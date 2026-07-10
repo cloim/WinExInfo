@@ -8,6 +8,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cwchar>
 #include <string>
 #include <vector>
 
@@ -73,6 +74,58 @@ void RequireCode(
     const winexinfo::ErrorCode expected) {
     const winexinfo::TargetValidationResult result = winexinfo::ValidateTargetEvidence(evidence);
     WXI_REQUIRE_EQ(result.status.code, expected);
+}
+
+struct FakeModuleEntry final {
+    std::wstring basename;
+    std::wstring path;
+};
+
+struct FakeModuleSnapshotState final {
+    std::vector<DWORD> create_results;
+    std::size_t create_index = 0;
+    std::vector<DWORD> observed_flags;
+    std::vector<FakeModuleEntry> modules;
+    std::size_t module_index = 0;
+    DWORD last_error = ERROR_SUCCESS;
+};
+
+winexinfo::ModuleSnapshotOperations FakeModuleSnapshotOperations(
+    FakeModuleSnapshotState* const state) {
+    return {
+        [state](const DWORD flags, const DWORD) -> HANDLE {
+            state->observed_flags.push_back(flags);
+            const DWORD result = state->create_results[state->create_index++];
+            if (result != ERROR_SUCCESS) {
+                state->last_error = result;
+                return INVALID_HANDLE_VALUE;
+            }
+            return CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        },
+        [state](const HANDLE, MODULEENTRY32W* const entry) {
+            if (state->modules.empty()) {
+                state->last_error = ERROR_NO_MORE_FILES;
+                return FALSE;
+            }
+            state->module_index = 0;
+            const FakeModuleEntry& source = state->modules[0];
+            wcscpy_s(entry->szModule, source.basename.c_str());
+            wcscpy_s(entry->szExePath, source.path.c_str());
+            return TRUE;
+        },
+        [state](const HANDLE, MODULEENTRY32W* const entry) {
+            ++state->module_index;
+            if (state->module_index >= state->modules.size()) {
+                state->last_error = ERROR_NO_MORE_FILES;
+                return FALSE;
+            }
+            const FakeModuleEntry& source = state->modules[state->module_index];
+            wcscpy_s(entry->szModule, source.basename.c_str());
+            wcscpy_s(entry->szExePath, source.path.c_str());
+            return TRUE;
+        },
+        [state]() { return state->last_error; },
+    };
 }
 
 WXI_TEST(target_validation_exact_target_passes, "target_validation.exact_target_passes") {
@@ -221,12 +274,129 @@ WXI_TEST(
 }
 
 WXI_TEST(
-    target_validation_module_snapshot_retry_policy,
-    "target_validation.module_snapshot_retry_policy") {
-    WXI_REQUIRE(winexinfo::ShouldRetryModuleSnapshot(ERROR_BAD_LENGTH));
-    WXI_REQUIRE(!winexinfo::ShouldRetryModuleSnapshot(ERROR_ACCESS_DENIED));
-    WXI_REQUIRE(!winexinfo::ShouldRetryModuleSnapshot(ERROR_PARTIAL_COPY));
-    WXI_REQUIRE(!winexinfo::ShouldRetryModuleSnapshot(ERROR_SUCCESS));
+    target_validation_module_snapshot_retries_bad_length_in_real_loop,
+    "target_validation.module_snapshot_retries_bad_length_in_real_loop") {
+    FakeModuleSnapshotState state{
+        {ERROR_BAD_LENGTH, ERROR_SUCCESS},
+        0,
+        {},
+        {
+            {L"explorerframe.dll", L"C:\\Windows\\System32\\explorerframe.dll"},
+            {L"SHELL32.dll", L"C:\\Windows\\System32\\SHELL32.dll"},
+        },
+    };
+    const winexinfo::ModuleSnapshotOperations operations =
+        FakeModuleSnapshotOperations(&state);
+    winexinfo::LoadedModulePaths paths{};
+
+    const winexinfo::Status status = winexinfo::CaptureLoadedModulePaths(
+        1234, operations, &paths);
+
+    WXI_REQUIRE(status.ok());
+    WXI_REQUIRE_EQ(state.observed_flags.size(), std::size_t{2});
+    WXI_REQUIRE_EQ(
+        state.observed_flags[0], DWORD{TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32});
+    WXI_REQUIRE_EQ(state.observed_flags[1], state.observed_flags[0]);
+    WXI_REQUIRE_EQ(paths.explorer_frame, std::wstring{L"C:\\Windows\\System32\\explorerframe.dll"});
+    WXI_REQUIRE_EQ(paths.shell32, std::wstring{L"C:\\Windows\\System32\\SHELL32.dll"});
+}
+
+WXI_TEST(
+    target_validation_module_snapshot_does_not_retry_other_errors,
+    "target_validation.module_snapshot_does_not_retry_other_errors") {
+    FakeModuleSnapshotState state{{ERROR_ACCESS_DENIED, ERROR_SUCCESS}};
+    const winexinfo::ModuleSnapshotOperations operations =
+        FakeModuleSnapshotOperations(&state);
+    winexinfo::LoadedModulePaths paths{};
+
+    const winexinfo::Status status = winexinfo::CaptureLoadedModulePaths(
+        1234, operations, &paths);
+
+    WXI_REQUIRE_EQ(status.code, winexinfo::ErrorCode::UNSUPPORTED_EXPLORER_BUILD);
+    WXI_REQUIRE_EQ(status.hresult, HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED));
+    WXI_REQUIRE_EQ(status.win32, DWORD{ERROR_ACCESS_DENIED});
+    WXI_REQUIRE_EQ(state.observed_flags.size(), std::size_t{1});
+}
+
+WXI_TEST(
+    target_validation_module_snapshot_enumerates_real_operation_path,
+    "target_validation.module_snapshot_enumerates_real_operation_path") {
+    FakeModuleSnapshotState state{
+        {ERROR_SUCCESS},
+        0,
+        {},
+        {
+            {L"ExplorerFrame.dll", L"frame"},
+            {L"shell32.dll", L"shell"},
+        },
+    };
+    const winexinfo::ModuleSnapshotOperations operations =
+        FakeModuleSnapshotOperations(&state);
+    winexinfo::LoadedModulePaths paths{};
+
+    const winexinfo::Status status = winexinfo::CaptureLoadedModulePaths(
+        1234, operations, &paths);
+
+    WXI_REQUIRE(status.ok());
+    WXI_REQUIRE_EQ(state.observed_flags.size(), std::size_t{1});
+    WXI_REQUIRE_EQ(paths.explorer_frame, std::wstring{L"frame"});
+    WXI_REQUIRE_EQ(paths.shell32, std::wstring{L"shell"});
+}
+
+WXI_TEST(
+    target_validation_module_snapshot_rejects_mixed_case_duplicates,
+    "target_validation.module_snapshot_rejects_mixed_case_duplicates") {
+    FakeModuleSnapshotState state{
+        {ERROR_SUCCESS},
+        0,
+        {},
+        {
+            {L"explorerframe.dll", L"frame-one"},
+            {L"ExplorerFrame.DLL", L"frame-two"},
+            {L"SHELL32.dll", L"shell-one"},
+            {L"shell32.DLL", L"shell-two"},
+        },
+    };
+    const winexinfo::ModuleSnapshotOperations operations =
+        FakeModuleSnapshotOperations(&state);
+    winexinfo::LoadedModulePaths paths{};
+
+    const winexinfo::Status status = winexinfo::CaptureLoadedModulePaths(
+        1234, operations, &paths);
+
+    WXI_REQUIRE_EQ(status.code, winexinfo::ErrorCode::UNSUPPORTED_EXPLORER_BUILD);
+    WXI_REQUIRE_EQ(status.hresult, S_FALSE);
+    WXI_REQUIRE_EQ(status.win32, DWORD{ERROR_SUCCESS});
+    WXI_REQUIRE_EQ(paths.explorer_frame_match_count, std::size_t{2});
+    WXI_REQUIRE_EQ(paths.shell32_match_count, std::size_t{2});
+    WXI_REQUIRE(paths.explorer_frame.empty());
+    WXI_REQUIRE(paths.shell32.empty());
+}
+
+WXI_TEST(
+    target_validation_module_snapshot_rejects_missing_exact_module,
+    "target_validation.module_snapshot_rejects_missing_exact_module") {
+    FakeModuleSnapshotState state{
+        {ERROR_SUCCESS},
+        0,
+        {},
+        {
+            {L"unrelated.dll", L"unrelated"},
+            {L"SHELL32.dll", L"shell"},
+        },
+    };
+    const winexinfo::ModuleSnapshotOperations operations =
+        FakeModuleSnapshotOperations(&state);
+    winexinfo::LoadedModulePaths paths{};
+
+    const winexinfo::Status status = winexinfo::CaptureLoadedModulePaths(
+        1234, operations, &paths);
+
+    WXI_REQUIRE_EQ(status.code, winexinfo::ErrorCode::UNSUPPORTED_EXPLORER_BUILD);
+    WXI_REQUIRE_EQ(status.hresult, S_FALSE);
+    WXI_REQUIRE_EQ(status.win32, DWORD{ERROR_SUCCESS});
+    WXI_REQUIRE_EQ(paths.explorer_frame_match_count, std::size_t{0});
+    WXI_REQUIRE_EQ(paths.shell32_match_count, std::size_t{1});
 }
 
 WXI_TEST(
@@ -263,14 +433,21 @@ WXI_TEST(
 WXI_TEST(
     target_validation_preserves_createfile_missing_error,
     "target_validation.preserves_createfile_missing_error") {
-    const std::wstring missing = L"Z:\\WinExInfo\\definitely-missing-explorer.exe";
+    std::array<wchar_t, MAX_PATH> temporaryDirectory{};
+    WXI_REQUIRE(GetTempPathW(
+        static_cast<DWORD>(temporaryDirectory.size()), temporaryDirectory.data()) > 0);
+    std::array<wchar_t, MAX_PATH> temporaryFile{};
+    WXI_REQUIRE(GetTempFileNameW(
+        temporaryDirectory.data(), L"WXI", 0, temporaryFile.data()) != 0);
+    WXI_REQUIRE(DeleteFileW(temporaryFile.data()));
+    const std::wstring missing = temporaryFile.data();
     winexinfo::OpenedIdentityFiles opened{};
     const winexinfo::Status status =
         winexinfo::CaptureFileIdentityEvidence(missing, missing, &opened);
 
     WXI_REQUIRE_EQ(status.code, winexinfo::ErrorCode::TARGET_VALIDATION_FAILED);
-    WXI_REQUIRE_EQ(status.hresult, HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND));
-    WXI_REQUIRE_EQ(status.win32, DWORD{ERROR_PATH_NOT_FOUND});
+    WXI_REQUIRE_EQ(status.hresult, HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND));
+    WXI_REQUIRE_EQ(status.win32, DWORD{ERROR_FILE_NOT_FOUND});
 }
 
 }  // namespace

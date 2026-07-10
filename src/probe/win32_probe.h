@@ -4,6 +4,7 @@
 
 #include <Windows.h>
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -36,8 +37,22 @@ struct Win32ContractResult final {
     HWND active_view;
 };
 
+struct Win32ProbeOperations final {
+    std::function<int(HWND, wchar_t*, int)> get_class_name;
+    std::function<BOOL(HWND, RECT*)> get_window_rect;
+    std::function<BOOL(HWND)> is_window_visible;
+    std::function<BOOL(HWND, WNDENUMPROC, LPARAM)> enum_child_windows;
+    std::function<HWND(HWND)> get_parent;
+    std::function<void(DWORD)> set_last_error;
+    std::function<DWORD()> get_last_error;
+};
+
 [[nodiscard]] Win32ContractResult ValidateWin32Contract(const Win32ClassTree& classTree);
 [[nodiscard]] Status EnumerateExplorerWindows(std::vector<ExplorerWindowRecord>* output);
 [[nodiscard]] Status CaptureWin32ClassTree(HWND topLevel, Win32ClassTree* output);
+[[nodiscard]] Status CaptureWin32ClassTreeWithOperations(
+    HWND topLevel,
+    const Win32ProbeOperations& operations,
+    Win32ClassTree* output);
 
 }  // namespace winexinfo

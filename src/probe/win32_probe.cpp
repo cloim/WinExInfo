@@ -165,8 +165,14 @@ Status EnumerateExplorerWindows(std::vector<ExplorerWindowRecord>* const output)
     return {ErrorCode::OK, S_OK, ERROR_SUCCESS};
 }
 
-Status CaptureWin32ClassTree(const HWND topLevel, Win32ClassTree* const output) {
-    if (output == nullptr || topLevel == nullptr) {
+Status CaptureWin32ClassTreeWithOperations(
+    const HWND topLevel,
+    const Win32ProbeOperations& operations,
+    Win32ClassTree* const output) {
+    if (output == nullptr || topLevel == nullptr || !operations.get_class_name ||
+        !operations.get_window_rect || !operations.is_window_visible ||
+        !operations.enum_child_windows || !operations.get_parent ||
+        !operations.set_last_error || !operations.get_last_error) {
         return {
             ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH,
             E_INVALIDARG,
@@ -176,11 +182,19 @@ Status CaptureWin32ClassTree(const HWND topLevel, Win32ClassTree* const output) 
 
     Win32ClassTree tree{topLevel, {}, {ErrorCode::OK, S_OK, ERROR_SUCCESS}};
     std::array<wchar_t, 256> topClass{};
-    const int topClassLength =
-        GetClassNameW(topLevel, topClass.data(), static_cast<int>(topClass.size()));
+    const int topClassLength = operations.get_class_name(
+        topLevel, topClass.data(), static_cast<int>(topClass.size()));
+    if (topClassLength == 0) {
+        const DWORD error = operations.get_last_error();
+        return {
+            ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH,
+            HRESULT_FROM_WIN32(error),
+            error,
+        };
+    }
     RECT topBounds{};
-    if (topClassLength == 0 || !GetWindowRect(topLevel, &topBounds)) {
-        const DWORD error = GetLastError();
+    if (!operations.get_window_rect(topLevel, &topBounds)) {
+        const DWORD error = operations.get_last_error();
         return {
             ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH,
             HRESULT_FROM_WIN32(error),
@@ -191,24 +205,29 @@ Status CaptureWin32ClassTree(const HWND topLevel, Win32ClassTree* const output) 
         topLevel,
         nullptr,
         std::wstring{topClass.data(), static_cast<std::size_t>(topClassLength)},
-        IsWindowVisible(topLevel) != FALSE,
+        operations.is_window_visible(topLevel) != FALSE,
         topBounds,
     });
 
     struct TreeContext final {
         Win32ClassTree* tree;
         Status status;
+        const Win32ProbeOperations* operations;
     };
-    TreeContext context{&tree, {ErrorCode::OK, S_OK, ERROR_SUCCESS}};
-    static_cast<void>(EnumChildWindows(
+    TreeContext context{
+        &tree,
+        {ErrorCode::OK, S_OK, ERROR_SUCCESS},
+        &operations,
+    };
+    static_cast<void>(operations.enum_child_windows(
         topLevel,
         [](const HWND hwnd, const LPARAM parameter) -> BOOL {
             auto* const state = reinterpret_cast<TreeContext*>(parameter);
             std::array<wchar_t, 256> className{};
-            const int length = GetClassNameW(hwnd, className.data(), static_cast<int>(className.size()));
-            RECT bounds{};
-            if (length == 0 || !GetWindowRect(hwnd, &bounds)) {
-                const DWORD error = GetLastError();
+            const int length = state->operations->get_class_name(
+                hwnd, className.data(), static_cast<int>(className.size()));
+            if (length == 0) {
+                const DWORD error = state->operations->get_last_error();
                 state->status = {
                     ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH,
                     HRESULT_FROM_WIN32(error),
@@ -216,11 +235,34 @@ Status CaptureWin32ClassTree(const HWND topLevel, Win32ClassTree* const output) 
                 };
                 return FALSE;
             }
+            RECT bounds{};
+            if (!state->operations->get_window_rect(hwnd, &bounds)) {
+                const DWORD error = state->operations->get_last_error();
+                state->status = {
+                    ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH,
+                    HRESULT_FROM_WIN32(error),
+                    error,
+                };
+                return FALSE;
+            }
+            state->operations->set_last_error(ERROR_SUCCESS);
+            const HWND parent = state->operations->get_parent(hwnd);
+            if (parent == nullptr) {
+                const DWORD error = state->operations->get_last_error();
+                if (error != ERROR_SUCCESS) {
+                    state->status = {
+                        ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH,
+                        HRESULT_FROM_WIN32(error),
+                        error,
+                    };
+                    return FALSE;
+                }
+            }
             state->tree->nodes.push_back({
                 hwnd,
-                GetParent(hwnd),
+                parent,
                 std::wstring{className.data(), static_cast<std::size_t>(length)},
-                IsWindowVisible(hwnd) != FALSE,
+                state->operations->is_window_visible(hwnd) != FALSE,
                 bounds,
             });
             return TRUE;
@@ -238,6 +280,23 @@ Status CaptureWin32ClassTree(const HWND topLevel, Win32ClassTree* const output) 
     });
     *output = std::move(tree);
     return {ErrorCode::OK, S_OK, ERROR_SUCCESS};
+}
+
+Status CaptureWin32ClassTree(const HWND topLevel, Win32ClassTree* const output) {
+    const Win32ProbeOperations operations{
+        [](const HWND hwnd, wchar_t* const buffer, const int capacity) {
+            return GetClassNameW(hwnd, buffer, capacity);
+        },
+        [](const HWND hwnd, RECT* const bounds) { return GetWindowRect(hwnd, bounds); },
+        [](const HWND hwnd) { return IsWindowVisible(hwnd); },
+        [](const HWND hwnd, const WNDENUMPROC callback, const LPARAM parameter) {
+            return EnumChildWindows(hwnd, callback, parameter);
+        },
+        [](const HWND hwnd) { return GetParent(hwnd); },
+        [](const DWORD error) { SetLastError(error); },
+        []() { return GetLastError(); },
+    };
+    return CaptureWin32ClassTreeWithOperations(topLevel, operations, output);
 }
 
 }  // namespace winexinfo

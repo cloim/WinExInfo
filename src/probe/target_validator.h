@@ -4,9 +4,12 @@
 #include "common/win32_handle.h"
 
 #include <Windows.h>
+#include <TlHelp32.h>
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -46,6 +49,20 @@ struct OpenedIdentityFiles final {
     FileIdentityEvidence evidence;
     UniqueHandle target_file;
     UniqueHandle system_file;
+};
+
+struct LoadedModulePaths final {
+    std::wstring explorer_frame;
+    std::wstring shell32;
+    std::size_t explorer_frame_match_count;
+    std::size_t shell32_match_count;
+};
+
+struct ModuleSnapshotOperations final {
+    std::function<HANDLE(DWORD, DWORD)> create_snapshot;
+    std::function<BOOL(HANDLE, MODULEENTRY32W*)> module_first;
+    std::function<BOOL(HANDLE, MODULEENTRY32W*)> module_next;
+    std::function<DWORD()> get_last_error;
 };
 
 struct CatalogSignatureEvidence final {
@@ -122,10 +139,13 @@ struct TargetValidationResult final {
 [[nodiscard]] bool IsExactTargetModuleBasename(
     std::wstring_view basename,
     TargetModuleFile target);
-[[nodiscard]] bool ShouldRetryModuleSnapshot(DWORD error) noexcept;
 [[nodiscard]] Status CaptureFileIdentityEvidence(
     const std::wstring& targetPath,
     const std::wstring& systemPath,
     OpenedIdentityFiles* output);
+[[nodiscard]] Status CaptureLoadedModulePaths(
+    DWORD processId,
+    const ModuleSnapshotOperations& operations,
+    LoadedModulePaths* output);
 
 }  // namespace winexinfo

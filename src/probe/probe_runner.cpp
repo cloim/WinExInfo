@@ -1,6 +1,7 @@
 #include "probe/probe_runner.h"
 
 #include "common/utf8.h"
+#include "probe/report_writer.h"
 #include "probe/target_validator.h"
 #include "probe/uia_probe.h"
 #include "probe/win32_probe.h"
@@ -224,26 +225,7 @@ ProbeRunResult RunSnapshotProbe() {
 
         UiaContractSnapshot uiaSnapshot{};
         const Status uiaValidation = ValidateUiaContract(uiaEvidence, &uiaSnapshot);
-        section.fields.push_back({
-            prefix + ".cardinality.status_bar",
-            std::to_string(uiaSnapshot.cardinalities.status_bar),
-        });
-        section.fields.push_back({
-            prefix + ".cardinality.left_group",
-            std::to_string(uiaSnapshot.cardinalities.left_group),
-        });
-        section.fields.push_back({
-            prefix + ".cardinality.right_group",
-            std::to_string(uiaSnapshot.cardinalities.right_group),
-        });
-        section.fields.push_back({
-            prefix + ".cardinality.tab_view",
-            std::to_string(uiaSnapshot.cardinalities.tab_view),
-        });
-        section.fields.push_back({
-            prefix + ".cardinality.tab_list",
-            std::to_string(uiaSnapshot.cardinalities.tab_list),
-        });
+        AppendUiaCardinalityReportFields(prefix, uiaSnapshot.cardinalities, &section);
         if (!uiaValidation.ok()) {
             if (firstError == ErrorCode::OK) {
                 firstError = uiaValidation.code;

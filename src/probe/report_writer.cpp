@@ -71,4 +71,35 @@ std::string WriteProbeReport(const ProbeReport& report) {
     return output;
 }
 
+void AppendUiaCardinalityReportFields(
+    const std::string_view prefix,
+    const UiaSelectorCardinalities& cardinalities,
+    ReportSection* const output) {
+    if (output == nullptr) {
+        std::terminate();
+    }
+
+    const std::string keyPrefix{prefix};
+    output->fields.push_back({
+        keyPrefix + ".cardinality.status_bar",
+        std::to_string(cardinalities.status_bar),
+    });
+    output->fields.push_back({
+        keyPrefix + ".cardinality.left_group",
+        std::to_string(cardinalities.left_group),
+    });
+    output->fields.push_back({
+        keyPrefix + ".cardinality.right_group",
+        std::to_string(cardinalities.right_group),
+    });
+    output->fields.push_back({
+        keyPrefix + ".cardinality.tab_view",
+        std::to_string(cardinalities.tab_view),
+    });
+    output->fields.push_back({
+        keyPrefix + ".cardinality.tab_list",
+        std::to_string(cardinalities.tab_list),
+    });
+}
+
 }  // namespace winexinfo

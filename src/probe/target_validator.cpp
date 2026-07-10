@@ -189,10 +189,6 @@ bool IsExactTargetModuleBasename(
                TRUE) == CSTR_EQUAL;
 }
 
-bool ShouldRetryModuleSnapshot(const DWORD error) noexcept {
-    return error == ERROR_BAD_LENGTH;
-}
-
 Status CaptureFileIdentityEvidence(
     const std::wstring& targetPath,
     const std::wstring& systemPath,
@@ -290,6 +286,85 @@ Status CaptureFileIdentityEvidence(
 
     *output = std::move(opened);
     return status;
+}
+
+Status CaptureLoadedModulePaths(
+    const DWORD processId,
+    const ModuleSnapshotOperations& operations,
+    LoadedModulePaths* const output) {
+    if (processId == 0 || output == nullptr || !operations.create_snapshot ||
+        !operations.module_first || !operations.module_next || !operations.get_last_error) {
+        return {
+            ErrorCode::UNSUPPORTED_EXPLORER_BUILD,
+            E_INVALIDARG,
+            ERROR_INVALID_PARAMETER,
+        };
+    }
+
+    UniqueHandle snapshot;
+    for (;;) {
+        const HANDLE candidate = operations.create_snapshot(
+            TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, processId);
+        if (candidate != INVALID_HANDLE_VALUE) {
+            snapshot.reset(candidate);
+            break;
+        }
+        const DWORD error = operations.get_last_error();
+        if (error != ERROR_BAD_LENGTH) {
+            return {
+                ErrorCode::UNSUPPORTED_EXPLORER_BUILD,
+                HRESULT_FROM_WIN32(error),
+                error,
+            };
+        }
+    }
+
+    LoadedModulePaths paths{};
+    MODULEENTRY32W module{};
+    module.dwSize = sizeof(module);
+    if (!operations.module_first(snapshot.get(), &module)) {
+        const DWORD error = operations.get_last_error();
+        *output = std::move(paths);
+        if (error == ERROR_NO_MORE_FILES) {
+            return {ErrorCode::UNSUPPORTED_EXPLORER_BUILD, S_FALSE, ERROR_SUCCESS};
+        }
+        return {
+            ErrorCode::UNSUPPORTED_EXPLORER_BUILD,
+            HRESULT_FROM_WIN32(error),
+            error,
+        };
+    }
+
+    do {
+        if (IsExactTargetModuleBasename(
+                module.szModule, TargetModuleFile::ExplorerFrame)) {
+            ++paths.explorer_frame_match_count;
+            if (paths.explorer_frame_match_count == 1) {
+                paths.explorer_frame = module.szExePath;
+            }
+        } else if (IsExactTargetModuleBasename(
+                       module.szModule, TargetModuleFile::Shell32)) {
+            ++paths.shell32_match_count;
+            if (paths.shell32_match_count == 1) {
+                paths.shell32 = module.szExePath;
+            }
+        }
+    } while (operations.module_next(snapshot.get(), &module));
+    const DWORD enumerationError = operations.get_last_error();
+    *output = std::move(paths);
+    if (enumerationError != ERROR_NO_MORE_FILES) {
+        return {
+            ErrorCode::UNSUPPORTED_EXPLORER_BUILD,
+            HRESULT_FROM_WIN32(enumerationError),
+            enumerationError,
+        };
+    }
+    if (output->explorer_frame_match_count != 1 || output->shell32_match_count != 1) {
+        output->explorer_frame.clear();
+        output->shell32.clear();
+        return {ErrorCode::UNSUPPORTED_EXPLORER_BUILD, S_FALSE, ERROR_SUCCESS};
+    }
+    return {ErrorCode::OK, S_OK, ERROR_SUCCESS};
 }
 
 Status CaptureTargetValidationEvidence(
@@ -626,58 +701,30 @@ Status CaptureTargetValidationEvidence(
         }
     }
 
-    std::wstring explorerFramePath;
-    std::wstring shell32Path;
-    UniqueHandle moduleSnapshot;
-    DWORD moduleSnapshotError = ERROR_SUCCESS;
-    for (;;) {
-        const HANDLE snapshot =
-            CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, processId);
-        if (snapshot != INVALID_HANDLE_VALUE) {
-            moduleSnapshot.reset(snapshot);
-            break;
-        }
-        moduleSnapshotError = GetLastError();
-        if (!ShouldRetryModuleSnapshot(moduleSnapshotError)) {
-            break;
-        }
-    }
-    if (moduleSnapshot) {
-        MODULEENTRY32W module{};
-        module.dwSize = sizeof(module);
-        if (Module32FirstW(moduleSnapshot.get(), &module)) {
-            do {
-                if (IsExactTargetModuleBasename(
-                        module.szModule, TargetModuleFile::ExplorerFrame)) {
-                    explorerFramePath = module.szExePath;
-                } else if (IsExactTargetModuleBasename(
-                               module.szModule, TargetModuleFile::Shell32)) {
-                    shell32Path = module.szExePath;
-                }
-            } while (Module32NextW(moduleSnapshot.get(), &module));
-            const DWORD enumerationError = GetLastError();
-            if (enumerationError != ERROR_NO_MORE_FILES) {
-                RecordCaptureFailure(
-                    &evidence.capture_status,
-                    ErrorCode::UNSUPPORTED_EXPLORER_BUILD,
-                    HRESULT_FROM_WIN32(enumerationError),
-                    enumerationError);
-            }
-        } else {
-            const DWORD error = GetLastError();
-            RecordCaptureFailure(
-                &evidence.capture_status,
-                ErrorCode::UNSUPPORTED_EXPLORER_BUILD,
-                HRESULT_FROM_WIN32(error),
-                error);
-        }
-    } else {
+    const ModuleSnapshotOperations moduleOperations{
+        [](const DWORD flags, const DWORD targetProcessId) {
+            return CreateToolhelp32Snapshot(flags, targetProcessId);
+        },
+        [](const HANDLE snapshot, MODULEENTRY32W* const module) {
+            return Module32FirstW(snapshot, module);
+        },
+        [](const HANDLE snapshot, MODULEENTRY32W* const module) {
+            return Module32NextW(snapshot, module);
+        },
+        []() { return GetLastError(); },
+    };
+    LoadedModulePaths loadedModules{};
+    const Status moduleStatus =
+        CaptureLoadedModulePaths(processId, moduleOperations, &loadedModules);
+    if (!moduleStatus.ok()) {
         RecordCaptureFailure(
             &evidence.capture_status,
-            ErrorCode::UNSUPPORTED_EXPLORER_BUILD,
-            HRESULT_FROM_WIN32(moduleSnapshotError),
-            moduleSnapshotError);
+            moduleStatus.code,
+            moduleStatus.hresult,
+            moduleStatus.win32);
     }
+    const std::wstring& explorerFramePath = loadedModules.explorer_frame;
+    const std::wstring& shell32Path = loadedModules.shell32;
 
     evidence.explorer_version = targetPath.empty()
         ? FileVersionEvidence{FileVersionSource::Missing, {}}
@@ -688,15 +735,6 @@ Status CaptureTargetValidationEvidence(
     evidence.shell32_version = shell32Path.empty()
         ? FileVersionEvidence{FileVersionSource::Missing, {}}
         : ReadFixedFileVersion(shell32Path, &evidence.capture_status);
-    if (explorerFramePath.empty() || shell32Path.empty()) {
-        const DWORD error = ERROR_MOD_NOT_FOUND;
-        RecordCaptureFailure(
-            &evidence.capture_status,
-            ErrorCode::UNSUPPORTED_EXPLORER_BUILD,
-            HRESULT_FROM_WIN32(error),
-            error);
-    }
-
     if (process) {
         PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY extensionPoints{};
         evidence.mitigations.extension_point_query_succeeded = GetProcessMitigationPolicy(
