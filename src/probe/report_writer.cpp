@@ -1,7 +1,12 @@
 #include "probe/report_writer.h"
 
+#include "common/utf8.h"
+
 #include <algorithm>
+#include <cstdint>
 #include <exception>
+#include <iomanip>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -100,6 +105,63 @@ void AppendUiaCardinalityReportFields(
         keyPrefix + ".cardinality.tab_list",
         std::to_string(cardinalities.tab_list),
     });
+}
+
+Status AppendActiveShellViewReportFields(
+    const std::string_view prefix,
+    const ActiveShellViewSnapshot& snapshot,
+    ReportSection* const output) {
+    if (output == nullptr) {
+        return {
+            ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH,
+            E_INVALIDARG,
+            ERROR_INVALID_PARAMETER,
+        };
+    }
+
+    const std::string keyPrefix{prefix};
+    output->fields.push_back({
+        keyPrefix + ".top_level_entry_count",
+        std::to_string(snapshot.top_level_entry_count),
+    });
+    output->fields.push_back({
+        keyPrefix + ".active_view_count",
+        std::to_string(snapshot.active_view_count),
+    });
+    output->fields.push_back({
+        keyPrefix + ".shell_tab_match_count",
+        std::to_string(snapshot.shell_tab_match_count),
+    });
+    std::ostringstream handle;
+    handle << "0x" << std::uppercase << std::hex << std::setw(sizeof(void*) * 2)
+           << std::setfill('0') << reinterpret_cast<std::uintptr_t>(snapshot.active_view);
+    output->fields.push_back({keyPrefix + ".shell_view", handle.str()});
+    output->fields.push_back({
+        keyPrefix + ".filesystem_path_available",
+        snapshot.filesystem_path_available ? "true" : "false",
+    });
+    output->fields.push_back({
+        keyPrefix + ".shell_hresult",
+        std::to_string(snapshot.status.hresult),
+    });
+    output->fields.push_back({
+        keyPrefix + ".shell_win32",
+        std::to_string(snapshot.status.win32),
+    });
+
+    std::string filesystemPath;
+    if (snapshot.filesystem_path_available) {
+        const Status conversion = Utf8FromUtf16(snapshot.filesystem_path, &filesystemPath);
+        if (!conversion.ok()) {
+            return {
+                ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH,
+                conversion.hresult,
+                conversion.win32,
+            };
+        }
+    }
+    output->fields.push_back({keyPrefix + ".filesystem_path", std::move(filesystemPath)});
+    return {ErrorCode::OK, S_OK, ERROR_SUCCESS};
 }
 
 }  // namespace winexinfo

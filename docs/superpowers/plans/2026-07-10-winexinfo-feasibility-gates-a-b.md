@@ -410,10 +410,10 @@ The exact build-script failures are `BUILD_TOOL_NOT_FOUND: vswhere`, `BUILD_TOOL
 | Produces | Exact contract |
 |---|---|
 | Shell enumeration | `IShellWindows` entries whose `IWebBrowser2::HWND` equals one probed top-level HWND |
-| Browser mapping | `IWebBrowser2`→`IServiceProvider`→`QueryService(SID_STopLevelBrowser, IID_IShellBrowser)`; `IShellBrowser::GetWindow` must equal the selected first-z-order `ShellTabWindowClass` for exactly one entry |
+| Browser mapping | `IWebBrowser2`→`IServiceProvider`→`QueryService(SID_STopLevelBrowser, IID_IShellBrowser)`; among all entries sharing the top-level HWND, `IShellBrowser::GetWindow` must equal the selected first-z-order `ShellTabWindowClass` for exactly one entry |
 | View mapping | `QueryActiveShellView`→`IShellView::GetWindow`; view must be visible descendant of active `ShellTabWindowClass` |
 | Active selection | exactly one qualifying view; zero/multiple returns `ACTIVE_VIEW_CONTRACT_MISMATCH` |
-| Folder path | `IFolderView::GetFolder`→`IShellFolder`→`SHGetIDListFromObject` absolute PIDL→`SHCreateItemFromIDList` `IShellItem`→`SIGDN_FILESYSPATH` |
+| Folder path | `IFolderView::GetFolder`→`IShellFolder`→`SHGetIDListFromObject` absolute PIDL→`SHCreateItemFromIDList` `IShellItem`→`GetAttributes(SFGAO_FILESYSTEM)`; only `S_OK` with the bit set proceeds to a required non-empty `SIGDN_FILESYSPATH`, while `S_FALSE` with the bit unset is unavailable |
 | Non-filesystem view | expected hidden state; not a contract error |
 | Report privacy | snapshot command may print explicit path because it is user-invoked; runtime log files are not created in Gate A |
 
@@ -445,7 +445,7 @@ The exact build-script failures are `BUILD_TOOL_NOT_FOUND: vswhere`, `BUILD_TOOL
   .\out\build\windows-x64-debug\bin\WinExInfoHost.exe --probe snapshot
   ```
 
-  Expected: each filesystem Explorer window reports `active_view_count=1` and its exact active path; non-filesystem views report `filesystem_path_available=false`; no entry uses a fallback field.
+  Expected: each filesystem Explorer window reports `shell_tab_match_count=1`, `active_view_count=1`, a distinct `shell_view`, and its exact active path; non-filesystem views report `filesystem_path_available=false` with one empty `filesystem_path`; no entry uses a fallback field.
 
 - [ ] **Step 5: Commit Shell mapping or record an early Gate A failure**
 

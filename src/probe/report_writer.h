@@ -13,5 +13,9 @@ void AppendUiaCardinalityReportFields(
     std::string_view prefix,
     const UiaSelectorCardinalities& cardinalities,
     ReportSection* output);
+Status AppendActiveShellViewReportFields(
+    std::string_view prefix,
+    const ActiveShellViewSnapshot& snapshot,
+    ReportSection* output);
 
 }  // namespace winexinfo

@@ -22,9 +22,11 @@ add_executable(WinExInfoTests
   src/host/command_line.cpp
   src/probe/probe_runner.cpp
   src/probe/report_writer.cpp
+  src/probe/shell_probe.cpp
   src/probe/target_validator.cpp
   src/probe/uia_probe.cpp
   src/probe/win32_probe.cpp
+  tests/active_view_tests.cpp
   tests/command_line_tests.cpp
   tests/contracts_tests.cpp
   tests/host_manifest_tests.cpp
@@ -58,6 +60,9 @@ target_link_options(WinExInfoTests PRIVATE /guard:cf)
 
 target_link_libraries(WinExInfoTests PRIVATE
   crypt32
+  ole32
+  shell32
+  uuid
   version
   wintrust
 )
@@ -75,6 +80,7 @@ add_executable(WinExInfoHost
   src/host/WinExInfoHost.manifest
   src/probe/probe_runner.cpp
   src/probe/report_writer.cpp
+  src/probe/shell_probe.cpp
   src/probe/target_validator.cpp
   src/probe/uia_probe.cpp
   src/probe/win32_probe.cpp
@@ -103,6 +109,9 @@ target_link_options(WinExInfoHost PRIVATE /guard:cf)
 
 target_link_libraries(WinExInfoHost PRIVATE
   crypt32
+  ole32
+  shell32
+  uuid
   version
   wintrust
 )

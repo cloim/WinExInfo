@@ -2,6 +2,7 @@
 
 #include "common/utf8.h"
 #include "probe/report_writer.h"
+#include "probe/shell_probe.h"
 #include "probe/target_validator.h"
 #include "probe/uia_probe.h"
 #include "probe/win32_probe.h"
@@ -188,6 +189,35 @@ ProbeRunResult RunSnapshotProbe() {
             }
             section.fields.push_back(
                 {prefix + ".error_code", std::string{ToString(win32Validation.status.code)}});
+            report.sections.push_back(std::move(section));
+            continue;
+        }
+
+        ActiveShellViewSnapshot shellSnapshot{};
+        const Status shellStatus = CaptureActiveShellView(
+            window.hwnd, win32Validation.active_shell_tab, &shellSnapshot);
+        const Status shellReportStatus =
+            AppendActiveShellViewReportFields(prefix, shellSnapshot, &section);
+        const Status effectiveShellStatus =
+            shellStatus.ok() ? shellReportStatus : shellStatus;
+        if (!effectiveShellStatus.ok()) {
+            if (firstError == ErrorCode::OK) {
+                firstError = effectiveShellStatus.code;
+            }
+            transportFailure =
+                transportFailure || IsProbeTransportFailure(effectiveShellStatus);
+            section.fields.push_back({
+                prefix + ".error_code",
+                std::string{ToString(effectiveShellStatus.code)},
+            });
+            section.fields.push_back({
+                prefix + ".error_hresult",
+                std::to_string(effectiveShellStatus.hresult),
+            });
+            section.fields.push_back({
+                prefix + ".error_win32",
+                std::to_string(effectiveShellStatus.win32),
+            });
             report.sections.push_back(std::move(section));
             continue;
         }
