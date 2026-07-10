@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <cstring>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -162,6 +163,135 @@ TargetValidationResult ValidateTargetEvidence(const TargetValidationEvidence& ev
     };
 }
 
+bool IsExactTargetModuleBasename(
+    const std::wstring_view basename,
+    const TargetModuleFile target) {
+    if (basename.size() > static_cast<std::size_t>((std::numeric_limits<int>::max)())) {
+        return false;
+    }
+
+    std::wstring_view expected;
+    switch (target) {
+        case TargetModuleFile::ExplorerFrame:
+            expected = L"ExplorerFrame.dll";
+            break;
+        case TargetModuleFile::Shell32:
+            expected = L"shell32.dll";
+            break;
+        default:
+            std::terminate();
+    }
+    return CompareStringOrdinal(
+               basename.data(),
+               static_cast<int>(basename.size()),
+               expected.data(),
+               static_cast<int>(expected.size()),
+               TRUE) == CSTR_EQUAL;
+}
+
+bool ShouldRetryModuleSnapshot(const DWORD error) noexcept {
+    return error == ERROR_BAD_LENGTH;
+}
+
+Status CaptureFileIdentityEvidence(
+    const std::wstring& targetPath,
+    const std::wstring& systemPath,
+    OpenedIdentityFiles* const output) {
+    if (output == nullptr) {
+        return {ErrorCode::TARGET_VALIDATION_FAILED, E_INVALIDARG, ERROR_INVALID_PARAMETER};
+    }
+
+    OpenedIdentityFiles opened{};
+    Status status{ErrorCode::OK, S_OK, ERROR_SUCCESS};
+
+    const HANDLE target = CreateFileW(
+        targetPath.c_str(),
+        FILE_READ_ATTRIBUTES | GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (target == INVALID_HANDLE_VALUE) {
+        const DWORD error = GetLastError();
+        RecordCaptureFailure(
+            &status,
+            ErrorCode::TARGET_VALIDATION_FAILED,
+            HRESULT_FROM_WIN32(error),
+            error);
+    } else {
+        opened.target_file.reset(target);
+    }
+
+    const HANDLE system = CreateFileW(
+        systemPath.c_str(),
+        FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (system == INVALID_HANDLE_VALUE) {
+        const DWORD error = GetLastError();
+        RecordCaptureFailure(
+            &status,
+            ErrorCode::TARGET_VALIDATION_FAILED,
+            HRESULT_FROM_WIN32(error),
+            error);
+    } else {
+        opened.system_file.reset(system);
+    }
+
+    FILE_ID_INFO targetIdentity{};
+    if (opened.target_file) {
+        if (GetFileInformationByHandleEx(
+                opened.target_file.get(),
+                FileIdInfo,
+                &targetIdentity,
+                sizeof(targetIdentity))) {
+            opened.evidence.target_opened = true;
+            opened.evidence.target_volume_serial = targetIdentity.VolumeSerialNumber;
+            std::memcpy(
+                opened.evidence.target_file_id.data(),
+                targetIdentity.FileId.Identifier,
+                opened.evidence.target_file_id.size());
+        } else {
+            const DWORD error = GetLastError();
+            RecordCaptureFailure(
+                &status,
+                ErrorCode::TARGET_VALIDATION_FAILED,
+                HRESULT_FROM_WIN32(error),
+                error);
+        }
+    }
+
+    FILE_ID_INFO systemIdentity{};
+    if (opened.system_file) {
+        if (GetFileInformationByHandleEx(
+                opened.system_file.get(),
+                FileIdInfo,
+                &systemIdentity,
+                sizeof(systemIdentity))) {
+            opened.evidence.system_opened = true;
+            opened.evidence.system_volume_serial = systemIdentity.VolumeSerialNumber;
+            std::memcpy(
+                opened.evidence.system_file_id.data(),
+                systemIdentity.FileId.Identifier,
+                opened.evidence.system_file_id.size());
+        } else {
+            const DWORD error = GetLastError();
+            RecordCaptureFailure(
+                &status,
+                ErrorCode::TARGET_VALIDATION_FAILED,
+                HRESULT_FROM_WIN32(error),
+                error);
+        }
+    }
+
+    *output = std::move(opened);
+    return status;
+}
+
 Status CaptureTargetValidationEvidence(
     const DWORD processId,
     TargetValidationEvidence* const output) {
@@ -273,64 +403,18 @@ Status CaptureTargetValidationEvidence(
             error);
     }
 
-    UniqueHandle targetFile;
-    if (!targetPath.empty()) {
-        targetFile.reset(CreateFileW(
-            targetPath.c_str(),
-            FILE_READ_ATTRIBUTES | GENERIC_READ,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            nullptr,
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            nullptr));
-    }
-    UniqueHandle systemFile;
-    if (!systemExplorerPath.empty()) {
-        systemFile.reset(CreateFileW(
-            systemExplorerPath.c_str(),
-            FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            nullptr,
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            nullptr));
-    }
-
-    FILE_ID_INFO targetIdentity{};
-    if (targetFile && GetFileInformationByHandleEx(
-                          targetFile.get(), FileIdInfo, &targetIdentity, sizeof(targetIdentity))) {
-        evidence.file_identity.target_opened = true;
-        evidence.file_identity.target_volume_serial = targetIdentity.VolumeSerialNumber;
-        std::memcpy(
-            evidence.file_identity.target_file_id.data(),
-            targetIdentity.FileId.Identifier,
-            evidence.file_identity.target_file_id.size());
-    } else {
-        const DWORD error = targetFile ? GetLastError() : ERROR_FILE_NOT_FOUND;
+    OpenedIdentityFiles identityFiles{};
+    const Status identityStatus =
+        CaptureFileIdentityEvidence(targetPath, systemExplorerPath, &identityFiles);
+    evidence.file_identity = identityFiles.evidence;
+    if (!identityStatus.ok()) {
         RecordCaptureFailure(
             &evidence.capture_status,
-            ErrorCode::TARGET_VALIDATION_FAILED,
-            HRESULT_FROM_WIN32(error),
-            error);
+            identityStatus.code,
+            identityStatus.hresult,
+            identityStatus.win32);
     }
-
-    FILE_ID_INFO systemIdentity{};
-    if (systemFile && GetFileInformationByHandleEx(
-                          systemFile.get(), FileIdInfo, &systemIdentity, sizeof(systemIdentity))) {
-        evidence.file_identity.system_opened = true;
-        evidence.file_identity.system_volume_serial = systemIdentity.VolumeSerialNumber;
-        std::memcpy(
-            evidence.file_identity.system_file_id.data(),
-            systemIdentity.FileId.Identifier,
-            evidence.file_identity.system_file_id.size());
-    } else {
-        const DWORD error = systemFile ? GetLastError() : ERROR_FILE_NOT_FOUND;
-        RecordCaptureFailure(
-            &evidence.capture_status,
-            ErrorCode::TARGET_VALIDATION_FAILED,
-            HRESULT_FROM_WIN32(error),
-            error);
-    }
+    UniqueHandle targetFile = std::move(identityFiles.target_file);
 
     evidence.signature.cache_only = true;
     evidence.signature.revocation_none = true;
@@ -544,16 +628,30 @@ Status CaptureTargetValidationEvidence(
 
     std::wstring explorerFramePath;
     std::wstring shell32Path;
-    UniqueHandle moduleSnapshot{
-        CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, processId)};
+    UniqueHandle moduleSnapshot;
+    DWORD moduleSnapshotError = ERROR_SUCCESS;
+    for (;;) {
+        const HANDLE snapshot =
+            CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, processId);
+        if (snapshot != INVALID_HANDLE_VALUE) {
+            moduleSnapshot.reset(snapshot);
+            break;
+        }
+        moduleSnapshotError = GetLastError();
+        if (!ShouldRetryModuleSnapshot(moduleSnapshotError)) {
+            break;
+        }
+    }
     if (moduleSnapshot) {
         MODULEENTRY32W module{};
         module.dwSize = sizeof(module);
         if (Module32FirstW(moduleSnapshot.get(), &module)) {
             do {
-                if (std::wstring_view{module.szModule} == L"ExplorerFrame.dll") {
+                if (IsExactTargetModuleBasename(
+                        module.szModule, TargetModuleFile::ExplorerFrame)) {
                     explorerFramePath = module.szExePath;
-                } else if (std::wstring_view{module.szModule} == L"shell32.dll") {
+                } else if (IsExactTargetModuleBasename(
+                               module.szModule, TargetModuleFile::Shell32)) {
                     shell32Path = module.szExePath;
                 }
             } while (Module32NextW(moduleSnapshot.get(), &module));
@@ -574,12 +672,11 @@ Status CaptureTargetValidationEvidence(
                 error);
         }
     } else {
-        const DWORD error = GetLastError();
         RecordCaptureFailure(
             &evidence.capture_status,
             ErrorCode::UNSUPPORTED_EXPLORER_BUILD,
-            HRESULT_FROM_WIN32(error),
-            error);
+            HRESULT_FROM_WIN32(moduleSnapshotError),
+            moduleSnapshotError);
     }
 
     evidence.explorer_version = targetPath.empty()

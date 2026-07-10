@@ -12,6 +12,10 @@
 namespace winexinfo {
 
 Win32ContractResult ValidateWin32Contract(const Win32ClassTree& classTree) {
+    if (!classTree.capture_status.ok()) {
+        return {classTree.capture_status, classTree, nullptr, nullptr};
+    }
+
     std::vector<HWND> shellTabs;
     for (const Win32ClassNode& node : classTree.nodes) {
         if (node.class_name != L"ShellTabWindowClass" || !node.visible) {
@@ -170,7 +174,7 @@ Status CaptureWin32ClassTree(const HWND topLevel, Win32ClassTree* const output) 
         };
     }
 
-    Win32ClassTree tree{topLevel, {}};
+    Win32ClassTree tree{topLevel, {}, {ErrorCode::OK, S_OK, ERROR_SUCCESS}};
     std::array<wchar_t, 256> topClass{};
     const int topClassLength =
         GetClassNameW(topLevel, topClass.data(), static_cast<int>(topClass.size()));
@@ -196,8 +200,7 @@ Status CaptureWin32ClassTree(const HWND topLevel, Win32ClassTree* const output) 
         Status status;
     };
     TreeContext context{&tree, {ErrorCode::OK, S_OK, ERROR_SUCCESS}};
-    SetLastError(ERROR_SUCCESS);
-    const BOOL enumerated = EnumChildWindows(
+    static_cast<void>(EnumChildWindows(
         topLevel,
         [](const HWND hwnd, const LPARAM parameter) -> BOOL {
             auto* const state = reinterpret_cast<TreeContext*>(parameter);
@@ -222,17 +225,11 @@ Status CaptureWin32ClassTree(const HWND topLevel, Win32ClassTree* const output) 
             });
             return TRUE;
         },
-        reinterpret_cast<LPARAM>(&context));
-    if (!enumerated) {
-        if (!context.status.ok()) {
-            return context.status;
-        }
-        const DWORD error = GetLastError();
-        return {
-            ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH,
-            HRESULT_FROM_WIN32(error),
-            error,
-        };
+        reinterpret_cast<LPARAM>(&context)));
+    tree.capture_status = context.status;
+    if (!context.status.ok()) {
+        *output = std::move(tree);
+        return context.status;
     }
 
     std::ranges::sort(tree.nodes.begin() + 1, tree.nodes.end(), [](const auto& left, const auto& right) {

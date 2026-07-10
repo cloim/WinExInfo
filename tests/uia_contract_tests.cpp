@@ -171,6 +171,41 @@ WXI_TEST(uia_contract_required_selector_cardinality, "uia_contract.required_sele
     }
 }
 
+WXI_TEST(
+    uia_contract_reports_exact_selector_match_cardinalities,
+    "uia_contract.reports_exact_selector_match_cardinalities") {
+    winexinfo::UiaContractSnapshot exactSnapshot{};
+    WXI_REQUIRE(winexinfo::ValidateUiaContract(ExactUia(), &exactSnapshot).ok());
+    WXI_REQUIRE_EQ(exactSnapshot.cardinalities.status_bar, std::size_t{1});
+    WXI_REQUIRE_EQ(exactSnapshot.cardinalities.left_group, std::size_t{1});
+    WXI_REQUIRE_EQ(exactSnapshot.cardinalities.right_group, std::size_t{1});
+    WXI_REQUIRE_EQ(exactSnapshot.cardinalities.tab_view, std::size_t{1});
+    WXI_REQUIRE_EQ(exactSnapshot.cardinalities.tab_list, std::size_t{1});
+
+    winexinfo::UiaContractEvidence missing = ExactUia();
+    missing.elements.erase(missing.elements.begin() + 1);
+    winexinfo::UiaContractSnapshot missingSnapshot{};
+    RequireUiaMismatch(missing);
+    static_cast<void>(winexinfo::ValidateUiaContract(missing, &missingSnapshot));
+    WXI_REQUIRE_EQ(missingSnapshot.cardinalities.status_bar, std::size_t{1});
+    WXI_REQUIRE_EQ(missingSnapshot.cardinalities.left_group, std::size_t{0});
+    WXI_REQUIRE_EQ(missingSnapshot.cardinalities.right_group, std::size_t{1});
+    WXI_REQUIRE_EQ(missingSnapshot.cardinalities.tab_view, std::size_t{1});
+    WXI_REQUIRE_EQ(missingSnapshot.cardinalities.tab_list, std::size_t{1});
+
+    winexinfo::UiaContractEvidence duplicate = ExactUia();
+    duplicate.elements.push_back(duplicate.elements[0]);
+    duplicate.elements.push_back(duplicate.elements[4]);
+    winexinfo::UiaContractSnapshot duplicateSnapshot{};
+    RequireUiaMismatch(duplicate);
+    static_cast<void>(winexinfo::ValidateUiaContract(duplicate, &duplicateSnapshot));
+    WXI_REQUIRE_EQ(duplicateSnapshot.cardinalities.status_bar, std::size_t{2});
+    WXI_REQUIRE_EQ(duplicateSnapshot.cardinalities.left_group, std::size_t{1});
+    WXI_REQUIRE_EQ(duplicateSnapshot.cardinalities.right_group, std::size_t{1});
+    WXI_REQUIRE_EQ(duplicateSnapshot.cardinalities.tab_view, std::size_t{1});
+    WXI_REQUIRE_EQ(duplicateSnapshot.cardinalities.tab_list, std::size_t{2});
+}
+
 WXI_TEST(uia_contract_rejects_alternate_properties, "uia_contract.rejects_alternate_properties") {
     winexinfo::UiaContractEvidence automationId = ExactUia();
     automationId.elements[0].automation_id = L"StatusBar";
@@ -214,6 +249,24 @@ WXI_TEST(uia_contract_retains_transport_hresult, "uia_contract.retains_transport
     const winexinfo::Status status = winexinfo::ValidateUiaContract(evidence, &snapshot);
     WXI_REQUIRE_EQ(status.code, winexinfo::ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH);
     WXI_REQUIRE_EQ(status.hresult, UIA_E_ELEMENTNOTAVAILABLE);
+}
+
+WXI_TEST(
+    uia_contract_preserves_partial_tree_callback_error,
+    "uia_contract.preserves_partial_tree_callback_error") {
+    winexinfo::Win32ClassTree tree = ExactClassTree();
+    tree.capture_status = {
+        winexinfo::ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH,
+        HRESULT_FROM_WIN32(ERROR_INVALID_WINDOW_HANDLE),
+        ERROR_INVALID_WINDOW_HANDLE,
+    };
+
+    const winexinfo::Win32ContractResult result = winexinfo::ValidateWin32Contract(tree);
+    WXI_REQUIRE_EQ(
+        result.status.code,
+        winexinfo::ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH);
+    WXI_REQUIRE_EQ(result.status.hresult, HRESULT_FROM_WIN32(ERROR_INVALID_WINDOW_HANDLE));
+    WXI_REQUIRE_EQ(result.status.win32, DWORD{ERROR_INVALID_WINDOW_HANDLE});
 }
 
 }  // namespace

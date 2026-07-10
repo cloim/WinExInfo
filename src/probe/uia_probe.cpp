@@ -161,18 +161,24 @@ Status ValidateUiaContract(
             element.automation_id == L"TabListView" && element.class_name == L"ListView";
     });
 
+    output->cardinalities = {
+        statusBars.size(),
+        leftGroups.size(),
+        rightGroups.size(),
+        tabViews.size(),
+        tabLists.size(),
+    };
+
     if (statusBars.size() != 1 || leftGroups.size() != 1 || rightGroups.size() != 1 ||
         tabViews.size() != 1 || tabLists.size() != 1) {
         return {ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH, S_FALSE, ERROR_SUCCESS};
     }
 
-    *output = {
-        *statusBars[0],
-        *leftGroups[0],
-        *rightGroups[0],
-        *tabViews[0],
-        *tabLists[0],
-    };
+    output->status_bar = *statusBars[0];
+    output->left_group = *leftGroups[0];
+    output->right_group = *rightGroups[0];
+    output->tab_view = *tabViews[0];
+    output->tab_list = *tabLists[0];
     return {ErrorCode::OK, S_OK, ERROR_SUCCESS};
 }
 

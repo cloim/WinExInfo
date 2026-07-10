@@ -203,4 +203,74 @@ WXI_TEST(target_validation_retains_capture_error, "target_validation.retains_cap
     WXI_REQUIRE_EQ(result.status.win32, DWORD{ERROR_ACCESS_DENIED});
 }
 
+WXI_TEST(
+    target_validation_matches_live_module_basename_case,
+    "target_validation.matches_live_module_basename_case") {
+    WXI_REQUIRE(winexinfo::IsExactTargetModuleBasename(
+        L"explorerframe.dll", winexinfo::TargetModuleFile::ExplorerFrame));
+    WXI_REQUIRE(winexinfo::IsExactTargetModuleBasename(
+        L"SHELL32.dll", winexinfo::TargetModuleFile::Shell32));
+    WXI_REQUIRE(winexinfo::IsExactTargetModuleBasename(
+        L"ExplorerFrame.dll", winexinfo::TargetModuleFile::ExplorerFrame));
+    WXI_REQUIRE(winexinfo::IsExactTargetModuleBasename(
+        L"shell32.dll", winexinfo::TargetModuleFile::Shell32));
+    WXI_REQUIRE(!winexinfo::IsExactTargetModuleBasename(
+        L"explorerframe2.dll", winexinfo::TargetModuleFile::ExplorerFrame));
+    WXI_REQUIRE(!winexinfo::IsExactTargetModuleBasename(
+        L"shell32.dll.bak", winexinfo::TargetModuleFile::Shell32));
+}
+
+WXI_TEST(
+    target_validation_module_snapshot_retry_policy,
+    "target_validation.module_snapshot_retry_policy") {
+    WXI_REQUIRE(winexinfo::ShouldRetryModuleSnapshot(ERROR_BAD_LENGTH));
+    WXI_REQUIRE(!winexinfo::ShouldRetryModuleSnapshot(ERROR_ACCESS_DENIED));
+    WXI_REQUIRE(!winexinfo::ShouldRetryModuleSnapshot(ERROR_PARTIAL_COPY));
+    WXI_REQUIRE(!winexinfo::ShouldRetryModuleSnapshot(ERROR_SUCCESS));
+}
+
+WXI_TEST(
+    target_validation_preserves_createfile_sharing_error,
+    "target_validation.preserves_createfile_sharing_error") {
+    std::array<wchar_t, MAX_PATH> temporaryDirectory{};
+    WXI_REQUIRE(GetTempPathW(
+        static_cast<DWORD>(temporaryDirectory.size()), temporaryDirectory.data()) > 0);
+    std::array<wchar_t, MAX_PATH> temporaryFile{};
+    WXI_REQUIRE(GetTempFileNameW(
+        temporaryDirectory.data(), L"WXI", 0, temporaryFile.data()) != 0);
+
+    winexinfo::UniqueHandle exclusive{CreateFileW(
+        temporaryFile.data(),
+        GENERIC_READ | GENERIC_WRITE,
+        0,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr)};
+    WXI_REQUIRE(static_cast<bool>(exclusive));
+
+    winexinfo::OpenedIdentityFiles opened{};
+    const winexinfo::Status status = winexinfo::CaptureFileIdentityEvidence(
+        temporaryFile.data(), temporaryFile.data(), &opened);
+    exclusive.reset();
+    WXI_REQUIRE(DeleteFileW(temporaryFile.data()));
+
+    WXI_REQUIRE_EQ(status.code, winexinfo::ErrorCode::TARGET_VALIDATION_FAILED);
+    WXI_REQUIRE_EQ(status.hresult, HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION));
+    WXI_REQUIRE_EQ(status.win32, DWORD{ERROR_SHARING_VIOLATION});
+}
+
+WXI_TEST(
+    target_validation_preserves_createfile_missing_error,
+    "target_validation.preserves_createfile_missing_error") {
+    const std::wstring missing = L"Z:\\WinExInfo\\definitely-missing-explorer.exe";
+    winexinfo::OpenedIdentityFiles opened{};
+    const winexinfo::Status status =
+        winexinfo::CaptureFileIdentityEvidence(missing, missing, &opened);
+
+    WXI_REQUIRE_EQ(status.code, winexinfo::ErrorCode::TARGET_VALIDATION_FAILED);
+    WXI_REQUIRE_EQ(status.hresult, HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND));
+    WXI_REQUIRE_EQ(status.win32, DWORD{ERROR_PATH_NOT_FOUND});
+}
+
 }  // namespace

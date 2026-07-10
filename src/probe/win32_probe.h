@@ -26,6 +26,7 @@ struct Win32ClassNode final {
 struct Win32ClassTree final {
     HWND top_level;
     std::vector<Win32ClassNode> nodes;
+    Status capture_status;
 };
 
 struct Win32ContractResult final {

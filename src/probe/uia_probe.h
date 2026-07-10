@@ -6,6 +6,7 @@
 #include <objbase.h>
 #include <UIAutomation.h>
 
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -36,12 +37,21 @@ struct UiaContractEvidence final {
     std::vector<UiaElementEvidence> elements;
 };
 
+struct UiaSelectorCardinalities final {
+    std::size_t status_bar;
+    std::size_t left_group;
+    std::size_t right_group;
+    std::size_t tab_view;
+    std::size_t tab_list;
+};
+
 struct UiaContractSnapshot final {
     UiaElementEvidence status_bar;
     UiaElementEvidence left_group;
     UiaElementEvidence right_group;
     UiaElementEvidence tab_view;
     UiaElementEvidence tab_list;
+    UiaSelectorCardinalities cardinalities;
 };
 
 [[nodiscard]] Status ValidateUiaContract(

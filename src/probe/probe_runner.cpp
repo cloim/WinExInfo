@@ -69,10 +69,6 @@ void AppendUiaElement(
     section->fields.push_back({keyPrefix + ".offscreen", element.offscreen ? "true" : "false"});
 }
 
-std::size_t CountScope(const UiaContractEvidence& evidence, const UiaQueryScope scope) {
-    return static_cast<std::size_t>(std::ranges::count(evidence.elements, scope, &UiaElementEvidence::scope));
-}
-
 }  // namespace
 
 ProbeRunResult RunSnapshotProbe() {
@@ -226,25 +222,28 @@ ProbeRunResult RunSnapshotProbe() {
             continue;
         }
 
-        section.fields.push_back({
-            prefix + ".cardinality.active_view_subtree",
-            std::to_string(CountScope(uiaEvidence, UiaQueryScope::ActiveViewSubtree)),
-        });
-        section.fields.push_back({
-            prefix + ".cardinality.status_bar_children",
-            std::to_string(CountScope(uiaEvidence, UiaQueryScope::StatusBarChildren)),
-        });
-        section.fields.push_back({
-            prefix + ".cardinality.explorer_subtree",
-            std::to_string(CountScope(uiaEvidence, UiaQueryScope::ExplorerSubtree)),
-        });
-        section.fields.push_back({
-            prefix + ".cardinality.tab_view_children",
-            std::to_string(CountScope(uiaEvidence, UiaQueryScope::TabViewChildren)),
-        });
-
         UiaContractSnapshot uiaSnapshot{};
         const Status uiaValidation = ValidateUiaContract(uiaEvidence, &uiaSnapshot);
+        section.fields.push_back({
+            prefix + ".cardinality.status_bar",
+            std::to_string(uiaSnapshot.cardinalities.status_bar),
+        });
+        section.fields.push_back({
+            prefix + ".cardinality.left_group",
+            std::to_string(uiaSnapshot.cardinalities.left_group),
+        });
+        section.fields.push_back({
+            prefix + ".cardinality.right_group",
+            std::to_string(uiaSnapshot.cardinalities.right_group),
+        });
+        section.fields.push_back({
+            prefix + ".cardinality.tab_view",
+            std::to_string(uiaSnapshot.cardinalities.tab_view),
+        });
+        section.fields.push_back({
+            prefix + ".cardinality.tab_list",
+            std::to_string(uiaSnapshot.cardinalities.tab_list),
+        });
         if (!uiaValidation.ok()) {
             if (firstError == ErrorCode::OK) {
                 firstError = uiaValidation.code;

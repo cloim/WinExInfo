@@ -1,12 +1,14 @@
 #pragma once
 
 #include "common/status.h"
+#include "common/win32_handle.h"
 
 #include <Windows.h>
 
 #include <array>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace winexinfo {
@@ -15,6 +17,11 @@ enum class FileVersionSource {
     FixedResource,
     Alternate,
     Missing,
+};
+
+enum class TargetModuleFile {
+    ExplorerFrame,
+    Shell32,
 };
 
 struct OsVersionEvidence final {
@@ -33,6 +40,12 @@ struct FileIdentityEvidence final {
     std::uint64_t system_volume_serial;
     std::array<std::uint8_t, 16> target_file_id;
     std::array<std::uint8_t, 16> system_file_id;
+};
+
+struct OpenedIdentityFiles final {
+    FileIdentityEvidence evidence;
+    UniqueHandle target_file;
+    UniqueHandle system_file;
 };
 
 struct CatalogSignatureEvidence final {
@@ -106,5 +119,13 @@ struct TargetValidationResult final {
 [[nodiscard]] Status CaptureTargetValidationEvidence(
     DWORD processId,
     TargetValidationEvidence* output);
+[[nodiscard]] bool IsExactTargetModuleBasename(
+    std::wstring_view basename,
+    TargetModuleFile target);
+[[nodiscard]] bool ShouldRetryModuleSnapshot(DWORD error) noexcept;
+[[nodiscard]] Status CaptureFileIdentityEvidence(
+    const std::wstring& targetPath,
+    const std::wstring& systemPath,
+    OpenedIdentityFiles* output);
 
 }  // namespace winexinfo
