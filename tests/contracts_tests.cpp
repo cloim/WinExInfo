@@ -103,6 +103,26 @@ WXI_TEST(contracts_handle_move, "contracts.handle_move") {
     DWORD flags = 0;
     WXI_REQUIRE(!GetHandleInformation(event, &flags));
     WXI_REQUIRE_EQ(GetLastError(), ERROR_INVALID_HANDLE);
+
+    const HANDLE transferredEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    WXI_REQUIRE(transferredEvent != nullptr);
+    const HANDLE replacedEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    WXI_REQUIRE(replacedEvent != nullptr);
+
+    winexinfo::UniqueHandle source{transferredEvent};
+    winexinfo::UniqueHandle destination{replacedEvent};
+    destination = std::move(source);
+
+    WXI_REQUIRE(!source);
+    WXI_REQUIRE_EQ(destination.get(), transferredEvent);
+    WXI_REQUIRE(GetHandleInformation(transferredEvent, &flags));
+    WXI_REQUIRE(!GetHandleInformation(replacedEvent, &flags));
+    WXI_REQUIRE_EQ(GetLastError(), ERROR_INVALID_HANDLE);
+
+    destination.reset();
+    WXI_REQUIRE(!destination);
+    WXI_REQUIRE(!GetHandleInformation(transferredEvent, &flags));
+    WXI_REQUIRE_EQ(GetLastError(), ERROR_INVALID_HANDLE);
 }
 
 WXI_TEST(contracts_utf8_roundtrip, "contracts.utf8_roundtrip") {
@@ -117,16 +137,22 @@ WXI_TEST(contracts_utf8_roundtrip, "contracts.utf8_roundtrip") {
 }
 
 WXI_TEST(contracts_utf8_rejects_invalid, "contracts.utf8_rejects_invalid") {
-    std::wstring utf16Output;
+    const std::wstring unchangedUtf16 = L"unchanged";
+    std::wstring utf16Output = unchangedUtf16;
     const winexinfo::Status invalidUtf8 =
         winexinfo::Utf16FromUtf8(std::string_view{"\xC3\x28", 2}, &utf16Output);
     WXI_REQUIRE_EQ(invalidUtf8.code, winexinfo::ErrorCode::INVALID_ARGUMENT);
+    WXI_REQUIRE_EQ(utf16Output, unchangedUtf16);
+    WXI_REQUIRE_EQ(utf16Output.find(L'\uFFFD'), std::wstring::npos);
 
-    std::string utf8Output;
+    const std::string unchangedUtf8 = "unchanged";
+    std::string utf8Output = unchangedUtf8;
     const wchar_t loneHighSurrogate[] = {static_cast<wchar_t>(0xD800), L'\0'};
     const winexinfo::Status invalidUtf16 =
         winexinfo::Utf8FromUtf16(std::wstring_view{loneHighSurrogate, 1}, &utf8Output);
     WXI_REQUIRE_EQ(invalidUtf16.code, winexinfo::ErrorCode::INVALID_ARGUMENT);
+    WXI_REQUIRE_EQ(utf8Output, unchangedUtf8);
+    WXI_REQUIRE_EQ(utf8Output.find(std::string_view{"\xEF\xBF\xBD", 3}), std::string::npos);
 }
 
 }  // namespace

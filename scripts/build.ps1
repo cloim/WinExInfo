@@ -90,7 +90,7 @@ foreach ($line in $environmentLines) {
 }
 
 $preset = "windows-x64-$($Configuration.ToLowerInvariant())"
-& $cmakePath --preset $preset
+& $cmakePath --preset $preset "-DCMAKE_MAKE_PROGRAM:FILEPATH=$ninjaPath"
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
