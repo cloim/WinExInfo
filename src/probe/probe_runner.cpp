@@ -102,6 +102,29 @@ ProbeRunResult RunSnapshotProbe() {
         const ExplorerWindowRecord& window = windows[index];
         const std::string prefix = "window." + std::to_string(index);
         ReportSection section{};
+        const Status terminalStageInitialization =
+            InitializeShellTerminalStageReportField(prefix, &section);
+        if (!terminalStageInitialization.ok()) {
+            if (firstError == ErrorCode::OK) {
+                firstError = terminalStageInitialization.code;
+            }
+            transportFailure =
+                transportFailure || IsProbeTransportFailure(terminalStageInitialization);
+            section.fields.push_back({
+                prefix + ".error_code",
+                std::string{ToString(terminalStageInitialization.code)},
+            });
+            section.fields.push_back({
+                prefix + ".error_hresult",
+                std::to_string(terminalStageInitialization.hresult),
+            });
+            section.fields.push_back({
+                prefix + ".error_win32",
+                std::to_string(terminalStageInitialization.win32),
+            });
+            report.sections.push_back(std::move(section));
+            continue;
+        }
         section.fields.push_back({prefix + ".hwnd", FormatHwnd(window.hwnd)});
         section.fields.push_back({prefix + ".pid", std::to_string(window.process_id)});
         section.fields.push_back({prefix + ".thread_id", std::to_string(window.thread_id)});

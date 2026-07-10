@@ -22,6 +22,7 @@ struct ShellViewEntryEvidence final {
 
 struct ActiveShellViewEvidence final {
     Status capture_status;
+    ShellProbeTerminalStage terminal_stage;
     std::vector<ShellViewEntryEvidence> entries;
 };
 

@@ -129,6 +129,7 @@ Status ValidateActiveShellViewEvidence(
 
     ActiveShellViewSnapshot snapshot{
         {ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH, S_FALSE, ERROR_SUCCESS},
+        ShellProbeTerminalStage::ValidateActiveView,
         0,
         0,
         0,
@@ -164,9 +165,13 @@ Status ValidateActiveShellViewEvidence(
 
     if (!evidence.capture_status.ok()) {
         snapshot.status = evidence.capture_status;
+        snapshot.terminal_stage = FAILED(evidence.capture_status.hresult)
+            ? evidence.terminal_stage
+            : ShellProbeTerminalStage::ValidateActiveView;
     } else if (snapshot.shell_tab_match_count == 1 &&
                snapshot.active_view_count == 1 && !invalidPathState) {
         snapshot.status = {ErrorCode::OK, S_OK, ERROR_SUCCESS};
+        snapshot.terminal_stage = ShellProbeTerminalStage::Complete;
     }
     if (!snapshot.status.ok()) {
         snapshot.active_view = nullptr;
@@ -191,11 +196,13 @@ Status CaptureActiveShellView(
 
     ActiveShellViewEvidence evidence{
         {ErrorCode::OK, S_OK, ERROR_SUCCESS},
+        ShellProbeTerminalStage::NotStarted,
         {},
     };
     Microsoft::WRL::ComPtr<IShellView> selectedShellView;
     std::size_t selectedEntryIndex = 0;
     Microsoft::WRL::ComPtr<IShellWindows> shellWindows;
+    evidence.terminal_stage = ShellProbeTerminalStage::CoCreateShellWindows;
     HRESULT hresult = CoCreateInstance(
         CLSID_ShellWindows,
         nullptr,
@@ -209,6 +216,7 @@ Status CaptureActiveShellView(
     }
 
     long count = 0;
+    evidence.terminal_stage = ShellProbeTerminalStage::IShellWindowsGetCount;
     hresult = shellWindows->get_Count(&count);
     if (hresult != S_OK) {
         evidence.capture_status = ShellFailure(hresult);
@@ -224,6 +232,7 @@ Status CaptureActiveShellView(
         index.vt = VT_I4;
         index.lVal = indexValue;
         Microsoft::WRL::ComPtr<IDispatch> dispatch;
+        evidence.terminal_stage = ShellProbeTerminalStage::IShellWindowsItem;
         hresult = shellWindows->Item(index, &dispatch);
         bool useEntry = false;
         const Status itemStatus = ClassifyShellWindowsItemResult(
@@ -237,6 +246,8 @@ Status CaptureActiveShellView(
         }
 
         Microsoft::WRL::ComPtr<IWebBrowser2> browser;
+        evidence.terminal_stage =
+            ShellProbeTerminalStage::IDispatchQueryIWebBrowser2;
         hresult = dispatch.As(&browser);
         const Status browserStatus = ClassifyBrowserInterfaceResult(
             hresult, browser != nullptr, &useEntry);
@@ -249,6 +260,7 @@ Status CaptureActiveShellView(
         }
 
         SHANDLE_PTR browserHandle = 0;
+        evidence.terminal_stage = ShellProbeTerminalStage::IWebBrowser2GetHwnd;
         hresult = browser->get_HWND(&browserHandle);
         if (hresult != S_OK) {
             evidence.capture_status = ShellFailure(hresult);
@@ -269,6 +281,8 @@ Status CaptureActiveShellView(
             {},
         };
         Microsoft::WRL::ComPtr<IServiceProvider> serviceProvider;
+        evidence.terminal_stage =
+            ShellProbeTerminalStage::IWebBrowser2QueryIServiceProvider;
         hresult = browser.As(&serviceProvider);
         requiredStatus =
             ClassifyRequiredComObjectResult(hresult, serviceProvider != nullptr);
@@ -278,6 +292,8 @@ Status CaptureActiveShellView(
         }
 
         Microsoft::WRL::ComPtr<IShellBrowser> shellBrowser;
+        evidence.terminal_stage =
+            ShellProbeTerminalStage::IServiceProviderQueryTopLevelBrowser;
         hresult = serviceProvider->QueryService(
             SID_STopLevelBrowser,
             IID_PPV_ARGS(&shellBrowser));
@@ -288,6 +304,7 @@ Status CaptureActiveShellView(
             return ValidateActiveShellViewEvidence(topLevel, selectedShellTab, evidence, output);
         }
 
+        evidence.terminal_stage = ShellProbeTerminalStage::IShellBrowserGetWindow;
         hresult = shellBrowser->GetWindow(&entry.shell_browser);
         if (hresult != S_OK) {
             evidence.capture_status = ShellFailure(hresult);
@@ -299,6 +316,8 @@ Status CaptureActiveShellView(
         }
 
         Microsoft::WRL::ComPtr<IShellView> shellView;
+        evidence.terminal_stage =
+            ShellProbeTerminalStage::IShellBrowserQueryActiveShellView;
         hresult = shellBrowser->QueryActiveShellView(&shellView);
         requiredStatus =
             ClassifyRequiredComObjectResult(hresult, shellView != nullptr);
@@ -307,6 +326,7 @@ Status CaptureActiveShellView(
             return ValidateActiveShellViewEvidence(topLevel, selectedShellTab, evidence, output);
         }
 
+        evidence.terminal_stage = ShellProbeTerminalStage::IShellViewGetWindow;
         hresult = shellView->GetWindow(&entry.active_view);
         if (hresult != S_OK) {
             evidence.capture_status = ShellFailure(hresult);
@@ -325,6 +345,7 @@ Status CaptureActiveShellView(
         evidence.entries.push_back(std::move(entry));
     }
 
+    evidence.terminal_stage = ShellProbeTerminalStage::ValidateActiveView;
     const Status mappingStatus =
         ValidateActiveShellViewEvidence(topLevel, selectedShellTab, evidence, output);
     if (!mappingStatus.ok()) {
@@ -337,6 +358,7 @@ Status CaptureActiveShellView(
 
     ShellViewEntryEvidence& selectedEntry = evidence.entries[selectedEntryIndex];
     Microsoft::WRL::ComPtr<IFolderView> folderView;
+    evidence.terminal_stage = ShellProbeTerminalStage::IShellViewQueryIFolderView;
     hresult = selectedShellView.As(&folderView);
     requiredStatus = ClassifyRequiredComObjectResult(hresult, folderView != nullptr);
     if (!requiredStatus.ok()) {
@@ -345,6 +367,7 @@ Status CaptureActiveShellView(
     }
 
     Microsoft::WRL::ComPtr<IShellFolder> folder;
+    evidence.terminal_stage = ShellProbeTerminalStage::IFolderViewGetFolder;
     hresult = folderView->GetFolder(IID_PPV_ARGS(&folder));
     requiredStatus = ClassifyRequiredComObjectResult(hresult, folder != nullptr);
     if (!requiredStatus.ok()) {
@@ -353,6 +376,7 @@ Status CaptureActiveShellView(
     }
 
     PIDLIST_ABSOLUTE rawPidl = nullptr;
+    evidence.terminal_stage = ShellProbeTerminalStage::ShGetIdListFromObject;
     hresult = SHGetIDListFromObject(folder.Get(), &rawPidl);
     if (hresult != S_OK || rawPidl == nullptr) {
         if (rawPidl != nullptr) {
@@ -372,6 +396,7 @@ Status CaptureActiveShellView(
     std::unique_ptr<ITEMIDLIST, PidlDeleter> pidl(rawPidl);
 
     Microsoft::WRL::ComPtr<IShellItem> item;
+    evidence.terminal_stage = ShellProbeTerminalStage::ShCreateItemFromIdList;
     hresult = SHCreateItemFromIDList(pidl.get(), IID_PPV_ARGS(&item));
     requiredStatus = ClassifyRequiredComObjectResult(hresult, item != nullptr);
     if (!requiredStatus.ok()) {
@@ -380,6 +405,7 @@ Status CaptureActiveShellView(
     }
 
     SFGAOF attributes = 0;
+    evidence.terminal_stage = ShellProbeTerminalStage::IShellItemGetAttributes;
     hresult = item->GetAttributes(SFGAO_FILESYSTEM, &attributes);
     bool filesystem = false;
     const Status attributeStatus =
@@ -390,6 +416,7 @@ Status CaptureActiveShellView(
     }
     if (filesystem) {
         PWSTR rawPath = nullptr;
+        evidence.terminal_stage = ShellProbeTerminalStage::IShellItemGetDisplayName;
         hresult = item->GetDisplayName(SIGDN_FILESYSPATH, &rawPath);
         if (hresult != S_OK || rawPath == nullptr || rawPath[0] == L'\0') {
             if (rawPath != nullptr) {
@@ -404,6 +431,7 @@ Status CaptureActiveShellView(
         selectedEntry.filesystem_path = path.get();
     }
 
+    evidence.terminal_stage = ShellProbeTerminalStage::ValidateActiveView;
     return ValidateActiveShellViewEvidence(topLevel, selectedShellTab, evidence, output);
 }
 

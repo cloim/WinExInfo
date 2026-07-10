@@ -13,6 +13,28 @@ enum class ProbeMode {
     Observe,
 };
 
+enum class ShellProbeTerminalStage {
+    NotStarted,
+    CoCreateShellWindows,
+    IShellWindowsGetCount,
+    IShellWindowsItem,
+    IDispatchQueryIWebBrowser2,
+    IWebBrowser2GetHwnd,
+    IWebBrowser2QueryIServiceProvider,
+    IServiceProviderQueryTopLevelBrowser,
+    IShellBrowserGetWindow,
+    IShellBrowserQueryActiveShellView,
+    IShellViewGetWindow,
+    ValidateActiveView,
+    IShellViewQueryIFolderView,
+    IFolderViewGetFolder,
+    ShGetIdListFromObject,
+    ShCreateItemFromIdList,
+    IShellItemGetAttributes,
+    IShellItemGetDisplayName,
+    Complete,
+};
+
 struct ReportField final {
     std::string key;
     std::string value;
@@ -31,6 +53,7 @@ struct ProbeReport final {
 
 struct ActiveShellViewSnapshot final {
     Status status;
+    ShellProbeTerminalStage terminal_stage;
     std::size_t top_level_entry_count;
     std::size_t shell_tab_match_count;
     std::size_t active_view_count;

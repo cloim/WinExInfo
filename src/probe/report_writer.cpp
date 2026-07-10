@@ -107,6 +107,31 @@ void AppendUiaCardinalityReportFields(
     });
 }
 
+Status InitializeShellTerminalStageReportField(
+    const std::string_view prefix,
+    ReportSection* const output) {
+    if (output == nullptr) {
+        return {
+            ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH,
+            E_INVALIDARG,
+            ERROR_INVALID_PARAMETER,
+        };
+    }
+
+    const std::string key = std::string{prefix} + ".shell_terminal_stage";
+    for (const ReportField& field : output->fields) {
+        if (field.key == key) {
+            return {
+                ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH,
+                E_INVALIDARG,
+                ERROR_INVALID_PARAMETER,
+            };
+        }
+    }
+    output->fields.push_back({key, "not_started"});
+    return {ErrorCode::OK, S_OK, ERROR_SUCCESS};
+}
+
 Status AppendActiveShellViewReportFields(
     const std::string_view prefix,
     const ActiveShellViewSnapshot& snapshot,
@@ -119,7 +144,94 @@ Status AppendActiveShellViewReportFields(
         };
     }
 
+    std::string terminalStage;
+    switch (snapshot.terminal_stage) {
+        case ShellProbeTerminalStage::NotStarted:
+            terminalStage = "not_started";
+            break;
+        case ShellProbeTerminalStage::CoCreateShellWindows:
+            terminalStage = "co_create_shell_windows";
+            break;
+        case ShellProbeTerminalStage::IShellWindowsGetCount:
+            terminalStage = "ishellwindows_get_count";
+            break;
+        case ShellProbeTerminalStage::IShellWindowsItem:
+            terminalStage = "ishellwindows_item";
+            break;
+        case ShellProbeTerminalStage::IDispatchQueryIWebBrowser2:
+            terminalStage = "idispatch_query_iwebbrowser2";
+            break;
+        case ShellProbeTerminalStage::IWebBrowser2GetHwnd:
+            terminalStage = "iwebbrowser2_get_hwnd";
+            break;
+        case ShellProbeTerminalStage::IWebBrowser2QueryIServiceProvider:
+            terminalStage = "iwebbrowser2_query_iserviceprovider";
+            break;
+        case ShellProbeTerminalStage::IServiceProviderQueryTopLevelBrowser:
+            terminalStage = "iserviceprovider_query_top_level_browser";
+            break;
+        case ShellProbeTerminalStage::IShellBrowserGetWindow:
+            terminalStage = "ishellbrowser_get_window";
+            break;
+        case ShellProbeTerminalStage::IShellBrowserQueryActiveShellView:
+            terminalStage = "ishellbrowser_query_active_shell_view";
+            break;
+        case ShellProbeTerminalStage::IShellViewGetWindow:
+            terminalStage = "ishellview_get_window";
+            break;
+        case ShellProbeTerminalStage::ValidateActiveView:
+            terminalStage = "validate_active_view";
+            break;
+        case ShellProbeTerminalStage::IShellViewQueryIFolderView:
+            terminalStage = "ishellview_query_ifolderview";
+            break;
+        case ShellProbeTerminalStage::IFolderViewGetFolder:
+            terminalStage = "ifolderview_get_folder";
+            break;
+        case ShellProbeTerminalStage::ShGetIdListFromObject:
+            terminalStage = "sh_get_id_list_from_object";
+            break;
+        case ShellProbeTerminalStage::ShCreateItemFromIdList:
+            terminalStage = "sh_create_item_from_id_list";
+            break;
+        case ShellProbeTerminalStage::IShellItemGetAttributes:
+            terminalStage = "ishellitem_get_attributes";
+            break;
+        case ShellProbeTerminalStage::IShellItemGetDisplayName:
+            terminalStage = "ishellitem_get_display_name";
+            break;
+        case ShellProbeTerminalStage::Complete:
+            terminalStage = "complete";
+            break;
+        default:
+            return {
+                ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH,
+                E_INVALIDARG,
+                ERROR_INVALID_PARAMETER,
+            };
+    }
+
     const std::string keyPrefix{prefix};
+    const std::string terminalStageKey = keyPrefix + ".shell_terminal_stage";
+    ReportField* existingTerminalStage = nullptr;
+    for (ReportField& field : output->fields) {
+        if (field.key != terminalStageKey) {
+            continue;
+        }
+        if (existingTerminalStage != nullptr) {
+            return {
+                ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH,
+                E_INVALIDARG,
+                ERROR_INVALID_PARAMETER,
+            };
+        }
+        existingTerminalStage = &field;
+    }
+    if (existingTerminalStage == nullptr) {
+        output->fields.push_back({terminalStageKey, std::move(terminalStage)});
+    } else {
+        existingTerminalStage->value = std::move(terminalStage);
+    }
     output->fields.push_back({
         keyPrefix + ".top_level_entry_count",
         std::to_string(snapshot.top_level_entry_count),

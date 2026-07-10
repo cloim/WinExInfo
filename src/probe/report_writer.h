@@ -13,6 +13,9 @@ void AppendUiaCardinalityReportFields(
     std::string_view prefix,
     const UiaSelectorCardinalities& cardinalities,
     ReportSection* output);
+Status InitializeShellTerminalStageReportField(
+    std::string_view prefix,
+    ReportSection* output);
 Status AppendActiveShellViewReportFields(
     std::string_view prefix,
     const ActiveShellViewSnapshot& snapshot,

@@ -416,6 +416,7 @@ The exact build-script failures are `BUILD_TOOL_NOT_FOUND: vswhere`, `BUILD_TOOL
 | Folder path | `IFolderView::GetFolder`→`IShellFolder`→`SHGetIDListFromObject` absolute PIDL→`SHCreateItemFromIDList` `IShellItem`→`GetAttributes(SFGAO_FILESYSTEM)`; only `S_OK` with the bit set proceeds to a required non-empty `SIGDN_FILESYSPATH`, while `S_FALSE` with the bit unset is unavailable |
 | Non-filesystem view | expected hidden state; not a contract error |
 | Report privacy | snapshot command may print explicit path because it is user-invoked; runtime log files are not created in Gate A |
+| Terminal stage | every window emits exactly one `shell_terminal_stage`; its fixed values are the 19 design-spec values from `not_started` through `complete`, invalid enum values fail with `ACTIVE_VIEW_CONTRACT_MISMATCH` and `E_INVALIDARG` |
 
 - [ ] **Step 1: Write failing active-view selection tests**
 
