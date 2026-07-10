@@ -21,10 +21,15 @@ add_executable(WinExInfoTests
   src/common/utf8.cpp
   src/host/command_line.cpp
   src/probe/report_writer.cpp
+  src/probe/target_validator.cpp
+  src/probe/uia_probe.cpp
+  src/probe/win32_probe.cpp
   tests/command_line_tests.cpp
   tests/contracts_tests.cpp
+  tests/target_validation_tests.cpp
   tests/test_framework.cpp
   tests/test_main.cpp
+  tests/uia_contract_tests.cpp
 )
 
 target_include_directories(WinExInfoTests PRIVATE
@@ -49,8 +54,56 @@ target_compile_options(WinExInfoTests PRIVATE
 
 target_link_options(WinExInfoTests PRIVATE /guard:cf)
 
+target_link_libraries(WinExInfoTests PRIVATE
+  crypt32
+  version
+  wintrust
+)
+
 set_target_properties(WinExInfoTests PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
 add_test(NAME WinExInfo.Unit COMMAND WinExInfoTests --unit)
+
+add_executable(WinExInfoHost
+  src/common/utf8.cpp
+  src/host/command_line.cpp
+  src/host/main.cpp
+  src/probe/probe_runner.cpp
+  src/probe/report_writer.cpp
+  src/probe/target_validator.cpp
+  src/probe/uia_probe.cpp
+  src/probe/win32_probe.cpp
+)
+
+target_include_directories(WinExInfoHost PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/src"
+)
+
+target_compile_definitions(WinExInfoHost PRIVATE
+  NOMINMAX
+  UNICODE
+  WIN32_LEAN_AND_MEAN
+  _UNICODE
+)
+
+target_compile_options(WinExInfoHost PRIVATE
+  /W4
+  /WX
+  /permissive-
+  /utf-8
+  /guard:cf
+)
+
+target_link_options(WinExInfoHost PRIVATE /guard:cf)
+
+target_link_libraries(WinExInfoHost PRIVATE
+  crypt32
+  version
+  wintrust
+)
+
+set_target_properties(WinExInfoHost PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
