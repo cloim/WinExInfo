@@ -19,6 +19,9 @@ enable_testing()
 
 add_executable(WinExInfoTests
   src/common/utf8.cpp
+  src/host/command_line.cpp
+  src/probe/report_writer.cpp
+  tests/command_line_tests.cpp
   tests/contracts_tests.cpp
   tests/test_framework.cpp
   tests/test_main.cpp
