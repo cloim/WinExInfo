@@ -27,6 +27,7 @@ add_executable(WinExInfoTests
   src/probe/uia_probe.cpp
   src/probe/win32_probe.cpp
   tests/active_view_tests.cpp
+  tests/com_apartment_tests.cpp
   tests/command_line_tests.cpp
   tests/contracts_tests.cpp
   tests/host_manifest_tests.cpp

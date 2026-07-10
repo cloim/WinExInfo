@@ -365,7 +365,7 @@ The exact build-script failures are `BUILD_TOOL_NOT_FOUND: vswhere`, `BUILD_TOOL
 
 - [ ] **Step 4: Add and build `WinExInfoHost.exe --probe snapshot`**
 
-  `main.cpp` must call `CoInitializeEx` with MTA, parse only Task 2 commands, run snapshot mode, print the deterministic report, remove UIA handlers/COM state, and call `CoUninitialize`. Snapshot output must include window index, HWND, PID, thread ID, class chain, exact selector properties, rectangles, cardinalities, and error code.
+  `main.cpp` must call `CoInitializeEx` with the exact `COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE` Shell STA flags, parse only Task 2 commands, run snapshot mode, print the deterministic report, release Shell COM state, and call `CoUninitialize`. Preserve the separate snapshot UIA MTA worker. Snapshot output must include window index, HWND, PID, thread ID, class chain, exact selector properties, rectangles, cardinalities, and error code.
 
 - [ ] **Step 5: Run unit tests and a live read-only snapshot**
 
@@ -489,6 +489,7 @@ The exact build-script failures are `BUILD_TOOL_NOT_FOUND: vswhere`, `BUILD_TOOL
 | WindowRegistered action | create a pending entry and re-enumerate once; count 0 is transitional until its first allowed navigation/structure event, without polling |
 | WindowRevoked action | require a previous mapping for the cookie/top-level HWND, then remove its current HWND/view/path mapping; current count 0 is the expected terminal state |
 | Correlation record | monotonic sequence, event kind, source top-level HWND, Shell cookie when present, previous/current active view HWND, active-view count, previous/current filesystem-path availability and value |
+| Thread ownership | dedicated Shell STA owns all `IShellWindows`/browser/service/browser-view objects and Shell connection points; one separate windowless UIA MTA owns all UIA objects and handler registration/removal; only immutable HWND/cookie/sequence/path state crosses apartments |
 
 - [ ] **Step 1: Write failing event-filter and lifetime tests**
 
@@ -507,7 +508,7 @@ The exact build-script failures are `BUILD_TOOL_NOT_FOUND: vswhere`, `BUILD_TOOL
 
 - [ ] **Step 3: Implement exact COM/UIA event subscriptions and cleanup**
 
-  Use one MTA observer worker. Advise/unadvise each Shell connection point exactly once. Register/remove UIA handlers with the same element and handler identities. The callback only queues an immutable event record; Shell remapping occurs on the observer worker, never inside the callback. COM/UIA subscription or callback transport failures serialize `ACTIVE_VIEW_CONTRACT_MISMATCH`, retain the exact HRESULT, and make Host exit 3.
+  Use one dedicated STA Shell coordinator initialized with the exact snapshot flags. It creates, calls, advises, unadvises, and releases all Shell objects and connection points on that STA and maintains a message pump. Shell callbacks only queue immutable event records; remapping occurs on the STA after the callback returns. Use one separate single windowless MTA that owns every UIA object and exact handler registration/removal identity. Pass only immutable HWND, cookie, sequence, path availability, and path value between apartments; never pass a raw COM pointer. COM/UIA subscription or callback transport failures serialize `ACTIVE_VIEW_CONTRACT_MISMATCH`, retain the exact HRESULT, and make Host exit 3.
 
 - [ ] **Step 4: Run full tests and start the 45-second observer**
 

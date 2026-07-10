@@ -1,5 +1,6 @@
 #include "common/utf8.h"
 #include "host/command_line.h"
+#include "host/com_apartment.h"
 #include "probe/probe_runner.h"
 #include "probe/report_writer.h"
 
@@ -36,7 +37,8 @@ int wmain(const int argc, const wchar_t* const argv[]) {
         return static_cast<int>(winexinfo::HostExitCode::InvalidCli);
     }
 
-    const HRESULT initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const HRESULT initialized =
+        CoInitializeEx(nullptr, winexinfo::kShellComApartmentFlags);
     if (FAILED(initialized)) {
         const winexinfo::ProbeReport report{
             winexinfo::ProbeMode::Snapshot,
