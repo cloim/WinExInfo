@@ -1,6 +1,7 @@
 #include "test_framework.h"
 
 #include "probe/uia_probe.h"
+#include "probe/probe_runner.h"
 #include "probe/report_writer.h"
 #include "probe/win32_probe.h"
 
@@ -8,8 +9,10 @@
 #include <UIAutomation.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -30,6 +33,8 @@ winexinfo::Win32ClassTree ExactClassTree() {
             {Handle(4), activeView, L"DirectUIHWND", true, RECT{0, 0, 1000, 700}},
             {Handle(5), top, L"msctls_statusbar32", true, RECT{0, 700, 0, 700}},
         },
+        {},
+        {shellTab, Handle(5)},
     };
 }
 
@@ -38,6 +43,12 @@ struct FakeWin32CaptureState final {
     DWORD child_class_error = ERROR_SUCCESS;
     DWORD parent_error = ERROR_SUCCESS;
     bool child_has_top_parent = true;
+    std::array<std::vector<HWND>, 2> top_level_z_orders{
+        std::vector<HWND>{Handle(2)},
+        std::vector<HWND>{Handle(2)},
+    };
+    std::size_t z_order_capture_index = 0;
+    std::size_t z_order_child_index = 0;
 };
 
 winexinfo::Win32ProbeOperations FakeWin32CaptureOperations(
@@ -76,6 +87,34 @@ winexinfo::Win32ProbeOperations FakeWin32CaptureOperations(
         },
         [state](const DWORD error) { state->last_error = error; },
         [state]() { return state->last_error; },
+        [state](const HWND) -> HWND {
+            if (state->z_order_capture_index >= state->top_level_z_orders.size()) {
+                state->last_error = ERROR_INVALID_STATE;
+                return nullptr;
+            }
+            state->z_order_child_index = 0;
+            const std::vector<HWND>& children =
+                state->top_level_z_orders[state->z_order_capture_index];
+            if (children.empty()) {
+                ++state->z_order_capture_index;
+                state->last_error = ERROR_SUCCESS;
+                return nullptr;
+            }
+            state->last_error = ERROR_SUCCESS;
+            return children[0];
+        },
+        [state](const HWND) -> HWND {
+            const std::vector<HWND>& children =
+                state->top_level_z_orders[state->z_order_capture_index];
+            ++state->z_order_child_index;
+            if (state->z_order_child_index >= children.size()) {
+                ++state->z_order_capture_index;
+                state->last_error = ERROR_SUCCESS;
+                return nullptr;
+            }
+            state->last_error = ERROR_SUCCESS;
+            return children[state->z_order_child_index];
+        },
     };
 }
 
@@ -162,18 +201,33 @@ WXI_TEST(uia_contract_exact_tree_passes, "uia_contract.exact_tree_passes") {
 }
 
 WXI_TEST(uia_contract_shell_tab_cardinality, "uia_contract.shell_tab_cardinality") {
-    winexinfo::Win32ClassTree missing = ExactClassTree();
-    missing.nodes[1].visible = false;
+    winexinfo::Win32ClassTree missingZOrder = ExactClassTree();
+    missingZOrder.top_level_child_z_order.clear();
     WXI_REQUIRE_EQ(
-        winexinfo::ValidateWin32Contract(missing).status.code,
+        winexinfo::ValidateWin32Contract(missingZOrder).status.code,
         winexinfo::ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH);
 
-    winexinfo::Win32ClassTree duplicate = ExactClassTree();
-    duplicate.nodes.push_back(
-        {Handle(6), duplicate.top_level, L"ShellTabWindowClass", true, RECT{0, 0, 1, 1}});
+    winexinfo::Win32ClassTree hiddenFirst = ExactClassTree();
+    hiddenFirst.nodes.push_back(
+        {Handle(6), hiddenFirst.top_level, L"ShellTabWindowClass", false, RECT{0, 0, 1, 1}});
+    hiddenFirst.nodes.push_back(
+        {Handle(7), Handle(6), L"DUIViewWndClassName", true, RECT{0, 0, 1, 1}});
+    hiddenFirst.top_level_child_z_order = {Handle(6), Handle(2), Handle(5)};
     WXI_REQUIRE_EQ(
-        winexinfo::ValidateWin32Contract(duplicate).status.code,
+        winexinfo::ValidateWin32Contract(hiddenFirst).status.code,
         winexinfo::ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH);
+
+    winexinfo::Win32ClassTree multipleVisible = ExactClassTree();
+    multipleVisible.nodes.push_back(
+        {Handle(6), multipleVisible.top_level, L"ShellTabWindowClass", true, RECT{0, 0, 1, 1}});
+    multipleVisible.nodes.push_back(
+        {Handle(7), Handle(6), L"DUIViewWndClassName", true, RECT{0, 0, 1, 1}});
+    multipleVisible.top_level_child_z_order = {Handle(6), Handle(2), Handle(5)};
+    const winexinfo::Win32ContractResult selected =
+        winexinfo::ValidateWin32Contract(multipleVisible);
+    WXI_REQUIRE(selected.status.ok());
+    WXI_REQUIRE_EQ(selected.active_shell_tab, Handle(6));
+    WXI_REQUIRE_EQ(selected.active_view, Handle(7));
 }
 
 WXI_TEST(uia_contract_diview_counts_hidden_duplicates, "uia_contract.diview_counts_hidden_duplicates") {
@@ -349,6 +403,150 @@ WXI_TEST(
     const winexinfo::Win32ContractResult result = winexinfo::ValidateWin32Contract(tree);
     WXI_REQUIRE_EQ(result.status.hresult, S_FALSE);
     WXI_REQUIRE_EQ(result.status.win32, DWORD{ERROR_SUCCESS});
+}
+
+WXI_TEST(
+    uia_contract_capture_tree_preserves_top_level_z_order,
+    "uia_contract.capture_tree_preserves_top_level_z_order") {
+    FakeWin32CaptureState state{};
+    const winexinfo::Win32ProbeOperations operations = FakeWin32CaptureOperations(&state);
+    winexinfo::Win32ClassTree tree{};
+    const winexinfo::Status status = winexinfo::CaptureWin32ClassTreeWithOperations(
+        Handle(1), operations, &tree);
+
+    WXI_REQUIRE(status.ok());
+    WXI_REQUIRE_EQ(tree.top_level_child_z_order.size(), std::size_t{1});
+    WXI_REQUIRE_EQ(tree.top_level_child_z_order[0], Handle(2));
+}
+
+WXI_TEST(
+    uia_contract_capture_tree_rejects_z_order_change,
+    "uia_contract.capture_tree_rejects_z_order_change") {
+    FakeWin32CaptureState state{};
+    state.top_level_z_orders[1] = {Handle(8), Handle(2)};
+    const winexinfo::Win32ProbeOperations operations = FakeWin32CaptureOperations(&state);
+    winexinfo::Win32ClassTree tree{};
+    const winexinfo::Status status = winexinfo::CaptureWin32ClassTreeWithOperations(
+        Handle(1), operations, &tree);
+
+    WXI_REQUIRE_EQ(status.code, winexinfo::ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH);
+    WXI_REQUIRE_EQ(status.hresult, S_FALSE);
+    WXI_REQUIRE_EQ(status.win32, DWORD{ERROR_SUCCESS});
+}
+
+WXI_TEST(
+    uia_contract_capture_tree_preserves_z_order_error,
+    "uia_contract.capture_tree_preserves_z_order_error") {
+    FakeWin32CaptureState state{};
+    winexinfo::Win32ProbeOperations operations = FakeWin32CaptureOperations(&state);
+    operations.get_top_window = [&state](const HWND) -> HWND {
+        state.last_error = ERROR_ACCESS_DENIED;
+        return nullptr;
+    };
+    winexinfo::Win32ClassTree tree{};
+    const winexinfo::Status status = winexinfo::CaptureWin32ClassTreeWithOperations(
+        Handle(1), operations, &tree);
+
+    WXI_REQUIRE_EQ(status.hresult, HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED));
+    WXI_REQUIRE_EQ(status.win32, DWORD{ERROR_ACCESS_DENIED});
+}
+
+WXI_TEST(
+    uia_contract_capture_tree_preserves_getnextwindow_error,
+    "uia_contract.capture_tree_preserves_getnextwindow_error") {
+    FakeWin32CaptureState state{};
+    winexinfo::Win32ProbeOperations operations = FakeWin32CaptureOperations(&state);
+    operations.get_next_window = [&state](const HWND) -> HWND {
+        state.last_error = ERROR_INVALID_WINDOW_HANDLE;
+        return nullptr;
+    };
+    winexinfo::Win32ClassTree tree{};
+    const winexinfo::Status status = winexinfo::CaptureWin32ClassTreeWithOperations(
+        Handle(1), operations, &tree);
+
+    WXI_REQUIRE_EQ(status.hresult, HRESULT_FROM_WIN32(ERROR_INVALID_WINDOW_HANDLE));
+    WXI_REQUIRE_EQ(status.win32, DWORD{ERROR_INVALID_WINDOW_HANDLE});
+}
+
+WXI_TEST(
+    uia_contract_capture_tree_preserves_confirmation_gettopwindow_error,
+    "uia_contract.capture_tree_preserves_confirmation_gettopwindow_error") {
+    FakeWin32CaptureState state{};
+    winexinfo::Win32ProbeOperations operations = FakeWin32CaptureOperations(&state);
+    const std::function<HWND(HWND)> firstPass = operations.get_top_window;
+    int calls = 0;
+    operations.get_top_window = [&state, &calls, firstPass](const HWND hwnd) -> HWND {
+        ++calls;
+        if (calls == 2) {
+            state.last_error = ERROR_RETRY;
+            return nullptr;
+        }
+        return firstPass(hwnd);
+    };
+    winexinfo::Win32ClassTree tree{};
+    const winexinfo::Status status = winexinfo::CaptureWin32ClassTreeWithOperations(
+        Handle(1), operations, &tree);
+
+    WXI_REQUIRE_EQ(status.hresult, HRESULT_FROM_WIN32(ERROR_RETRY));
+    WXI_REQUIRE_EQ(status.win32, DWORD{ERROR_RETRY});
+}
+
+WXI_TEST(
+    uia_contract_capture_tree_preserves_confirmation_getnextwindow_error,
+    "uia_contract.capture_tree_preserves_confirmation_getnextwindow_error") {
+    FakeWin32CaptureState state{};
+    winexinfo::Win32ProbeOperations operations = FakeWin32CaptureOperations(&state);
+    const std::function<HWND(HWND)> firstPass = operations.get_next_window;
+    int calls = 0;
+    operations.get_next_window = [&state, &calls, firstPass](const HWND hwnd) -> HWND {
+        ++calls;
+        if (calls == 2) {
+            state.last_error = ERROR_RETRY;
+            return nullptr;
+        }
+        return firstPass(hwnd);
+    };
+    winexinfo::Win32ClassTree tree{};
+    const winexinfo::Status status = winexinfo::CaptureWin32ClassTreeWithOperations(
+        Handle(1), operations, &tree);
+
+    WXI_REQUIRE_EQ(status.hresult, HRESULT_FROM_WIN32(ERROR_RETRY));
+    WXI_REQUIRE_EQ(status.win32, DWORD{ERROR_RETRY});
+}
+
+WXI_TEST(
+    uia_contract_capture_tree_rejects_z_order_cycle,
+    "uia_contract.capture_tree_rejects_z_order_cycle") {
+    FakeWin32CaptureState state{};
+    state.top_level_z_orders[0] = {Handle(2), Handle(2)};
+    const winexinfo::Win32ProbeOperations operations = FakeWin32CaptureOperations(&state);
+    winexinfo::Win32ClassTree tree{};
+    const winexinfo::Status status = winexinfo::CaptureWin32ClassTreeWithOperations(
+        Handle(1), operations, &tree);
+
+    WXI_REQUIRE_EQ(status.code, winexinfo::ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH);
+    WXI_REQUIRE_EQ(status.hresult, S_FALSE);
+    WXI_REQUIRE_EQ(status.win32, DWORD{ERROR_SUCCESS});
+}
+
+WXI_TEST(
+    uia_contract_probe_failure_exit_classification,
+    "uia_contract.probe_failure_exit_classification") {
+    WXI_REQUIRE(!winexinfo::IsProbeTransportFailure({
+        winexinfo::ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH,
+        S_FALSE,
+        ERROR_SUCCESS,
+    }));
+    WXI_REQUIRE(winexinfo::IsProbeTransportFailure({
+        winexinfo::ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH,
+        HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED),
+        ERROR_ACCESS_DENIED,
+    }));
+    WXI_REQUIRE(winexinfo::IsProbeTransportFailure({
+        winexinfo::ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH,
+        static_cast<HRESULT>(UIA_E_ELEMENTNOTAVAILABLE),
+        ERROR_SUCCESS,
+    }));
 }
 
 WXI_TEST(

@@ -16,29 +16,39 @@ Win32ContractResult ValidateWin32Contract(const Win32ClassTree& classTree) {
         return {classTree.capture_status, classTree, nullptr, nullptr};
     }
 
-    std::vector<HWND> shellTabs;
-    for (const Win32ClassNode& node : classTree.nodes) {
-        if (node.class_name != L"ShellTabWindowClass" || !node.visible) {
+    const Win32ClassNode* selectedShellTab = nullptr;
+    for (const HWND zOrderChild : classTree.top_level_child_z_order) {
+        const Win32ClassNode* node = nullptr;
+        for (const Win32ClassNode& candidate : classTree.nodes) {
+            if (candidate.hwnd == zOrderChild) {
+                node = &candidate;
+                break;
+            }
+        }
+        if (node == nullptr || node->parent != classTree.top_level) {
+            return {
+                {ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH, S_FALSE, ERROR_SUCCESS},
+                classTree,
+                nullptr,
+                nullptr,
+            };
+        }
+        if (node->class_name != L"ShellTabWindowClass") {
             continue;
         }
-
-        HWND parent = node.parent;
-        while (parent != nullptr && parent != classTree.top_level) {
-            const Win32ClassNode* parentNode = nullptr;
-            for (const Win32ClassNode& candidate : classTree.nodes) {
-                if (candidate.hwnd == parent) {
-                    parentNode = &candidate;
-                    break;
-                }
-            }
-            parent = parentNode == nullptr ? nullptr : parentNode->parent;
+        if (!node->visible) {
+            return {
+                {ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH, S_FALSE, ERROR_SUCCESS},
+                classTree,
+                node->hwnd,
+                nullptr,
+            };
         }
-        if (parent == classTree.top_level) {
-            shellTabs.push_back(node.hwnd);
-        }
+        selectedShellTab = node;
+        break;
     }
 
-    if (shellTabs.size() != 1) {
+    if (selectedShellTab == nullptr) {
         return {
             {ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH, S_FALSE, ERROR_SUCCESS},
             classTree,
@@ -55,7 +65,7 @@ Win32ContractResult ValidateWin32Contract(const Win32ClassTree& classTree) {
         }
 
         HWND parent = node.parent;
-        while (parent != nullptr && parent != shellTabs[0]) {
+        while (parent != nullptr && parent != selectedShellTab->hwnd) {
             const Win32ClassNode* parentNode = nullptr;
             for (const Win32ClassNode& candidate : classTree.nodes) {
                 if (candidate.hwnd == parent) {
@@ -65,7 +75,7 @@ Win32ContractResult ValidateWin32Contract(const Win32ClassTree& classTree) {
             }
             parent = parentNode == nullptr ? nullptr : parentNode->parent;
         }
-        if (parent == shellTabs[0]) {
+        if (parent == selectedShellTab->hwnd) {
             views.push_back(node.hwnd);
             selectedViewVisible = node.visible;
         }
@@ -75,7 +85,7 @@ Win32ContractResult ValidateWin32Contract(const Win32ClassTree& classTree) {
         return {
             {ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH, S_FALSE, ERROR_SUCCESS},
             classTree,
-            shellTabs[0],
+            selectedShellTab->hwnd,
             nullptr,
         };
     }
@@ -83,7 +93,7 @@ Win32ContractResult ValidateWin32Contract(const Win32ClassTree& classTree) {
     return {
         {ErrorCode::OK, S_OK, ERROR_SUCCESS},
         classTree,
-        shellTabs[0],
+        selectedShellTab->hwnd,
         views[0],
     };
 }
@@ -172,7 +182,8 @@ Status CaptureWin32ClassTreeWithOperations(
     if (output == nullptr || topLevel == nullptr || !operations.get_class_name ||
         !operations.get_window_rect || !operations.is_window_visible ||
         !operations.enum_child_windows || !operations.get_parent ||
-        !operations.set_last_error || !operations.get_last_error) {
+        !operations.set_last_error || !operations.get_last_error ||
+        !operations.get_top_window || !operations.get_next_window) {
         return {
             ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH,
             E_INVALIDARG,
@@ -180,7 +191,7 @@ Status CaptureWin32ClassTreeWithOperations(
         };
     }
 
-    Win32ClassTree tree{topLevel, {}, {ErrorCode::OK, S_OK, ERROR_SUCCESS}};
+    Win32ClassTree tree{topLevel, {}, {ErrorCode::OK, S_OK, ERROR_SUCCESS}, {}};
     std::array<wchar_t, 256> topClass{};
     const int topClassLength = operations.get_class_name(
         topLevel, topClass.data(), static_cast<int>(topClass.size()));
@@ -208,6 +219,38 @@ Status CaptureWin32ClassTreeWithOperations(
         operations.is_window_visible(topLevel) != FALSE,
         topBounds,
     });
+
+    operations.set_last_error(ERROR_SUCCESS);
+    HWND zOrderChild = operations.get_top_window(topLevel);
+    DWORD zOrderError = zOrderChild == nullptr ? operations.get_last_error() : ERROR_SUCCESS;
+    if (zOrderError != ERROR_SUCCESS) {
+        return {
+            ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH,
+            HRESULT_FROM_WIN32(zOrderError),
+            zOrderError,
+        };
+    }
+    while (zOrderChild != nullptr) {
+        if (std::ranges::find(tree.top_level_child_z_order, zOrderChild) !=
+            tree.top_level_child_z_order.end()) {
+            return {
+                ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH,
+                S_FALSE,
+                ERROR_SUCCESS,
+            };
+        }
+        tree.top_level_child_z_order.push_back(zOrderChild);
+        operations.set_last_error(ERROR_SUCCESS);
+        zOrderChild = operations.get_next_window(zOrderChild);
+        zOrderError = zOrderChild == nullptr ? operations.get_last_error() : ERROR_SUCCESS;
+        if (zOrderError != ERROR_SUCCESS) {
+            return {
+                ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH,
+                HRESULT_FROM_WIN32(zOrderError),
+                zOrderError,
+            };
+        }
+    }
 
     struct TreeContext final {
         Win32ClassTree* tree;
@@ -274,6 +317,53 @@ Status CaptureWin32ClassTreeWithOperations(
         return context.status;
     }
 
+    std::vector<HWND> confirmedZOrder;
+    operations.set_last_error(ERROR_SUCCESS);
+    zOrderChild = operations.get_top_window(topLevel);
+    zOrderError = zOrderChild == nullptr ? operations.get_last_error() : ERROR_SUCCESS;
+    if (zOrderError != ERROR_SUCCESS) {
+        tree.capture_status = {
+            ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH,
+            HRESULT_FROM_WIN32(zOrderError),
+            zOrderError,
+        };
+        *output = std::move(tree);
+        return output->capture_status;
+    }
+    while (zOrderChild != nullptr) {
+        if (std::ranges::find(confirmedZOrder, zOrderChild) != confirmedZOrder.end()) {
+            tree.capture_status = {
+                ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH,
+                S_FALSE,
+                ERROR_SUCCESS,
+            };
+            *output = std::move(tree);
+            return output->capture_status;
+        }
+        confirmedZOrder.push_back(zOrderChild);
+        operations.set_last_error(ERROR_SUCCESS);
+        zOrderChild = operations.get_next_window(zOrderChild);
+        zOrderError = zOrderChild == nullptr ? operations.get_last_error() : ERROR_SUCCESS;
+        if (zOrderError != ERROR_SUCCESS) {
+            tree.capture_status = {
+                ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH,
+                HRESULT_FROM_WIN32(zOrderError),
+                zOrderError,
+            };
+            *output = std::move(tree);
+            return output->capture_status;
+        }
+    }
+    if (confirmedZOrder != tree.top_level_child_z_order) {
+        tree.capture_status = {
+            ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH,
+            S_FALSE,
+            ERROR_SUCCESS,
+        };
+        *output = std::move(tree);
+        return output->capture_status;
+    }
+
     std::ranges::sort(tree.nodes.begin() + 1, tree.nodes.end(), [](const auto& left, const auto& right) {
         return reinterpret_cast<std::uintptr_t>(left.hwnd) <
             reinterpret_cast<std::uintptr_t>(right.hwnd);
@@ -295,6 +385,8 @@ Status CaptureWin32ClassTree(const HWND topLevel, Win32ClassTree* const output) 
         [](const HWND hwnd) { return GetParent(hwnd); },
         [](const DWORD error) { SetLastError(error); },
         []() { return GetLastError(); },
+        [](const HWND hwnd) { return GetTopWindow(hwnd); },
+        [](const HWND hwnd) { return GetWindow(hwnd, GW_HWNDNEXT); },
     };
     return CaptureWin32ClassTreeWithOperations(topLevel, operations, output);
 }

@@ -13,7 +13,10 @@
 ## Global Constraints
 
 - 대상 OS는 Windows 11 Pro 25H2 `10.0.26200.8655`, AMD64 하나다.
-- 대상 `explorer.exe` 버전은 `10.0.26100.8457`, `ExplorerFrame.dll`은 `10.0.26100.8457`, `shell32.dll`은 `10.0.26100.8521`이다.
+- 대상 `explorer.exe`, `ExplorerFrame.dll`, `shell32.dll`의
+  `VS_FIXEDFILEINFO.dwFileVersionMS/LS` 버전은 모두 `10.0.26100.8655`다.
+- Host application manifest는 Windows 10/11
+  `supportedOS={8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}`를 내장한다.
 - Release runtime은 static CRT와 Control Flow Guard를 사용한다.
 - CLR과 제3자 runtime 또는 package dependency를 추가하지 않는다.
 - lookup은 설계 문서의 exact class, AutomationId, interface, event ID만 사용한다.
@@ -308,6 +311,8 @@ The exact build-script failures are `BUILD_TOOL_NOT_FOUND: vswhere`, `BUILD_TOOL
 - Create: `src/probe/probe_runner.h`
 - Create: `src/probe/probe_runner.cpp`
 - Create: `src/host/main.cpp`
+- Create: `src/host/WinExInfoHost.manifest`
+- Create: `tests/host_manifest_tests.cpp`
 - Create: `tests/target_validation_tests.cpp`
 - Create: `tests/uia_contract_tests.cpp`
 - Create on live Gate A failure: `docs/superpowers/evidence/2026-07-10-winexinfo-gate-a.md`
@@ -322,12 +327,12 @@ The exact build-script failures are `BUILD_TOOL_NOT_FOUND: vswhere`, `BUILD_TOOL
 | Signature | `CryptCATAdminCalcHashFromFileHandle2`→`CryptCATAdminEnumCatalogFromHash`→`WinVerifyTrust` with `WINTRUST_CATALOG_INFO`, `WTD_CACHE_ONLY_URL_RETRIEVAL`, and `WTD_REVOKE_NONE`; signer subject equals `CN=Microsoft Windows, O=Microsoft Corporation, L=Redmond, S=Washington, C=US`; no embedded-signature path |
 | Token/session | target user SID and session equal Host; target integrity level equals Host |
 | Architecture | native AMD64 only; WOW64 or another native machine fails |
-| File versions | `explorer.exe=10.0.26100.8457`, `ExplorerFrame.dll=10.0.26100.8457`, `shell32.dll=10.0.26100.8521` from fixed version resources only |
+| File versions | `VS_FIXEDFILEINFO.dwFileVersionMS/LS` only: `explorer.exe=10.0.26100.8655`, `ExplorerFrame.dll=10.0.26100.8655`, `shell32.dll=10.0.26100.8655`; Host embeds Windows 10/11 `supportedOS={8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}` so version.dll does not return an older compatibility context |
 | Mitigations | `DisableExtensionPoints=OFF`, `MicrosoftSignedOnly=OFF`, `CFG=ON`, `StrictCFG=OFF` |
 | Preflight errors | OS mismatch=`UNSUPPORTED_OS_BUILD`; file-version mismatch=`UNSUPPORTED_EXPLORER_BUILD`; any mitigation mismatch=`TARGET_MITIGATION_BLOCKED`; every other target mismatch=`TARGET_VALIDATION_FAILED` |
 | `EnumerateExplorerWindows` | visible top-level `CabinetWClass` windows only; records HWND, PID, UI thread ID |
-| HWND tree | exact parent/child class snapshot including `ShellTabWindowClass`, `DUIViewWndClassName`, `DirectUIHWND`, `msctls_statusbar32` |
-| Active tab HWND | exactly one visible `ShellTabWindowClass` descendant; zero/multiple returns `EXPLORER_UI_CONTRACT_MISMATCH` |
+| HWND tree | exact parent/child class snapshot including `ShellTabWindowClass`, `DUIViewWndClassName`, `DirectUIHWND`, `msctls_statusbar32`; capture the top-level direct-child z-order before and after the tree and require the two sequences to be identical |
+| Active tab HWND | scan the documented direct-child z-order from `GetTopWindow` through `GetWindow(..., GW_HWNDNEXT)` and select the first exact `ShellTabWindowClass`; multiple ShellTab siblings are valid, but zero candidates or a hidden first exact candidate returns `EXPLORER_UI_CONTRACT_MISMATCH` without selecting a later candidate |
 | Active view parent HWND | under the selected ShellTab, all `DUIViewWndClassName` descendants are counted regardless of visibility; exactly one must exist and be visible, otherwise `EXPLORER_UI_CONTRACT_MISMATCH` |
 | UIA search scope | `ElementFromHandle(active DUIViewWndClassName)` `TreeScope_Subtree` for StatusBar; top-level Explorer element `TreeScope_Subtree` for TabView; selected StatusBar `TreeScope_Children` for Groups; selected TabView `TreeScope_Children` for TabListView; no inactive-tab or desktop-global search |
 | StatusBar selector | FrameworkId `DirectUI`, ControlType StatusBar, AutomationId/ClassName `StatusBarModuleInner`, NativeWindowHandle 0 |
@@ -340,7 +345,7 @@ The exact build-script failures are `BUILD_TOOL_NOT_FOUND: vswhere`, `BUILD_TOOL
 
 - [ ] **Step 1: Write failing target-validation and exact-selector tests**
 
-  Add validation cases for the exact inspected target; missing exact UBR value; alternate version source; path-equal/file-ID-different; signer mismatch; signature cache miss; different SID/session/integrity; WOW64; each file-version mismatch; each mitigation mismatch; and a cache-only verification policy that cannot request network data. Add UI cases for zero/multiple visible `ShellTabWindowClass` candidates; zero/multiple total `DUIViewWndClassName` descendants; one visible plus one hidden DUIView duplicate; one exact but hidden DUIView; missing UIA element; duplicate UIA element; alternate AutomationId; alternate FrameworkId; wrong parent scope; nonzero StatusBar or Group native HWND; and localized Name-only matches. Add a Win32 class-tree test that proves the zero-width `msctls_statusbar32` is recorded but never selected.
+  Add validation cases for the exact inspected target; missing exact UBR value; alternate version source; path-equal/file-ID-different; signer mismatch; signature cache miss; different SID/session/integrity; WOW64; each file-version mismatch; each mitigation mismatch; and a cache-only verification policy that cannot request network data. Verify the built Host manifest resource contains exactly one Windows 10/11 `supportedOS` GUID. Add UI cases for an empty direct-child z-order; multiple visible `ShellTabWindowClass` siblings with the first z-order candidate selected; a hidden first exact candidate followed by a visible candidate; changed or cyclic z-order capture; zero/multiple total `DUIViewWndClassName` descendants; one visible plus one hidden DUIView duplicate; one exact but hidden DUIView; missing UIA element; duplicate UIA element; alternate AutomationId; alternate FrameworkId; wrong parent scope; nonzero StatusBar or Group native HWND; and localized Name-only matches. Add a Win32 class-tree test that proves the zero-width `msctls_statusbar32` is recorded but never selected.
 
 - [ ] **Step 2: Run the UIA tests and verify red**
 
@@ -356,7 +361,7 @@ The exact build-script failures are `BUILD_TOOL_NOT_FOUND: vswhere`, `BUILD_TOOL
 
 - [ ] **Step 3: Implement target preflight, then static Win32/UIA capture and validation**
 
-  Complete every preflight row before opening UIA state for that PID. Use only `RtlGetVersion`, the exact UBR registry value, fixed version resources, opened-file identity, cache-only catalog verification, process tokens/session, `IsWow64Process2`, and exact process mitigation policies; a missing source fails and never triggers an alternate lookup. Run UI Automation in an MTA worker. Use cached FrameworkId, ControlType, ClassName, AutomationId, ProcessId, NativeWindowHandle, BoundingRectangle, and IsOffscreen properties. Convert screen rectangles without changing any target window. Exact cardinality and Win32/UIA transport failures serialize `EXPLORER_UI_CONTRACT_MISMATCH`; transport failures also retain the exact HRESULT or Win32 code and make Host exit 3.
+  Complete every preflight row before opening UIA state for that PID. Use only `RtlGetVersion`, the exact UBR registry value, `VS_FIXEDFILEINFO.dwFileVersionMS/LS`, opened-file identity, cache-only catalog verification, process tokens/session, `IsWow64Process2`, and exact process mitigation policies; a missing source fails and never triggers an alternate lookup. Embed the Windows 10/11 `supportedOS` GUID in the Host manifest before reading version resources. Capture the top-level direct-child z-order before and after descendant enumeration, reject a changed sequence or a repeated HWND, and retain exact GetTopWindow/GetWindow errors. Run UI Automation in an MTA worker. Use cached FrameworkId, ControlType, ClassName, AutomationId, ProcessId, NativeWindowHandle, BoundingRectangle, and IsOffscreen properties. Convert screen rectangles without changing any target window. Exact cardinality and Win32/UIA transport failures serialize `EXPLORER_UI_CONTRACT_MISMATCH`; transport failures also retain the exact HRESULT or Win32 code and make Host exit 3.
 
 - [ ] **Step 4: Add and build `WinExInfoHost.exe --probe snapshot`**
 
@@ -405,7 +410,7 @@ The exact build-script failures are `BUILD_TOOL_NOT_FOUND: vswhere`, `BUILD_TOOL
 | Produces | Exact contract |
 |---|---|
 | Shell enumeration | `IShellWindows` entries whose `IWebBrowser2::HWND` equals one probed top-level HWND |
-| Browser mapping | `IWebBrowser2`→`IServiceProvider`→`QueryService(SID_STopLevelBrowser, IID_IShellBrowser)` |
+| Browser mapping | `IWebBrowser2`→`IServiceProvider`→`QueryService(SID_STopLevelBrowser, IID_IShellBrowser)`; `IShellBrowser::GetWindow` must equal the selected first-z-order `ShellTabWindowClass` for exactly one entry |
 | View mapping | `QueryActiveShellView`→`IShellView::GetWindow`; view must be visible descendant of active `ShellTabWindowClass` |
 | Active selection | exactly one qualifying view; zero/multiple returns `ACTIVE_VIEW_CONTRACT_MISMATCH` |
 | Folder path | `IFolderView::GetFolder`→`IShellFolder`→`SHGetIDListFromObject` absolute PIDL→`SHCreateItemFromIDList` `IShellItem`→`SIGDN_FILESYSPATH` |
@@ -414,7 +419,7 @@ The exact build-script failures are `BUILD_TOOL_NOT_FOUND: vswhere`, `BUILD_TOOL
 
 - [ ] **Step 1: Write failing active-view selection tests**
 
-  Add exact tests for one visible descendant, zero candidates, two candidates, same HWND but hidden view, visible view under the wrong `ShellTabWindowClass`, non-filesystem Shell item, PIDL conversion failure, and duplicate Shell entries pointing to the same visible view.
+  Add exact tests for one browser HWND equal to the selected ShellTab and one visible descendant view; zero or two matching browser HWNDs; same HWND but hidden view; visible view under the wrong `ShellTabWindowClass`; non-filesystem Shell item; PIDL conversion failure; and duplicate Shell entries pointing to the same visible view.
 
 - [ ] **Step 2: Run the targeted tests and verify red**
 

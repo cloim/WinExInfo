@@ -10,6 +10,7 @@ struct ProbeRunResult final {
     HostExitCode exit_code;
 };
 
+[[nodiscard]] bool IsProbeTransportFailure(const Status& status);
 [[nodiscard]] ProbeRunResult RunSnapshotProbe();
 
 }  // namespace winexinfo

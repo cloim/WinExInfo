@@ -20,12 +20,14 @@ enable_testing()
 add_executable(WinExInfoTests
   src/common/utf8.cpp
   src/host/command_line.cpp
+  src/probe/probe_runner.cpp
   src/probe/report_writer.cpp
   src/probe/target_validator.cpp
   src/probe/uia_probe.cpp
   src/probe/win32_probe.cpp
   tests/command_line_tests.cpp
   tests/contracts_tests.cpp
+  tests/host_manifest_tests.cpp
   tests/target_validation_tests.cpp
   tests/test_framework.cpp
   tests/test_main.cpp
@@ -70,6 +72,7 @@ add_executable(WinExInfoHost
   src/common/utf8.cpp
   src/host/command_line.cpp
   src/host/main.cpp
+  src/host/WinExInfoHost.manifest
   src/probe/probe_runner.cpp
   src/probe/report_writer.cpp
   src/probe/target_validator.cpp
@@ -107,3 +110,5 @@ target_link_libraries(WinExInfoHost PRIVATE
 set_target_properties(WinExInfoHost PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
+
+add_dependencies(WinExInfoTests WinExInfoHost)

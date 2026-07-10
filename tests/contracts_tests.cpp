@@ -23,11 +23,11 @@ WXI_TEST(contracts_target_versions, "contracts.target_versions") {
     WXI_REQUIRE_EQ(winexinfo::kTargetOsUbr, 8655U);
     WXI_REQUIRE_EQ(winexinfo::kTargetMachine, IMAGE_FILE_MACHINE_AMD64);
     WXI_REQUIRE_EQ(sizeof(void*), 8U);
-    WXI_REQUIRE_EQ(winexinfo::kTargetExplorerVersion, std::wstring_view{L"10.0.26100.8457"});
+    WXI_REQUIRE_EQ(winexinfo::kTargetExplorerVersion, std::wstring_view{L"10.0.26100.8655"});
     WXI_REQUIRE_EQ(
         winexinfo::kTargetExplorerFrameVersion,
-        std::wstring_view{L"10.0.26100.8457"});
-    WXI_REQUIRE_EQ(winexinfo::kTargetShell32Version, std::wstring_view{L"10.0.26100.8521"});
+        std::wstring_view{L"10.0.26100.8655"});
+    WXI_REQUIRE_EQ(winexinfo::kTargetShell32Version, std::wstring_view{L"10.0.26100.8655"});
 }
 
 WXI_TEST(contracts_error_names, "contracts.error_names") {

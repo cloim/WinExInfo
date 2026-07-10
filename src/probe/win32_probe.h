@@ -28,6 +28,7 @@ struct Win32ClassTree final {
     HWND top_level;
     std::vector<Win32ClassNode> nodes;
     Status capture_status;
+    std::vector<HWND> top_level_child_z_order;
 };
 
 struct Win32ContractResult final {
@@ -45,6 +46,8 @@ struct Win32ProbeOperations final {
     std::function<HWND(HWND)> get_parent;
     std::function<void(DWORD)> set_last_error;
     std::function<DWORD()> get_last_error;
+    std::function<HWND(HWND)> get_top_window;
+    std::function<HWND(HWND)> get_next_window;
 };
 
 [[nodiscard]] Win32ContractResult ValidateWin32Contract(const Win32ClassTree& classTree);

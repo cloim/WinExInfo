@@ -72,6 +72,10 @@ void AppendUiaElement(
 
 }  // namespace
 
+bool IsProbeTransportFailure(const Status& status) {
+    return status.win32 != ERROR_SUCCESS || FAILED(status.hresult);
+}
+
 ProbeRunResult RunSnapshotProbe() {
     std::vector<ExplorerWindowRecord> windows;
     const Status enumerationStatus = EnumerateExplorerWindows(&windows);
@@ -133,7 +137,7 @@ ProbeRunResult RunSnapshotProbe() {
             if (firstError == ErrorCode::OK) {
                 firstError = treeCapture.code;
             }
-            transportFailure = true;
+            transportFailure = transportFailure || IsProbeTransportFailure(treeCapture);
             section.fields.push_back(
                 {prefix + ".error_code", std::string{ToString(treeCapture.code)}});
             section.fields.push_back(
@@ -164,7 +168,7 @@ ProbeRunResult RunSnapshotProbe() {
             if (firstError == ErrorCode::OK) {
                 firstError = conversionStatus.code;
             }
-            transportFailure = true;
+            transportFailure = transportFailure || IsProbeTransportFailure(conversionStatus);
             section.fields.push_back(
                 {prefix + ".error_code", std::string{ToString(conversionStatus.code)}});
             section.fields.push_back(
@@ -212,7 +216,7 @@ ProbeRunResult RunSnapshotProbe() {
             if (firstError == ErrorCode::OK) {
                 firstError = workerStatus.code;
             }
-            transportFailure = true;
+            transportFailure = transportFailure || IsProbeTransportFailure(workerStatus);
             section.fields.push_back(
                 {prefix + ".error_code", std::string{ToString(workerStatus.code)}});
             section.fields.push_back(
@@ -287,7 +291,7 @@ ProbeRunResult RunSnapshotProbe() {
             if (firstError == ErrorCode::OK) {
                 firstError = conversionStatus.code;
             }
-            transportFailure = true;
+            transportFailure = transportFailure || IsProbeTransportFailure(conversionStatus);
             section.fields.push_back(
                 {prefix + ".error_code", std::string{ToString(conversionStatus.code)}});
             section.fields.push_back(
