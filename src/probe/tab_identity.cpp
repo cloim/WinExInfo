@@ -149,7 +149,11 @@ Status ReconcileObserverTabSet(
         }
         activeShellTabs.emplace(order.top_level, active);
     }
-    if (orderedTabs != currentTargetTabs) {
+    if (!std::includes(
+            currentTargetTabs.begin(),
+            currentTargetTabs.end(),
+            orderedTabs.begin(),
+            orderedTabs.end())) {
         return ContractFailure();
     }
 

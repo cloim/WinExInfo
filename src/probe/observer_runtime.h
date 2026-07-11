@@ -262,6 +262,9 @@ struct ObserverCurrentReconcileOutcome final {
     ObserverCurrentTabState* state,
     ObserverCurrentReconcileOutcome* output) noexcept;
 
+[[nodiscard]] bool IsIgnorableObserverTabRefreshResult(
+    const ObserverOperationResult& result) noexcept;
+
 struct ObserverShellStartupOutcome final {
     ObserverOperationResult setup;
     bool any_setup_transport_failure;

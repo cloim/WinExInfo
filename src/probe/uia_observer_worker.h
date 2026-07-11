@@ -56,6 +56,9 @@ struct ObserverUiaHandlerRemovalOperations final {
         remove_structure;
 };
 
+[[nodiscard]] bool IsIgnorableObserverUiaCallbackStatus(
+    const Status& status) noexcept;
+
 [[nodiscard]] ObserverCleanupOutcome RemoveObserverUiaHandlerRegistrations(
     const ObserverUiaHandlerRemovalOperations& operations,
     ObserverUiaHandlerRemovalState* state) noexcept;

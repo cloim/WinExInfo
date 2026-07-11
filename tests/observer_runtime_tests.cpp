@@ -519,6 +519,29 @@ winexinfo::EventObservationSnapshot PassingProductionGateSnapshot() {
 }  // namespace
 
 WXI_TEST(
+    observer_runtime_ignores_only_transient_tab_refresh_mismatch,
+    "observer_runtime.transient_tab_refresh_mismatch") {
+    const winexinfo::ObserverOperationResult transient{
+        {
+            winexinfo::ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH,
+            S_FALSE,
+            ERROR_INVALID_DATA,
+        },
+        winexinfo::ObserverFailureOrigin::Transport,
+    };
+    WXI_REQUIRE(winexinfo::IsIgnorableObserverTabRefreshResult(transient));
+    auto otherWin32 = transient;
+    otherWin32.status.win32 = ERROR_INVALID_PARAMETER;
+    WXI_REQUIRE(!winexinfo::IsIgnorableObserverTabRefreshResult(otherWin32));
+    auto otherHresult = transient;
+    otherHresult.status.hresult = E_FAIL;
+    WXI_REQUIRE(!winexinfo::IsIgnorableObserverTabRefreshResult(otherHresult));
+    auto otherOrigin = transient;
+    otherOrigin.failure_origin = winexinfo::ObserverFailureOrigin::Contract;
+    WXI_REQUIRE(!winexinfo::IsIgnorableObserverTabRefreshResult(otherOrigin));
+}
+
+WXI_TEST(
     observer_runtime_callback_queue_assigns_gapless_fifo_after_emplace,
     "observer_runtime.callback_queue_gapless_fifo") {
     DWORD lastError = ERROR_SUCCESS;

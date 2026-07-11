@@ -2,6 +2,7 @@
 
 #include "probe/uia_observer_worker.h"
 
+#include <UIAutomationCoreApi.h>
 #include <Windows.h>
 
 #include <chrono>
@@ -21,6 +22,31 @@ winexinfo::ObserverOperationResult SuccessOperation() {
 }
 
 }  // namespace
+
+WXI_TEST(
+    uia_observer_worker_ignores_only_stale_callback_statuses,
+    "uia_observer_worker.stale_callback_status") {
+    WXI_REQUIRE(winexinfo::IsIgnorableObserverUiaCallbackStatus({
+        winexinfo::ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH,
+        static_cast<HRESULT>(UIA_E_ELEMENTNOTAVAILABLE),
+        ERROR_SUCCESS,
+    }));
+    WXI_REQUIRE(winexinfo::IsIgnorableObserverUiaCallbackStatus({
+        winexinfo::ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH,
+        S_FALSE,
+        ERROR_SUCCESS,
+    }));
+    WXI_REQUIRE(!winexinfo::IsIgnorableObserverUiaCallbackStatus({
+        winexinfo::ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH,
+        RPC_E_DISCONNECTED,
+        ERROR_SUCCESS,
+    }));
+    WXI_REQUIRE(!winexinfo::IsIgnorableObserverUiaCallbackStatus({
+        winexinfo::ErrorCode::OK,
+        S_OK,
+        ERROR_SUCCESS,
+    }));
+}
 
 WXI_TEST(
     uia_observer_worker_preserves_fifo_signal_and_cleanup,

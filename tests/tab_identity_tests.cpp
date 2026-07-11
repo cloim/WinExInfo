@@ -151,6 +151,36 @@ WXI_TEST(
 }
 
 WXI_TEST(
+    tab_identity_ignores_stale_shell_metadata_after_hwnd_removal,
+    "tab_identity.stale_removed_shell_metadata") {
+    const std::array previous{
+        Identity(11, 0x100, 0x101, 1, 1),
+        Identity(22, 0x100, 0x102, 1, 1),
+    };
+    const std::array current{
+        Target(11, 0x100, 0x101),
+        Target(22, 0x100, 0x102),
+    };
+    const std::array orders{
+        Order(0x100, {{Handle(0x101), true}}),
+    };
+    const auto generations = Generations(
+        {{Handle(0x100), 1}},
+        {{Handle(0x101), 1}, {Handle(0x102), 1}});
+
+    winexinfo::ObserverTabSetReconciliation output{};
+    WXI_REQUIRE(winexinfo::ReconcileObserverTabSet(
+                    previous, current, orders, generations, &output)
+                    .ok());
+    WXI_REQUIRE_EQ(
+        output.current,
+        std::vector{Identity(11, 0x100, 0x101, 1, 1)});
+    WXI_REQUIRE_EQ(
+        output.removed,
+        std::vector{Identity(22, 0x100, 0x102, 1, 1)});
+}
+
+WXI_TEST(
     tab_identity_rejects_incomplete_or_duplicate_bijections,
     "tab_identity.bijection_failures") {
     const std::array<winexinfo::ObserverTabIdentity, 0> previous{};
@@ -158,7 +188,9 @@ WXI_TEST(
         Target(11, 0x100, 0x101),
         Target(22, 0x100, 0x102),
     };
-    const std::array missingOrder{Order(0x100, {{Handle(0x101), true}})};
+    const std::array mismatchedTopLevel{
+        Order(0x200, {{Handle(0x101), true}}),
+    };
     const std::array extraOrder{Order(
         0x100,
         {{Handle(0x101), true}, {Handle(0x102), false}, {Handle(0x103), false}})};
@@ -170,7 +202,7 @@ WXI_TEST(
     auto output = sentinel;
 
     RequireContractFailure(winexinfo::ReconcileObserverTabSet(
-        previous, current, missingOrder, {}, &output));
+        previous, current, mismatchedTopLevel, {}, &output));
     WXI_REQUIRE_EQ(output, sentinel);
     RequireContractFailure(winexinfo::ReconcileObserverTabSet(
         previous, current, extraOrder, {}, &output));

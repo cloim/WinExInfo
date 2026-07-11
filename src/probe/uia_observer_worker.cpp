@@ -75,6 +75,14 @@ ObserverCleanupOutcome CleanupFromOperation(
 
 }  // namespace
 
+bool IsIgnorableObserverUiaCallbackStatus(const Status& status) noexcept {
+    return status.code == ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH &&
+        status.win32 == ERROR_SUCCESS &&
+        (status.hresult ==
+             static_cast<HRESULT>(UIA_E_ELEMENTNOTAVAILABLE) ||
+         status.hresult == S_FALSE);
+}
+
 struct ObserverUiaMtaWorker::Impl final {
     enum class Phase {
         Created,
@@ -469,6 +477,10 @@ public:
             return S_OK;
         }
         const auto fail = [&](const Status& status) {
+            if (IsIgnorableObserverUiaCallbackStatus(status)) {
+                static_cast<void>(queue_->CompleteIgnored(ticket));
+                return S_OK;
+            }
             const ObserverFailureOrigin origin =
                 FAILED(status.hresult) || status.win32 != ERROR_SUCCESS
                 ? ObserverFailureOrigin::Transport
@@ -654,6 +666,10 @@ public:
             return S_OK;
         }
         const auto fail = [&](const Status& status) {
+            if (IsIgnorableObserverUiaCallbackStatus(status)) {
+                static_cast<void>(queue_->CompleteIgnored(ticket));
+                return S_OK;
+            }
             const ObserverFailureOrigin origin =
                 FAILED(status.hresult) || status.win32 != ERROR_SUCCESS
                 ? ObserverFailureOrigin::Transport

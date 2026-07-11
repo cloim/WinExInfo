@@ -276,6 +276,14 @@ public:
                 : 0,
             &currentReconciliation);
         if (!currentReconciled.ok()) {
+            if (IsIgnorableObserverTabRefreshResult(currentReconciled)) {
+                return {
+                    RuntimeSuccessOperation(),
+                    ObserverEventDisposition::Ignored,
+                    envelope.sequence,
+                    std::nullopt,
+                };
+            }
             return FailureResult(envelope.sequence, currentReconciled);
         }
         if (envelope.payload.source == ObserverCallbackSource::ShellLifecycle) {
@@ -1095,6 +1103,16 @@ private:
 };
 
 }  // namespace
+
+bool IsIgnorableObserverTabRefreshResult(
+    const ObserverOperationResult& result) noexcept {
+    return result.status.code ==
+            ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH &&
+        result.status.hresult == S_FALSE &&
+        result.status.win32 == ERROR_INVALID_DATA &&
+        result.failure_origin ==
+            std::optional{ObserverFailureOrigin::Transport};
+}
 
 ObserverOperationResult EvaluateEventObservationGate(
     const EventObservationSnapshot& snapshot,
