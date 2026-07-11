@@ -38,6 +38,7 @@ struct RuntimeContext final {
 };
 
 std::atomic<RuntimeContext*> g_runtime{nullptr};
+HookCallbackGate g_callback_gate;
 
 Status WriteAttachResult(
     const HANDLE pipe,
@@ -81,10 +82,13 @@ DWORD WINAPI RuntimeWorker(void* const parameter) {
     status = ipc::ReadFrame(&pipe, &request);
     const bool detachRequested = status.ok() &&
         ipc::DecodeDetachRequest(request).ok();
-    if ((status.ok() && !detachRequested) ||
-        !context->state.BeginStop().ok()) {
+    if (!context->state.BeginStop().ok()) {
         context.release();
         return 1;
+    }
+    g_callback_gate.RejectNewWork();
+    if (!detachRequested) {
+        pipe.reset();
     }
 
     status = RequestStatusPaneRemoval(context->pane.hwnd);
@@ -94,6 +98,10 @@ DWORD WINAPI RuntimeWorker(void* const parameter) {
         return 1;
     }
     context->pane = {};
+    if (!DrainHookCallbacksForUnload(g_callback_gate, 5000).ok()) {
+        context.release();
+        return 1;
+    }
     if (WaitForSingleObject(context->hook_released.get(), 0) != WAIT_OBJECT_0) {
         context.release();
         return 1;
@@ -122,6 +130,58 @@ DWORD WINAPI RuntimeWorker(void* const parameter) {
 }
 
 }  // namespace
+
+bool HookCallbackGate::Enter() noexcept {
+    std::uint64_t state = rundown_.load(std::memory_order_acquire);
+    do {
+        if ((state & kClosed) != 0 || (state & kCountMask) == kCountMask) {
+            return false;
+        }
+    } while (!rundown_.compare_exchange_weak(
+        state, state + 1, std::memory_order_acq_rel));
+    return true;
+}
+
+void HookCallbackGate::Leave() noexcept {
+    rundown_.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+void HookCallbackGate::RejectNewWork() noexcept {
+    rundown_.fetch_or(kClosed, std::memory_order_acq_rel);
+}
+
+bool HookCallbackGate::WaitForZero(const DWORD timeoutMs) const noexcept {
+    const ULONGLONG deadline = GetTickCount64() + timeoutMs;
+    do {
+        if ((rundown_.load(std::memory_order_acquire) & kCountMask) == 0) {
+            return true;
+        }
+        if (GetTickCount64() >= deadline) {
+            return false;
+        }
+        Sleep(1);
+    } while (true);
+}
+
+std::uint32_t HookCallbackGate::in_flight() const noexcept {
+    return static_cast<std::uint32_t>(
+        rundown_.load(std::memory_order_acquire) & kCountMask);
+}
+
+HookCallbackGate& ProcessHookCallbackGate() noexcept {
+    return g_callback_gate;
+}
+
+Status DrainHookCallbacksForUnload(
+    HookCallbackGate& gate,
+    const DWORD timeoutMs) noexcept {
+    return gate.WaitForZero(timeoutMs)
+        ? Success()
+        : Status{
+              ErrorCode::DLL_UNLOAD_TIMEOUT,
+              HRESULT_FROM_WIN32(ERROR_TIMEOUT),
+              ERROR_TIMEOUT};
+}
 
 Status HookRuntimeStateMachine::BeginAttach() noexcept {
     if (state_ != RuntimeState::Stopped) {

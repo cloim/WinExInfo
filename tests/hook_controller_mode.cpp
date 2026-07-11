@@ -142,29 +142,84 @@ bool IsNativeAmd64(const HANDLE process) {
         nativeMachine == IMAGE_FILE_MACHINE_AMD64;
 }
 
-bool ModulePresent(const DWORD pid, const std::wstring_view moduleName) {
+enum class FileIdentityComparison {
+    Same,
+    Different,
+    Error,
+};
+
+FileIdentityComparison CompareFileIdentity(
+    const std::wstring_view firstPath,
+    const std::wstring_view secondPath) {
+    UniqueHandle first{CreateFileW(
+        std::wstring{firstPath}.c_str(), FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr)};
+    UniqueHandle second{CreateFileW(
+        std::wstring{secondPath}.c_str(), FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr)};
+    if (!first || !second) {
+        return FileIdentityComparison::Error;
+    }
+    BY_HANDLE_FILE_INFORMATION firstInfo{};
+    BY_HANDLE_FILE_INFORMATION secondInfo{};
+    if (GetFileInformationByHandle(first.get(), &firstInfo) == FALSE ||
+        GetFileInformationByHandle(second.get(), &secondInfo) == FALSE) {
+        return FileIdentityComparison::Error;
+    }
+    return firstInfo.dwVolumeSerialNumber == secondInfo.dwVolumeSerialNumber &&
+        firstInfo.nFileIndexHigh == secondInfo.nFileIndexHigh &&
+        firstInfo.nFileIndexLow == secondInfo.nFileIndexLow
+        ? FileIdentityComparison::Same
+        : FileIdentityComparison::Different;
+}
+
+enum class ModulePresence {
+    Present,
+    Absent,
+    Error,
+};
+
+ModulePresence QueryModulePresence(
+    const DWORD pid,
+    const std::wstring_view expectedDllPath) {
     UniqueHandle snapshot{CreateToolhelp32Snapshot(
         TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid)};
     if (!snapshot) {
-        return false;
+        return ModulePresence::Error;
     }
     MODULEENTRY32W entry{sizeof(MODULEENTRY32W)};
     if (Module32FirstW(snapshot.get(), &entry) == FALSE) {
-        return false;
+        return GetLastError() == ERROR_NO_MORE_FILES
+            ? ModulePresence::Absent
+            : ModulePresence::Error;
     }
     do {
-        if (std::wstring_view{entry.szModule} == moduleName) {
-            return true;
+        const FileIdentityComparison comparison =
+            CompareFileIdentity(entry.szExePath, expectedDllPath);
+        if (comparison == FileIdentityComparison::Error) {
+            return ModulePresence::Error;
+        }
+        if (comparison == FileIdentityComparison::Same) {
+            return ModulePresence::Present;
         }
     } while (Module32NextW(snapshot.get(), &entry) != FALSE);
-    return false;
+    return GetLastError() == ERROR_NO_MORE_FILES
+        ? ModulePresence::Absent
+        : ModulePresence::Error;
 }
 
-bool WaitForModuleState(const DWORD pid, const bool present) {
+bool WaitForModuleState(
+    const DWORD pid,
+    const std::wstring_view expectedDllPath,
+    const bool present) {
     const auto deadline = std::chrono::steady_clock::now() +
         std::chrono::seconds(5);
     do {
-        if (ModulePresent(pid, L"WinExInfoHook.dll") == present) {
+        const ModulePresence presence = QueryModulePresence(pid, expectedDllPath);
+        if ((present && presence == ModulePresence::Present) ||
+            (!present && presence == ModulePresence::Absent)) {
             return true;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(25));
@@ -196,6 +251,65 @@ bool CaptureProcessCounts(
     }
     *threads = count;
     return true;
+}
+
+bool WaitForStableProcessCounts(
+    const HANDLE targetProcess,
+    const DWORD targetPid,
+    DWORD* const targetHandles,
+    DWORD* const targetThreads,
+    DWORD* const controllerHandles,
+    DWORD* const controllerThreads) {
+    DWORD previousTargetHandles = 0;
+    DWORD previousTargetThreads = 0;
+    DWORD previousControllerHandles = 0;
+    DWORD previousControllerThreads = 0;
+    if (!CaptureProcessCounts(
+            targetProcess, targetPid,
+            &previousTargetHandles, &previousTargetThreads) ||
+        !CaptureProcessCounts(
+            GetCurrentProcess(), GetCurrentProcessId(),
+            &previousControllerHandles, &previousControllerThreads)) {
+        return false;
+    }
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::seconds(5);
+    std::uint32_t stableSamples = 0;
+    do {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        DWORD currentTargetHandles = 0;
+        DWORD currentTargetThreads = 0;
+        DWORD currentControllerHandles = 0;
+        DWORD currentControllerThreads = 0;
+        if (!CaptureProcessCounts(
+                targetProcess, targetPid,
+                &currentTargetHandles, &currentTargetThreads) ||
+            !CaptureProcessCounts(
+                GetCurrentProcess(), GetCurrentProcessId(),
+                &currentControllerHandles, &currentControllerThreads)) {
+            return false;
+        }
+        if (currentTargetHandles == previousTargetHandles &&
+            currentTargetThreads == previousTargetThreads &&
+            currentControllerHandles == previousControllerHandles &&
+            currentControllerThreads == previousControllerThreads) {
+            ++stableSamples;
+            if (stableSamples >= 5) {
+                *targetHandles = currentTargetHandles;
+                *targetThreads = currentTargetThreads;
+                *controllerHandles = currentControllerHandles;
+                *controllerThreads = currentControllerThreads;
+                return true;
+            }
+        } else {
+            stableSamples = 0;
+        }
+        previousTargetHandles = currentTargetHandles;
+        previousTargetThreads = currentTargetThreads;
+        previousControllerHandles = currentControllerHandles;
+        previousControllerThreads = currentControllerThreads;
+    } while (std::chrono::steady_clock::now() < deadline);
+    return false;
 }
 
 std::wstring HookDllPath() {
@@ -247,12 +361,16 @@ int RunHookControllerMode(const HookTestCommand& command) {
     std::cout << accepted.str() << '\n' << std::flush;
 
     std::uint64_t detachId = 0;
+    const std::wstring hookDllPath = HookDllPath();
+    if (hookDllPath.empty()) {
+        return 3;
+    }
     const std::uint32_t iterations =
         command.mode == HookTestMode::ControllerFault ? 1 : command.iterations;
     UniqueHandle* activePipe = nullptr;
     auto operations = injection::CreateProductionHookPlatformOperations(
-        HookDllPath(),
-        [&activePipe](
+        hookDllPath,
+        [&activePipe, expectedTargetPid = command.target_pid](
             const std::uint64_t attachId,
             const DWORD,
             injection::HookAttachReceipt* const output) {
@@ -264,6 +382,13 @@ int RunHookControllerMode(const HookTestCommand& command) {
                 const DWORD error = GetLastError();
                 return Status{ErrorCode::PIPE_DISCONNECTED,
                               HRESULT_FROM_WIN32(error), error};
+            }
+            ULONG clientPid = 0;
+            if (GetNamedPipeClientProcessId(activePipe->get(), &clientPid) == FALSE ||
+                clientPid != expectedTargetPid) {
+                activePipe->reset();
+                return Status{ErrorCode::TARGET_VALIDATION_FAILED,
+                              S_FALSE, ERROR_ACCESS_DENIED};
             }
             ipc::DecodedFrame frame{};
             ipc::AttachResult result{};
@@ -325,6 +450,20 @@ int RunHookControllerMode(const HookTestCommand& command) {
     }
     operations.close_event(warmupEvent.handle);
     injection::ThreadHookInjector injector{std::move(operations)};
+    DWORD targetHandlesStart = 0;
+    DWORD targetThreadsStart = 0;
+    DWORD controllerHandlesStart = 0;
+    DWORD controllerThreadsStart = 0;
+    DWORD targetHandlesEnd = 0;
+    DWORD targetThreadsEnd = 0;
+    DWORD controllerHandlesEnd = 0;
+    DWORD controllerThreadsEnd = 0;
+    if (!WaitForStableProcessCounts(
+            targetProcess.get(), command.target_pid,
+            &targetHandlesStart, &targetThreadsStart,
+            &controllerHandlesStart, &controllerThreadsStart)) {
+        return 3;
+    }
     for (std::uint32_t cycle = 0; cycle < iterations; ++cycle) {
         if (FindWindowExW(
                 match.hwnd, nullptr, L"WinExInfo.StatusPane", nullptr) != nullptr) {
@@ -342,6 +481,13 @@ int RunHookControllerMode(const HookTestCommand& command) {
                 &controllerHandlesBefore, &controllerThreadsBefore)) {
             return 3;
         }
+        if (cycle == 0 &&
+            (targetHandlesBefore != targetHandlesStart ||
+             targetThreadsBefore != targetThreadsStart ||
+             controllerHandlesBefore != controllerHandlesStart ||
+             controllerThreadsBefore != controllerThreadsStart)) {
+            return 1;
+        }
         std::wstring pipeName;
         UniqueHandle pipe;
         if (!ipc::BuildCurrentUserPipeName(&pipeName).ok() ||
@@ -355,7 +501,7 @@ int RunHookControllerMode(const HookTestCommand& command) {
         if (command.mode == HookTestMode::ControllerFault) {
             const bool retained = !attached.ok() &&
                 attached.code == ErrorCode::HOOK_RELEASE_FAILED &&
-                WaitForModuleState(command.target_pid, true);
+                WaitForModuleState(command.target_pid, hookDllPath, true);
             UniqueHandle releaseEvent{
                 OpenEventW(SYNCHRONIZE, FALSE, outcome.event_name.c_str())};
             const DWORD eventState = releaseEvent
@@ -385,7 +531,7 @@ int RunHookControllerMode(const HookTestCommand& command) {
             return 1;
         }
         pipe.reset();
-        if (!WaitForModuleState(command.target_pid, false) ||
+        if (!WaitForModuleState(command.target_pid, hookDllPath, false) ||
             !injector.ConfirmTargetGone(command.target_pid).ok() ||
             WaitForSingleObject(targetProcess.get(), 0) != WAIT_TIMEOUT ||
             FindWindowExW(
@@ -418,6 +564,16 @@ int RunHookControllerMode(const HookTestCommand& command) {
                       << '\n';
             return 1;
         }
+        targetHandlesEnd = targetHandlesAfter;
+        targetThreadsEnd = targetThreadsAfter;
+        controllerHandlesEnd = controllerHandlesAfter;
+        controllerThreadsEnd = controllerThreadsAfter;
+    }
+    if (targetHandlesEnd != targetHandlesStart ||
+        targetThreadsEnd != targetThreadsStart ||
+        controllerHandlesEnd != controllerHandlesStart ||
+        controllerThreadsEnd != controllerThreadsStart) {
+        return 1;
     }
     PostMessageW(match.hwnd, WM_CLOSE, 0, 0);
     if (WaitForSingleObject(targetProcess.get(), 5000) != WAIT_OBJECT_0) {
@@ -428,6 +584,14 @@ int RunHookControllerMode(const HookTestCommand& command) {
     if (exitCode != 0) {
         return 1;
     }
+    std::cout << "RESOURCE_COUNTS target_handles_start=" << targetHandlesStart
+              << " target_handles_end=" << targetHandlesEnd
+              << " target_threads_start=" << targetThreadsStart
+              << " target_threads_end=" << targetThreadsEnd
+              << " controller_handles_start=" << controllerHandlesStart
+              << " controller_handles_end=" << controllerHandlesEnd
+              << " controller_threads_start=" << controllerThreadsStart
+              << " controller_threads_end=" << controllerThreadsEnd << '\n';
     std::cout << "GATE_B_PASS iterations=" << iterations
               << " target_handles_delta=0 target_threads_delta=0"
               << " controller_handles_delta=0 controller_threads_delta=0 target_exit=0\n";

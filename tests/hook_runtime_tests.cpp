@@ -146,6 +146,23 @@ WXI_TEST(hook_runtime_requires_release_before_running, "hook_runtime.release_bef
     WXI_REQUIRE(state.MarkRunning(true).ok());
 }
 
+WXI_TEST(hook_runtime_callback_gate_drains_before_unload, "hook_runtime.callback_drain") {
+    winexinfo::hook::HookCallbackGate gate;
+    WXI_REQUIRE(gate.Enter());
+    WXI_REQUIRE_EQ(gate.in_flight(), std::uint32_t{1});
+    gate.RejectNewWork();
+    WXI_REQUIRE(!gate.Enter());
+    WXI_REQUIRE_EQ(gate.in_flight(), std::uint32_t{1});
+    WXI_REQUIRE(!gate.WaitForZero(0));
+    const winexinfo::Status timeout =
+        winexinfo::hook::DrainHookCallbacksForUnload(gate, 0);
+    WXI_REQUIRE_EQ(timeout.code, winexinfo::ErrorCode::DLL_UNLOAD_TIMEOUT);
+    WXI_REQUIRE_EQ(timeout.win32, DWORD{ERROR_TIMEOUT});
+    gate.Leave();
+    WXI_REQUIRE(winexinfo::hook::DrainHookCallbacksForUnload(gate, 0).ok());
+    WXI_REQUIRE_EQ(gate.in_flight(), std::uint32_t{0});
+}
+
 WXI_TEST(hook_runtime_status_pane_uses_exact_subclass_identity, "hook_runtime.status_pane") {
     const HWND parent = reinterpret_cast<HWND>(std::uintptr_t{0x100});
     const HWND child = reinterpret_cast<HWND>(std::uintptr_t{0x200});

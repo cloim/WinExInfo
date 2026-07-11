@@ -91,9 +91,18 @@ try {
     }
     else {
         $expected = "GATE_B_PASS iterations=$Iterations target_handles_delta=0 target_threads_delta=0 controller_handles_delta=0 controller_threads_delta=0 target_exit=0"
+        $resourceLines = @($controllerLines | Where-Object {
+            [string]$_ -match '^RESOURCE_COUNTS target_handles_start=\d+ target_handles_end=\d+ target_threads_start=\d+ target_threads_end=\d+ controller_handles_start=\d+ controller_handles_end=\d+ controller_threads_start=\d+ controller_threads_end=\d+$'
+        })
+        if ($resourceLines.Count -ne 1) {
+            throw "Controller resource-count record is missing or not exact."
+        }
     }
     if (@($controllerLines | Where-Object { [string]$_ -ceq $expected }).Count -ne 1) {
         throw "Controller success record is missing or not exact."
+    }
+    if ($PSCmdlet.ParameterSetName -eq 'Normal') {
+        Write-Output ([string]$resourceLines[0])
     }
     Write-Output $expected
 }

@@ -141,3 +141,48 @@ No Explorer injection, service, scheduled task, Run-key persistence, resident
 WinExInfo process, or outbound WinExInfo connection remained.
 
 Gate A: PASS
+
+## Release verification (2026-07-12)
+
+Release snapshot passed with exact target preflight, one active view, one Shell
+tab match, and filesystem path `D:\PROJECTS\LIMCOM` for the existing Explorer
+window.
+
+A separate single-tab controlled window was prepared before the 45-second
+observer run. Fresh snapshots were read before each action. The controlled
+identity and states were:
+
+```text
+pid=52068
+thread_id=70268
+top_level_hwnd=0x000000001C7E0FE4
+single_tab_path=D:\PROJECTS\WinExInfo
+multi_tab_count=2
+child_path=D:\PROJECTS\WinExInfo\.worktrees
+back_path=D:\PROJECTS\WinExInfo
+final_window_closed=true
+```
+
+Release observe result:
+
+```text
+result=pass
+observe.event_count=23
+observe.ignored_event_count=51
+observe.late_event_count=0
+observe.kind.window_registered_count=1
+observe.kind.window_revoked_count=1
+observe.kind.navigate_complete2_count=2
+observe.kind.tab_selected_count=10
+observe.kind.tab_structure_changed_count=9
+observe.runtime.error_code=OK
+observe.runtime.stage=lifecycle.reconciled
+observe.cleanup.error_code=OK
+error_code=OK
+exit_code=0
+```
+
+The two navigation records mapped
+`D:\PROJECTS\WinExInfo -> D:\PROJECTS\WinExInfo\.worktrees -> D:\PROJECTS\WinExInfo`
+with `active_view_count=1`. The final window-revoked record had the expected
+terminal active-view count 0. Gate A remains PASS in Release.

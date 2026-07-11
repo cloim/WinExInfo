@@ -1,6 +1,8 @@
 #include "hook_test_modes.h"
 
+#include "common/win32_handle.h"
 #include "injection/hook_platform.h"
+#include "hook/status_pane.h"
 
 #include <Windows.h>
 
@@ -61,6 +63,17 @@ int RunHookTargetMode() {
         0, kTargetClass, L"WinExInfo Gate B Target", WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, 640, 360, nullptr, nullptr, instance, nullptr);
     if (window == nullptr) {
+        eventOperations.close_event(ready.handle);
+        return 3;
+    }
+    UniqueHandle warmupAck{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+    hook::StatusPane warmupPane{};
+    const hook::StatusPaneOperations paneOperations =
+        hook::CreateProductionStatusPaneOperations(instance, warmupAck.get());
+    if (!warmupAck ||
+        !hook::InstallStatusPane(window, paneOperations, &warmupPane).ok() ||
+        !hook::RemoveStatusPane(paneOperations, &warmupPane).ok()) {
+        DestroyWindow(window);
         eventOperations.close_event(ready.handle);
         return 3;
     }
