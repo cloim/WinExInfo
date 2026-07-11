@@ -17,6 +17,7 @@ Win32ContractResult ValidateWin32Contract(const Win32ClassTree& classTree) {
     }
 
     const Win32ClassNode* selectedShellTab = nullptr;
+    std::vector<HWND> orderedShellTabs;
     for (const HWND zOrderChild : classTree.top_level_child_z_order) {
         const Win32ClassNode* node = nullptr;
         for (const Win32ClassNode& candidate : classTree.nodes) {
@@ -36,25 +37,45 @@ Win32ContractResult ValidateWin32Contract(const Win32ClassTree& classTree) {
         if (node->class_name != L"ShellTabWindowClass") {
             continue;
         }
+        orderedShellTabs.push_back(node->hwnd);
         if (!node->visible) {
+            continue;
+        }
+        if (selectedShellTab != nullptr) {
             return {
                 {ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH, S_FALSE, ERROR_SUCCESS},
                 classTree,
                 node->hwnd,
                 nullptr,
+                orderedShellTabs,
             };
         }
         selectedShellTab = node;
-        break;
     }
 
-    if (selectedShellTab == nullptr) {
+    if (selectedShellTab == nullptr || orderedShellTabs.empty()) {
         return {
             {ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH, S_FALSE, ERROR_SUCCESS},
             classTree,
             nullptr,
             nullptr,
+            orderedShellTabs,
         };
+    }
+
+    for (const Win32ClassNode& node : classTree.nodes) {
+        if (node.parent == classTree.top_level &&
+            node.class_name == L"ShellTabWindowClass" &&
+            std::ranges::find(orderedShellTabs, node.hwnd) ==
+                orderedShellTabs.end()) {
+            return {
+                {ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH, S_FALSE, ERROR_SUCCESS},
+                classTree,
+                selectedShellTab->hwnd,
+                nullptr,
+                orderedShellTabs,
+            };
+        }
     }
 
     std::vector<HWND> views;
@@ -87,6 +108,7 @@ Win32ContractResult ValidateWin32Contract(const Win32ClassTree& classTree) {
             classTree,
             selectedShellTab->hwnd,
             nullptr,
+            orderedShellTabs,
         };
     }
 
@@ -95,6 +117,7 @@ Win32ContractResult ValidateWin32Contract(const Win32ClassTree& classTree) {
         classTree,
         selectedShellTab->hwnd,
         views[0],
+        orderedShellTabs,
     };
 }
 

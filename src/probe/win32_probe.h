@@ -36,6 +36,7 @@ struct Win32ContractResult final {
     Win32ClassTree class_tree;
     HWND active_shell_tab;
     HWND active_view;
+    std::vector<HWND> ordered_shell_tabs;
 };
 
 struct Win32ProbeOperations final {
