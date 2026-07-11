@@ -20,6 +20,9 @@ enable_testing()
 add_executable(WinExInfoTests
   src/common/utf8.cpp
   src/host/command_line.cpp
+  src/probe/event_observer.cpp
+  src/probe/observer_runtime.cpp
+  src/probe/observer_runtime_contract.cpp
   src/probe/probe_runner.cpp
   src/probe/report_writer.cpp
   src/probe/shell_probe.cpp
@@ -30,7 +33,10 @@ add_executable(WinExInfoTests
   tests/com_apartment_tests.cpp
   tests/command_line_tests.cpp
   tests/contracts_tests.cpp
+  tests/event_filter_tests.cpp
   tests/host_manifest_tests.cpp
+  tests/observer_runtime_tests.cpp
+  tests/observer_runtime_contract_tests.cpp
   tests/target_validation_tests.cpp
   tests/test_framework.cpp
   tests/test_main.cpp
@@ -79,6 +85,9 @@ add_executable(WinExInfoHost
   src/host/command_line.cpp
   src/host/main.cpp
   src/host/WinExInfoHost.manifest
+  src/probe/event_observer.cpp
+  src/probe/observer_runtime.cpp
+  src/probe/observer_runtime_contract.cpp
   src/probe/probe_runner.cpp
   src/probe/report_writer.cpp
   src/probe/shell_probe.cpp

@@ -5,17 +5,231 @@
 #include "probe/shell_probe.h"
 
 #include <Windows.h>
+#include <ExDisp.h>
 #include <ShObjIdl_core.h>
 
+#include <array>
 #include <cstdint>
+#include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
+#include <vector>
 
 namespace {
 
 HWND Handle(const std::uintptr_t value) {
     return reinterpret_cast<HWND>(value);
+}
+
+class ScopedSta final {
+public:
+    ScopedSta() : status_(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED)) {}
+
+    ~ScopedSta() {
+        if (SUCCEEDED(status_)) {
+            CoUninitialize();
+        }
+    }
+
+    [[nodiscard]] HRESULT status() const noexcept {
+        return status_;
+    }
+
+private:
+    HRESULT status_;
+};
+
+class TestShellWindows final : public IShellWindows {
+public:
+    TestShellWindows(
+        std::vector<Microsoft::WRL::ComPtr<IDispatch>> items,
+        const long failureIndex,
+        const HRESULT failureResult)
+        : items_(std::move(items)),
+          failure_index_(failureIndex),
+          failure_result_(failureResult) {}
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(
+        const IID& interfaceId,
+        void** const object) override {
+        if (object == nullptr) {
+            return E_POINTER;
+        }
+        *object = nullptr;
+        if (interfaceId == IID_IUnknown || interfaceId == IID_IDispatch ||
+            interfaceId == IID_IShellWindows) {
+            *object = static_cast<IShellWindows*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return ++reference_count_;
+    }
+
+    ULONG STDMETHODCALLTYPE Release() override {
+        if (reference_count_ > 1) {
+            --reference_count_;
+        }
+        return reference_count_;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetTypeInfoCount(UINT* const count) override {
+        if (count == nullptr) {
+            return E_POINTER;
+        }
+        *count = 0;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetTypeInfo(UINT, LCID, ITypeInfo**) override {
+        return E_NOTIMPL;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetIDsOfNames(
+        const IID&,
+        LPOLESTR*,
+        UINT,
+        LCID,
+        DISPID*) override {
+        return DISP_E_UNKNOWNNAME;
+    }
+
+    HRESULT STDMETHODCALLTYPE Invoke(
+        DISPID,
+        const IID&,
+        LCID,
+        WORD,
+        DISPPARAMS*,
+        VARIANT*,
+        EXCEPINFO*,
+        UINT*) override {
+        return DISP_E_MEMBERNOTFOUND;
+    }
+
+    HRESULT STDMETHODCALLTYPE get_Count(long* const count) override {
+        if (count == nullptr) {
+            return E_POINTER;
+        }
+        *count = static_cast<long>(items_.size());
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE Item(
+        const VARIANT index,
+        IDispatch** const folder) override {
+        if (folder == nullptr) {
+            return E_POINTER;
+        }
+        *folder = nullptr;
+        if (index.vt != VT_I4) {
+            return DISP_E_TYPEMISMATCH;
+        }
+        if (index.lVal == failure_index_) {
+            return failure_result_;
+        }
+        if (index.lVal < 0 ||
+            static_cast<std::size_t>(index.lVal) >= items_.size()) {
+            return S_FALSE;
+        }
+        *folder = items_[static_cast<std::size_t>(index.lVal)].Get();
+        (*folder)->AddRef();
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE _NewEnum(IUnknown**) override {
+        return E_NOTIMPL;
+    }
+
+    HRESULT STDMETHODCALLTYPE Register(IDispatch*, long, int, long*) override {
+        return E_NOTIMPL;
+    }
+
+    HRESULT STDMETHODCALLTYPE RegisterPending(
+        long,
+        VARIANT*,
+        VARIANT*,
+        int,
+        long*) override {
+        return E_NOTIMPL;
+    }
+
+    HRESULT STDMETHODCALLTYPE Revoke(long) override {
+        return E_NOTIMPL;
+    }
+
+    HRESULT STDMETHODCALLTYPE OnNavigate(long, VARIANT*) override {
+        return E_NOTIMPL;
+    }
+
+    HRESULT STDMETHODCALLTYPE OnActivated(long, VARIANT_BOOL) override {
+        return E_NOTIMPL;
+    }
+
+    HRESULT STDMETHODCALLTYPE FindWindowSW(
+        VARIANT*,
+        VARIANT*,
+        int,
+        long*,
+        int,
+        IDispatch**) override {
+        return E_NOTIMPL;
+    }
+
+    HRESULT STDMETHODCALLTYPE OnCreated(long, IUnknown*) override {
+        return E_NOTIMPL;
+    }
+
+    HRESULT STDMETHODCALLTYPE ProcessAttachDetach(VARIANT_BOOL) override {
+        return E_NOTIMPL;
+    }
+
+private:
+    ULONG reference_count_{1};
+    std::vector<Microsoft::WRL::ComPtr<IDispatch>> items_;
+    long failure_index_;
+    HRESULT failure_result_;
+};
+
+Microsoft::WRL::ComPtr<IDispatch> CaptureLiveBrowserDispatch(HWND* const topLevel) {
+    WXI_REQUIRE(topLevel != nullptr);
+    *topLevel = nullptr;
+    Microsoft::WRL::ComPtr<IShellWindows> shellWindows;
+    WXI_REQUIRE_EQ(
+        CoCreateInstance(
+            CLSID_ShellWindows,
+            nullptr,
+            CLSCTX_LOCAL_SERVER,
+            IID_PPV_ARGS(&shellWindows)),
+        S_OK);
+    long count = 0;
+    WXI_REQUIRE_EQ(shellWindows->get_Count(&count), S_OK);
+    WXI_REQUIRE(count > 0);
+    for (long indexValue = 0; indexValue < count; ++indexValue) {
+        VARIANT index{};
+        index.vt = VT_I4;
+        index.lVal = indexValue;
+        Microsoft::WRL::ComPtr<IDispatch> dispatch;
+        if (shellWindows->Item(index, &dispatch) != S_OK || dispatch == nullptr) {
+            continue;
+        }
+        Microsoft::WRL::ComPtr<IWebBrowser2> browser;
+        if (dispatch.As(&browser) != S_OK || browser == nullptr) {
+            continue;
+        }
+        SHANDLE_PTR rawTopLevel = 0;
+        if (browser->get_HWND(&rawTopLevel) != S_OK || rawTopLevel == 0) {
+            continue;
+        }
+        *topLevel = reinterpret_cast<HWND>(rawTopLevel);
+        return dispatch;
+    }
+    WXI_REQUIRE(false);
+    return {};
 }
 
 winexinfo::ShellViewEntryEvidence ExactEntry() {
@@ -398,15 +612,267 @@ WXI_TEST(active_view_rejects_duplicate_entries_for_same_view, "active_view.rejec
     WXI_REQUIRE_EQ(snapshot.active_view_count, std::size_t{2});
 }
 
+WXI_TEST(shell_browser_set_rejects_empty_target_list, "active_view.shell_browser_set_rejects_empty_target_list") {
+    winexinfo::ShellBrowserSetCapture capture{};
+    const winexinfo::Status status = winexinfo::CaptureShellBrowserSet(
+        reinterpret_cast<IShellWindows*>(std::uintptr_t{1}),
+        std::span<const HWND>{},
+        &capture);
+
+    WXI_REQUIRE_EQ(
+        status.code,
+        winexinfo::ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH);
+    WXI_REQUIRE_EQ(status.hresult, E_INVALIDARG);
+    WXI_REQUIRE_EQ(status.win32, DWORD{ERROR_INVALID_PARAMETER});
+    WXI_REQUIRE_EQ(capture.status.code, status.code);
+    WXI_REQUIRE_EQ(capture.status.hresult, status.hresult);
+    WXI_REQUIRE_EQ(capture.status.win32, status.win32);
+    WXI_REQUIRE_EQ(
+        capture.terminal_stage,
+        winexinfo::ShellProbeTerminalStage::NotStarted);
+    WXI_REQUIRE_EQ(capture.owner_thread_id, DWORD{0});
+    WXI_REQUIRE(capture.entries.empty());
+}
+
+WXI_TEST(shell_browser_set_rejects_null_target, "active_view.shell_browser_set_rejects_null_target") {
+    const std::array<HWND, 1> targets{nullptr};
+    winexinfo::ShellBrowserSetCapture capture{};
+    const winexinfo::Status status = winexinfo::CaptureShellBrowserSet(
+        reinterpret_cast<IShellWindows*>(std::uintptr_t{1}), targets, &capture);
+
+    WXI_REQUIRE_EQ(
+        status.code,
+        winexinfo::ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH);
+    WXI_REQUIRE_EQ(status.hresult, E_INVALIDARG);
+    WXI_REQUIRE_EQ(status.win32, DWORD{ERROR_INVALID_PARAMETER});
+    WXI_REQUIRE(capture.entries.empty());
+}
+
+WXI_TEST(shell_browser_set_rejects_duplicate_target, "active_view.shell_browser_set_rejects_duplicate_target") {
+    const std::array<HWND, 2> targets{Handle(1), Handle(1)};
+    winexinfo::ShellBrowserSetCapture capture{};
+    const winexinfo::Status status = winexinfo::CaptureShellBrowserSet(
+        reinterpret_cast<IShellWindows*>(std::uintptr_t{1}), targets, &capture);
+
+    WXI_REQUIRE_EQ(
+        status.code,
+        winexinfo::ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH);
+    WXI_REQUIRE_EQ(status.hresult, E_INVALIDARG);
+    WXI_REQUIRE_EQ(status.win32, DWORD{ERROR_INVALID_PARAMETER});
+    WXI_REQUIRE(capture.entries.empty());
+}
+
+WXI_TEST(shell_browser_set_retains_non_target_identity, "active_view.shell_browser_set_retains_non_target_identity") {
+    ScopedSta apartment;
+    WXI_REQUIRE(SUCCEEDED(apartment.status()));
+    HWND liveTopLevel = nullptr;
+    const Microsoft::WRL::ComPtr<IDispatch> dispatch =
+        CaptureLiveBrowserDispatch(&liveTopLevel);
+    const HWND targetTopLevel = Handle(
+        reinterpret_cast<std::uintptr_t>(liveTopLevel) ^ std::uintptr_t{1});
+    const std::array<HWND, 1> targets{targetTopLevel};
+    TestShellWindows shellWindows({dispatch}, -1, S_OK);
+    winexinfo::ShellBrowserSetCapture capture{};
+
+    const winexinfo::Status status = winexinfo::CaptureShellBrowserSet(
+        &shellWindows, targets, &capture);
+
+    WXI_REQUIRE(status.ok());
+    WXI_REQUIRE_EQ(status.hresult, S_OK);
+    WXI_REQUIRE_EQ(status.win32, DWORD{ERROR_SUCCESS});
+    WXI_REQUIRE_EQ(capture.entries.size(), std::size_t{1});
+    const winexinfo::ShellBrowserEntryCapture& entry = capture.entries[0];
+    WXI_REQUIRE(entry.canonical_identity != nullptr);
+    WXI_REQUIRE(entry.browser != nullptr);
+    WXI_REQUIRE(entry.shell_browser == nullptr);
+    WXI_REQUIRE(!entry.target_matched);
+    WXI_REQUIRE_EQ(entry.top_level, liveTopLevel);
+    WXI_REQUIRE_EQ(entry.shell_tab, nullptr);
+
+    winexinfo::ActiveShellViewSnapshot snapshot{};
+    const winexinfo::Status mapping =
+        winexinfo::CaptureActiveShellViewFromBrowserSet(
+            capture, targetTopLevel, Handle(2), &snapshot);
+    WXI_REQUIRE_EQ(
+        mapping.code,
+        winexinfo::ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH);
+    WXI_REQUIRE_EQ(mapping.hresult, S_FALSE);
+    WXI_REQUIRE_EQ(mapping.win32, DWORD{ERROR_SUCCESS});
+    WXI_REQUIRE_EQ(snapshot.top_level_entry_count, std::size_t{0});
+    WXI_REQUIRE_EQ(snapshot.shell_tab_match_count, std::size_t{0});
+    WXI_REQUIRE_EQ(snapshot.active_view_count, std::size_t{0});
+}
+
+WXI_TEST(shell_browser_set_clears_partial_capture_on_item_failure, "active_view.shell_browser_set_clears_partial_capture_on_item_failure") {
+    ScopedSta apartment;
+    WXI_REQUIRE(SUCCEEDED(apartment.status()));
+    HWND liveTopLevel = nullptr;
+    const Microsoft::WRL::ComPtr<IDispatch> dispatch =
+        CaptureLiveBrowserDispatch(&liveTopLevel);
+    const HWND targetTopLevel = Handle(
+        reinterpret_cast<std::uintptr_t>(liveTopLevel) ^ std::uintptr_t{1});
+    const std::array<HWND, 1> targets{targetTopLevel};
+    TestShellWindows shellWindows(
+        {dispatch, dispatch}, 1, E_ACCESSDENIED);
+    winexinfo::ShellBrowserSetCapture capture{};
+
+    const winexinfo::Status status = winexinfo::CaptureShellBrowserSet(
+        &shellWindows, targets, &capture);
+
+    WXI_REQUIRE_EQ(
+        status.code,
+        winexinfo::ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH);
+    WXI_REQUIRE_EQ(status.hresult, E_ACCESSDENIED);
+    WXI_REQUIRE_EQ(status.win32, DWORD{ERROR_ACCESS_DENIED});
+    WXI_REQUIRE_EQ(
+        capture.terminal_stage,
+        winexinfo::ShellProbeTerminalStage::IShellWindowsItem);
+    WXI_REQUIRE(capture.entries.empty());
+}
+
+WXI_TEST(shell_browser_set_rejects_duplicate_canonical_identity, "active_view.shell_browser_set_rejects_duplicate_canonical_identity") {
+    ScopedSta apartment;
+    WXI_REQUIRE(SUCCEEDED(apartment.status()));
+    HWND liveTopLevel = nullptr;
+    const Microsoft::WRL::ComPtr<IDispatch> dispatch =
+        CaptureLiveBrowserDispatch(&liveTopLevel);
+    const HWND targetTopLevel = Handle(
+        reinterpret_cast<std::uintptr_t>(liveTopLevel) ^ std::uintptr_t{1});
+    const std::array<HWND, 1> targets{targetTopLevel};
+    TestShellWindows shellWindows({dispatch, dispatch}, -1, S_OK);
+    winexinfo::ShellBrowserSetCapture capture{};
+
+    const winexinfo::Status status = winexinfo::CaptureShellBrowserSet(
+        &shellWindows, targets, &capture);
+
+    WXI_REQUIRE_EQ(
+        status.code,
+        winexinfo::ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH);
+    WXI_REQUIRE_EQ(status.hresult, S_FALSE);
+    WXI_REQUIRE_EQ(status.win32, DWORD{ERROR_SUCCESS});
+    WXI_REQUIRE_EQ(
+        capture.terminal_stage,
+        winexinfo::ShellProbeTerminalStage::ValidateActiveView);
+    WXI_REQUIRE(capture.entries.empty());
+}
+
+WXI_TEST(shell_browser_set_propagates_capture_failure, "active_view.shell_browser_set_propagates_capture_failure") {
+    winexinfo::ShellBrowserSetCapture capture{
+        {
+            winexinfo::ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH,
+            E_ACCESSDENIED,
+            ERROR_ACCESS_DENIED,
+        },
+        winexinfo::ShellProbeTerminalStage::IShellWindowsItem,
+        GetCurrentThreadId(),
+        {},
+    };
+    winexinfo::ActiveShellViewSnapshot snapshot{};
+    const winexinfo::Status status =
+        winexinfo::CaptureActiveShellViewFromBrowserSet(
+            capture, Handle(1), Handle(2), &snapshot);
+
+    WXI_REQUIRE_EQ(status.code, capture.status.code);
+    WXI_REQUIRE_EQ(status.hresult, capture.status.hresult);
+    WXI_REQUIRE_EQ(status.win32, capture.status.win32);
+    WXI_REQUIRE_EQ(snapshot.status.code, capture.status.code);
+    WXI_REQUIRE_EQ(snapshot.status.hresult, capture.status.hresult);
+    WXI_REQUIRE_EQ(snapshot.status.win32, capture.status.win32);
+    WXI_REQUIRE_EQ(
+        snapshot.terminal_stage,
+        winexinfo::ShellProbeTerminalStage::IShellWindowsItem);
+    WXI_REQUIRE_EQ(snapshot.top_level_entry_count, std::size_t{0});
+    WXI_REQUIRE_EQ(snapshot.active_view, nullptr);
+}
+
+WXI_TEST(shell_browser_set_rejects_empty_capture, "active_view.shell_browser_set_rejects_empty_capture") {
+    winexinfo::ShellBrowserSetCapture capture{
+        {winexinfo::ErrorCode::OK, S_OK, ERROR_SUCCESS},
+        winexinfo::ShellProbeTerminalStage::Complete,
+        GetCurrentThreadId(),
+        {},
+    };
+    winexinfo::ActiveShellViewSnapshot snapshot{};
+    const winexinfo::Status status =
+        winexinfo::CaptureActiveShellViewFromBrowserSet(
+            capture, Handle(1), Handle(2), &snapshot);
+
+    WXI_REQUIRE_EQ(
+        status.code,
+        winexinfo::ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH);
+    WXI_REQUIRE_EQ(status.hresult, S_FALSE);
+    WXI_REQUIRE_EQ(status.win32, DWORD{ERROR_SUCCESS});
+    WXI_REQUIRE_EQ(
+        snapshot.terminal_stage,
+        winexinfo::ShellProbeTerminalStage::ValidateActiveView);
+    WXI_REQUIRE_EQ(snapshot.top_level_entry_count, std::size_t{0});
+    WXI_REQUIRE_EQ(snapshot.shell_tab_match_count, std::size_t{0});
+    WXI_REQUIRE_EQ(snapshot.active_view_count, std::size_t{0});
+}
+
+WXI_TEST(shell_browser_set_rejects_incoherent_success_status, "active_view.shell_browser_set_rejects_incoherent_success_status") {
+    winexinfo::ShellBrowserSetCapture capture{
+        {winexinfo::ErrorCode::OK, E_FAIL, ERROR_SUCCESS},
+        winexinfo::ShellProbeTerminalStage::Complete,
+        GetCurrentThreadId(),
+        {},
+    };
+    winexinfo::ActiveShellViewSnapshot snapshot{};
+    const winexinfo::Status status =
+        winexinfo::CaptureActiveShellViewFromBrowserSet(
+            capture, Handle(1), Handle(2), &snapshot);
+
+    WXI_REQUIRE_EQ(
+        status.code,
+        winexinfo::ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH);
+    WXI_REQUIRE_EQ(status.hresult, S_FALSE);
+    WXI_REQUIRE_EQ(status.win32, DWORD{ERROR_SUCCESS});
+    WXI_REQUIRE_EQ(snapshot.status.code, status.code);
+    WXI_REQUIRE_EQ(snapshot.status.hresult, status.hresult);
+    WXI_REQUIRE_EQ(snapshot.status.win32, status.win32);
+    WXI_REQUIRE_EQ(
+        snapshot.terminal_stage,
+        winexinfo::ShellProbeTerminalStage::ValidateActiveView);
+}
+
+WXI_TEST(shell_browser_set_rejects_foreign_thread, "active_view.shell_browser_set_rejects_foreign_thread") {
+    winexinfo::ShellBrowserSetCapture capture{
+        {winexinfo::ErrorCode::OK, S_OK, ERROR_SUCCESS},
+        winexinfo::ShellProbeTerminalStage::Complete,
+        GetCurrentThreadId(),
+        {},
+    };
+    winexinfo::ActiveShellViewSnapshot snapshot{};
+    winexinfo::Status status{winexinfo::ErrorCode::OK, S_OK, ERROR_SUCCESS};
+    std::thread worker([&]() {
+        status = winexinfo::CaptureActiveShellViewFromBrowserSet(
+            capture, Handle(1), Handle(2), &snapshot);
+    });
+    worker.join();
+
+    WXI_REQUIRE_EQ(
+        status.code,
+        winexinfo::ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH);
+    WXI_REQUIRE_EQ(status.hresult, RPC_E_WRONG_THREAD);
+    WXI_REQUIRE_EQ(status.win32, DWORD{ERROR_SUCCESS});
+    WXI_REQUIRE_EQ(snapshot.status.code, status.code);
+    WXI_REQUIRE_EQ(snapshot.status.hresult, status.hresult);
+    WXI_REQUIRE_EQ(snapshot.status.win32, status.win32);
+    WXI_REQUIRE_EQ(
+        snapshot.terminal_stage,
+        winexinfo::ShellProbeTerminalStage::ValidateActiveView);
+}
+
 WXI_TEST(active_view_report_includes_exact_mapping, "active_view.report_includes_exact_mapping") {
     winexinfo::ReportSection section{};
     winexinfo::AppendActiveShellViewReportFields("window.5", Validate(ExactEvidence()), &section);
-    const std::string report = winexinfo::WriteProbeReport({
+    std::string report;
+    WXI_REQUIRE(winexinfo::WriteProbeReport({
         winexinfo::ProbeMode::Snapshot,
         true,
         {section},
         winexinfo::ErrorCode::OK,
-    });
+    }, &report).ok());
 
     WXI_REQUIRE(report.find("window.5.active_view_count=1\n") != std::string::npos);
     WXI_REQUIRE(report.find("window.5.shell_tab_match_count=1\n") != std::string::npos);
@@ -449,12 +915,13 @@ WXI_TEST(active_view_report_preserves_rpc_stage_once, "active_view.report_preser
     WXI_REQUIRE(winexinfo::AppendActiveShellViewReportFields(
                     "window.2", Validate(evidence), &section)
                     .ok());
-    const std::string report = winexinfo::WriteProbeReport({
+    std::string report;
+    WXI_REQUIRE(winexinfo::WriteProbeReport({
         winexinfo::ProbeMode::Snapshot,
         false,
         {section},
         winexinfo::ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH,
-    });
+    }, &report).ok());
 
     const std::string stage =
         "window.2.shell_terminal_stage=ishellbrowser_get_window\n";
@@ -482,12 +949,13 @@ WXI_TEST(active_view_report_seeds_early_failure_stage_once, "active_view.report_
         winexinfo::ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH);
     WXI_REQUIRE_EQ(duplicate.hresult, E_INVALIDARG);
     WXI_REQUIRE_EQ(duplicate.win32, DWORD{ERROR_INVALID_PARAMETER});
-    const std::string report = winexinfo::WriteProbeReport({
+    std::string report;
+    WXI_REQUIRE(winexinfo::WriteProbeReport({
         winexinfo::ProbeMode::Snapshot,
         false,
         {section},
         winexinfo::ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH,
-    });
+    }, &report).ok());
     const std::string stage = "window.4.shell_terminal_stage=not_started\n";
     const std::size_t position = report.find(stage);
     WXI_REQUIRE(position != std::string::npos);
@@ -502,12 +970,13 @@ WXI_TEST(active_view_report_replaces_not_started_stage, "active_view.report_repl
     WXI_REQUIRE(winexinfo::AppendActiveShellViewReportFields(
                     "window.1", Validate(ExactEvidence()), &section)
                     .ok());
-    const std::string report = winexinfo::WriteProbeReport({
+    std::string report;
+    WXI_REQUIRE(winexinfo::WriteProbeReport({
         winexinfo::ProbeMode::Snapshot,
         true,
         {section},
         winexinfo::ErrorCode::OK,
-    });
+    }, &report).ok());
     const std::string complete = "window.1.shell_terminal_stage=complete\n";
     const std::size_t completePosition = report.find(complete);
     WXI_REQUIRE(completePosition != std::string::npos);
@@ -544,12 +1013,13 @@ WXI_TEST(active_view_report_serializes_every_terminal_stage, "active_view.report
         WXI_REQUIRE(winexinfo::AppendActiveShellViewReportFields(
                         "window.0", snapshot, &section)
                         .ok());
-        const std::string report = winexinfo::WriteProbeReport({
+        std::string report;
+        WXI_REQUIRE(winexinfo::WriteProbeReport({
             winexinfo::ProbeMode::Snapshot,
             true,
             {section},
             winexinfo::ErrorCode::OK,
-        });
+        }, &report).ok());
         const std::string expected =
             "window.0.shell_terminal_stage=" + std::string{name} + "\n";
         const std::size_t position = report.find(expected);
@@ -582,12 +1052,13 @@ WXI_TEST(active_view_report_includes_empty_non_filesystem_path, "active_view.rep
     WXI_REQUIRE(winexinfo::AppendActiveShellViewReportFields(
                     "window.0", Validate(evidence), &section)
                     .ok());
-    const std::string report = winexinfo::WriteProbeReport({
+    std::string report;
+    WXI_REQUIRE(winexinfo::WriteProbeReport({
         winexinfo::ProbeMode::Snapshot,
         true,
         {section},
         winexinfo::ErrorCode::OK,
-    });
+    }, &report).ok());
     WXI_REQUIRE(report.find("window.0.filesystem_path=\n") != std::string::npos);
     const std::size_t position = report.find("window.0.filesystem_path=");
     WXI_REQUIRE(report.find("window.0.filesystem_path=", position + 1) == std::string::npos);
@@ -600,12 +1071,13 @@ WXI_TEST(active_view_report_encodes_korean_path, "active_view.report_encodes_kor
     const winexinfo::Status status = winexinfo::AppendActiveShellViewReportFields(
         "window.0", Validate(evidence), &section);
     WXI_REQUIRE(status.ok());
-    const std::string report = winexinfo::WriteProbeReport({
+    std::string report;
+    WXI_REQUIRE(winexinfo::WriteProbeReport({
         winexinfo::ProbeMode::Snapshot,
         true,
         {section},
         winexinfo::ErrorCode::OK,
-    });
+    }, &report).ok());
     WXI_REQUIRE(
         report.find("window.0.filesystem_path=C:\\작업\\저장소\n") != std::string::npos);
 }

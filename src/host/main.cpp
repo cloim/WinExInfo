@@ -50,12 +50,30 @@ int wmain(const int argc, const wchar_t* const argv[]) {
             }},
             winexinfo::ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH,
         };
-        std::cout << winexinfo::WriteProbeReport(report);
+        std::string serialized;
+        const winexinfo::Status written =
+            winexinfo::WriteProbeReport(report, &serialized);
+        if (!written.ok()) {
+            std::cerr << "ACTIVE_VIEW_CONTRACT_MISMATCH: report serialization failed\n";
+            return static_cast<int>(winexinfo::HostExitCode::Win32ComFailure);
+        }
+        std::cout << serialized;
         return static_cast<int>(winexinfo::HostExitCode::Win32ComFailure);
     }
 
     winexinfo::ProbeRunResult result = winexinfo::RunSnapshotProbe();
-    std::cout << winexinfo::WriteProbeReport(result.report);
+    std::string serialized;
+    const winexinfo::Status written =
+        winexinfo::WriteProbeReport(result.report, &serialized);
+    if (!written.ok()) {
+        CoUninitialize();
+        std::cerr << "ACTIVE_VIEW_CONTRACT_MISMATCH: report serialization failed\n";
+        return static_cast<int>(
+            winexinfo::IsProbeTransportFailure(written)
+                ? winexinfo::HostExitCode::Win32ComFailure
+                : winexinfo::HostExitCode::ContractFailure);
+    }
+    std::cout << serialized;
     CoUninitialize();
     return static_cast<int>(result.exit_code);
 }

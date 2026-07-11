@@ -5,8 +5,11 @@
 #include <Windows.h>
 #include <objbase.h>
 #include <UIAutomation.h>
+#include <wrl/client.h>
 
+#include <array>
 #include <cstddef>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -54,9 +57,64 @@ struct UiaContractSnapshot final {
     UiaSelectorCardinalities cardinalities;
 };
 
+struct UiaEventCacheContract final {
+    AutomationElementMode element_mode;
+    TreeScope tree_scope;
+    std::array<PROPERTYID, 6> properties;
+};
+
+struct RetainedUiaContractCapture final {
+    UiaContractEvidence evidence;
+    UiaContractSnapshot snapshot;
+    Microsoft::WRL::ComPtr<IUIAutomation> automation;
+    Microsoft::WRL::ComPtr<IUIAutomationElement> tab_list_element;
+    DWORD owner_thread_id;
+};
+
+struct RetainedUiaAccessEvidence final {
+    DWORD owner_thread_id;
+    DWORD current_thread_id;
+    bool automation_present;
+    bool tab_list_element_present;
+    UiaElementEvidence tab_list;
+};
+
+struct UiaTabChildEvidence final {
+    std::wstring framework_id;
+    CONTROLTYPEID control_type;
+    std::wstring automation_id;
+    std::wstring class_name;
+    DWORD process_id;
+    bool offscreen;
+};
+
 [[nodiscard]] Status ValidateUiaContract(
     const UiaContractEvidence& evidence,
     UiaContractSnapshot* output);
+[[nodiscard]] UiaEventCacheContract GetExactUiaEventCacheContract();
+[[nodiscard]] Status ClassifyExactUiaCallResult(
+    HRESULT hresult,
+    bool requiredObjectPresent);
+[[nodiscard]] Status ClassifyLegacyUiaCaptureCallResult(
+    HRESULT hresult,
+    bool requiredObjectPresent);
+[[nodiscard]] Status CreateUiaEventCacheRequest(
+    IUIAutomation* automation,
+    Microsoft::WRL::ComPtr<IUIAutomationCacheRequest>* output);
+[[nodiscard]] Status CaptureRetainedUiaContract(
+    IUIAutomation* automation,
+    HWND topLevel,
+    HWND activeView,
+    RetainedUiaContractCapture* output);
+[[nodiscard]] Status ValidateRetainedUiaAccess(
+    const RetainedUiaAccessEvidence& evidence);
+[[nodiscard]] Status ValidateTabListDirectChildren(
+    DWORD expectedProcessId,
+    std::span<const UiaTabChildEvidence> children,
+    std::size_t* outputCount);
+[[nodiscard]] Status ReenumerateRetainedTabListDirectChildren(
+    const RetainedUiaContractCapture& capture,
+    std::size_t* outputCount);
 [[nodiscard]] Status CaptureUiaContractEvidence(
     HWND topLevel,
     HWND activeView,

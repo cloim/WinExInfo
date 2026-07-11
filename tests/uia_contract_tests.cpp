@@ -183,6 +183,16 @@ void RequireUiaMismatch(const winexinfo::UiaContractEvidence& evidence) {
     WXI_REQUIRE_EQ(status.code, winexinfo::ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH);
 }
 
+void RequireActiveViewMismatch(
+    const winexinfo::Status& status,
+    const HRESULT expectedHresult = S_FALSE) {
+    WXI_REQUIRE_EQ(
+        status.code,
+        winexinfo::ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH);
+    WXI_REQUIRE_EQ(status.hresult, expectedHresult);
+    WXI_REQUIRE_EQ(status.win32, DWORD{ERROR_SUCCESS});
+}
+
 WXI_TEST(uia_contract_exact_tree_passes, "uia_contract.exact_tree_passes") {
     const winexinfo::Win32ContractResult win32 =
         winexinfo::ValidateWin32Contract(ExactClassTree());
@@ -324,6 +334,19 @@ WXI_TEST(uia_contract_rejects_alternate_properties, "uia_contract.rejects_altern
     winexinfo::UiaContractEvidence groupNative = ExactUia();
     groupNative.elements[1].native_window_handle = reinterpret_cast<UIA_HWND>(77);
     RequireUiaMismatch(groupNative);
+
+    winexinfo::UiaContractEvidence embeddedFramework = ExactUia();
+    embeddedFramework.elements[4].framework_id =
+        std::wstring{L"XAML\0suffix", 11};
+    RequireUiaMismatch(embeddedFramework);
+    winexinfo::UiaContractEvidence embeddedAutomationId = ExactUia();
+    embeddedAutomationId.elements[4].automation_id =
+        std::wstring{L"TabListView\0suffix", 18};
+    RequireUiaMismatch(embeddedAutomationId);
+    winexinfo::UiaContractEvidence embeddedClass = ExactUia();
+    embeddedClass.elements[4].class_name =
+        std::wstring{L"ListView\0suffix", 15};
+    RequireUiaMismatch(embeddedClass);
 }
 
 WXI_TEST(uia_contract_rejects_wrong_parent_scope, "uia_contract.rejects_wrong_parent_scope") {
@@ -557,12 +580,13 @@ WXI_TEST(
         "window.7",
         winexinfo::UiaSelectorCardinalities{2, 0, 1, 3, 4},
         &section);
-    const std::string report = winexinfo::WriteProbeReport({
+    std::string report;
+    WXI_REQUIRE(winexinfo::WriteProbeReport({
         winexinfo::ProbeMode::Snapshot,
         false,
         {section},
         winexinfo::ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH,
-    });
+    }, &report).ok());
 
     WXI_REQUIRE(report.find("window.7.cardinality.status_bar=2\n") != std::string::npos);
     WXI_REQUIRE(report.find("window.7.cardinality.left_group=0\n") != std::string::npos);
@@ -581,18 +605,220 @@ WXI_TEST(
         "window.0",
         winexinfo::UiaSelectorCardinalities{1, 1, 1, 1, 1},
         &section);
-    const std::string report = winexinfo::WriteProbeReport({
+    std::string report;
+    WXI_REQUIRE(winexinfo::WriteProbeReport({
         winexinfo::ProbeMode::Snapshot,
         true,
         {section},
         winexinfo::ErrorCode::OK,
-    });
+    }, &report).ok());
 
     WXI_REQUIRE(report.find("window.0.cardinality.status_bar=1\n") != std::string::npos);
     WXI_REQUIRE(report.find("window.0.cardinality.left_group=1\n") != std::string::npos);
     WXI_REQUIRE(report.find("window.0.cardinality.right_group=1\n") != std::string::npos);
     WXI_REQUIRE(report.find("window.0.cardinality.tab_view=1\n") != std::string::npos);
     WXI_REQUIRE(report.find("window.0.cardinality.tab_list=1\n") != std::string::npos);
+}
+
+WXI_TEST(
+    uia_contract_event_cache_is_exact_and_name_free,
+    "uia_contract.retained.event_cache") {
+    const winexinfo::UiaEventCacheContract contract =
+        winexinfo::GetExactUiaEventCacheContract();
+    WXI_REQUIRE_EQ(contract.element_mode, AutomationElementMode_Full);
+    WXI_REQUIRE_EQ(contract.tree_scope, TreeScope_Element);
+    const std::array<PROPERTYID, 6> expected{
+        UIA_FrameworkIdPropertyId,
+        UIA_ControlTypePropertyId,
+        UIA_ClassNamePropertyId,
+        UIA_AutomationIdPropertyId,
+        UIA_ProcessIdPropertyId,
+        UIA_IsOffscreenPropertyId,
+    };
+    WXI_REQUIRE_EQ(contract.properties, expected);
+    WXI_REQUIRE(
+        std::ranges::find(contract.properties, UIA_NamePropertyId) ==
+        contract.properties.end());
+
+    WXI_REQUIRE(winexinfo::ClassifyExactUiaCallResult(S_OK, true).ok());
+    const winexinfo::Status nonExact =
+        winexinfo::ClassifyExactUiaCallResult(S_FALSE, true);
+    WXI_REQUIRE_EQ(
+        nonExact.code,
+        winexinfo::ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH);
+    WXI_REQUIRE_EQ(nonExact.hresult, S_FALSE);
+    WXI_REQUIRE_EQ(nonExact.win32, DWORD{ERROR_SUCCESS});
+    const winexinfo::Status missingObject =
+        winexinfo::ClassifyExactUiaCallResult(S_OK, false);
+    WXI_REQUIRE_EQ(missingObject.hresult, S_FALSE);
+    const HRESULT accessDenied = HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED);
+    const winexinfo::Status transport =
+        winexinfo::ClassifyExactUiaCallResult(accessDenied, true);
+    WXI_REQUIRE_EQ(transport.hresult, accessDenied);
+    WXI_REQUIRE_EQ(transport.win32, DWORD{ERROR_ACCESS_DENIED});
+
+    WXI_REQUIRE(
+        winexinfo::ClassifyLegacyUiaCaptureCallResult(S_FALSE, true).ok());
+    const winexinfo::Status legacyMissing =
+        winexinfo::ClassifyLegacyUiaCaptureCallResult(S_OK, false);
+    WXI_REQUIRE_EQ(
+        legacyMissing.code,
+        winexinfo::ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH);
+    WXI_REQUIRE_EQ(legacyMissing.hresult, S_FALSE);
+    const winexinfo::Status legacyNonExactMissing =
+        winexinfo::ClassifyLegacyUiaCaptureCallResult(S_FALSE, false);
+    WXI_REQUIRE_EQ(
+        legacyNonExactMissing.code,
+        winexinfo::ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH);
+    WXI_REQUIRE_EQ(legacyNonExactMissing.hresult, S_FALSE);
+
+    Microsoft::WRL::ComPtr<IUIAutomationCacheRequest> request;
+    const winexinfo::Status nullAutomation =
+        winexinfo::CreateUiaEventCacheRequest(nullptr, &request);
+    WXI_REQUIRE_EQ(
+        nullAutomation.code,
+        winexinfo::ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH);
+    WXI_REQUIRE_EQ(nullAutomation.hresult, E_INVALIDARG);
+    WXI_REQUIRE_EQ(nullAutomation.win32, DWORD{ERROR_INVALID_PARAMETER});
+    WXI_REQUIRE(request == nullptr);
+    const winexinfo::Status nullOutput =
+        winexinfo::CreateUiaEventCacheRequest(
+            reinterpret_cast<IUIAutomation*>(std::uintptr_t{1}), nullptr);
+    WXI_REQUIRE_EQ(nullOutput.hresult, E_INVALIDARG);
+}
+
+WXI_TEST(
+    uia_contract_retained_access_requires_exact_owner_and_tab_list,
+    "uia_contract.retained.access_guard") {
+    winexinfo::RetainedUiaAccessEvidence access{
+        71,
+        71,
+        true,
+        true,
+        Element(
+            winexinfo::UiaQueryScope::TabViewChildren,
+            L"XAML",
+            UIA_ListControlTypeId,
+            L"TabListView",
+            L"ListView"),
+    };
+    WXI_REQUIRE(winexinfo::ValidateRetainedUiaAccess(access).ok());
+
+    access.current_thread_id = 72;
+    const winexinfo::Status wrongThread =
+        winexinfo::ValidateRetainedUiaAccess(access);
+    WXI_REQUIRE_EQ(
+        wrongThread.code,
+        winexinfo::ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH);
+    WXI_REQUIRE_EQ(wrongThread.hresult, RPC_E_WRONG_THREAD);
+    WXI_REQUIRE_EQ(wrongThread.win32, DWORD{ERROR_SUCCESS});
+    access.current_thread_id = 71;
+    access.automation_present = false;
+    RequireActiveViewMismatch(winexinfo::ValidateRetainedUiaAccess(access));
+    access.automation_present = true;
+    access.tab_list_element_present = false;
+    RequireActiveViewMismatch(winexinfo::ValidateRetainedUiaAccess(access));
+    access.tab_list_element_present = true;
+    access.tab_list.process_id = 0;
+    RequireActiveViewMismatch(winexinfo::ValidateRetainedUiaAccess(access));
+    access.tab_list.process_id = 1234;
+    access.tab_list.control_type = UIA_TabControlTypeId;
+    RequireActiveViewMismatch(winexinfo::ValidateRetainedUiaAccess(access));
+    access.tab_list.control_type = UIA_ListControlTypeId;
+    WXI_REQUIRE(winexinfo::ValidateRetainedUiaAccess(access).ok());
+}
+
+WXI_TEST(
+    uia_contract_tab_children_require_exact_shape_and_pid,
+    "uia_contract.retained.direct_children") {
+    std::vector<winexinfo::UiaTabChildEvidence> children{
+        {L"XAML", UIA_TabItemControlTypeId, L"Tab-1", L"ListViewItem", 1234, false},
+        {L"XAML", UIA_TabItemControlTypeId, L"Tab-2", L"ListViewItem", 1234, true},
+    };
+    std::size_t count = 99;
+    WXI_REQUIRE(winexinfo::ValidateTabListDirectChildren(
+                    1234, children, &count)
+                    .ok());
+    WXI_REQUIRE_EQ(count, std::size_t{2});
+
+    children[0].automation_id = L"a completely different id";
+    count = 99;
+    WXI_REQUIRE(winexinfo::ValidateTabListDirectChildren(
+                    1234, children, &count)
+                    .ok());
+    WXI_REQUIRE_EQ(count, std::size_t{2});
+
+    const auto requireTransactionalMismatch = [&](const auto mutate) {
+        std::vector<winexinfo::UiaTabChildEvidence> malformed = children;
+        mutate(malformed[0]);
+        std::size_t unchanged = 99;
+        const winexinfo::Status status =
+            winexinfo::ValidateTabListDirectChildren(
+                1234, malformed, &unchanged);
+        WXI_REQUIRE_EQ(
+            status.code,
+            winexinfo::ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH);
+        WXI_REQUIRE_EQ(status.hresult, S_FALSE);
+        WXI_REQUIRE_EQ(unchanged, std::size_t{99});
+    };
+    requireTransactionalMismatch([](auto& child) { child.framework_id = L"Win32"; });
+    requireTransactionalMismatch([](auto& child) {
+        child.control_type = UIA_ButtonControlTypeId;
+    });
+    requireTransactionalMismatch([](auto& child) { child.class_name = L"ListBoxItem"; });
+    requireTransactionalMismatch([](auto& child) { child.process_id = 4321; });
+
+    count = 99;
+    const winexinfo::Status empty = winexinfo::ValidateTabListDirectChildren(
+        1234, std::span<const winexinfo::UiaTabChildEvidence>{}, &count);
+    WXI_REQUIRE(empty.ok());
+    WXI_REQUIRE_EQ(count, std::size_t{0});
+    const winexinfo::Status nullCount =
+        winexinfo::ValidateTabListDirectChildren(1234, children, nullptr);
+    WXI_REQUIRE_EQ(nullCount.hresult, E_INVALIDARG);
+}
+
+WXI_TEST(
+    uia_contract_retained_capture_guards_are_transactional,
+    "uia_contract.retained.transactional_guards") {
+    winexinfo::RetainedUiaContractCapture capture{};
+    capture.owner_thread_id = 777;
+    capture.evidence.transport_status = {
+        winexinfo::ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH,
+        E_ACCESSDENIED,
+        ERROR_ACCESS_DENIED,
+    };
+    const winexinfo::Status nullAutomation =
+        winexinfo::CaptureRetainedUiaContract(
+            nullptr, Handle(1), Handle(2), &capture);
+    WXI_REQUIRE_EQ(
+        nullAutomation.code,
+        winexinfo::ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH);
+    WXI_REQUIRE_EQ(nullAutomation.hresult, E_INVALIDARG);
+    WXI_REQUIRE_EQ(capture.owner_thread_id, DWORD{777});
+    WXI_REQUIRE_EQ(capture.evidence.transport_status.hresult, E_ACCESSDENIED);
+
+    const winexinfo::Status nullHandle =
+        winexinfo::CaptureRetainedUiaContract(
+            reinterpret_cast<IUIAutomation*>(std::uintptr_t{1}),
+            nullptr,
+            Handle(2),
+            &capture);
+    WXI_REQUIRE_EQ(nullHandle.hresult, E_INVALIDARG);
+    WXI_REQUIRE_EQ(capture.owner_thread_id, DWORD{777});
+
+    capture.owner_thread_id = GetCurrentThreadId();
+    std::size_t count = 99;
+    const winexinfo::Status malformed =
+        winexinfo::ReenumerateRetainedTabListDirectChildren(capture, &count);
+    WXI_REQUIRE_EQ(
+        malformed.code,
+        winexinfo::ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH);
+    WXI_REQUIRE_EQ(malformed.hresult, S_FALSE);
+    WXI_REQUIRE_EQ(count, std::size_t{99});
+    const winexinfo::Status nullCount =
+        winexinfo::ReenumerateRetainedTabListDirectChildren(capture, nullptr);
+    WXI_REQUIRE_EQ(nullCount.hresult, E_INVALIDARG);
 }
 
 }  // namespace

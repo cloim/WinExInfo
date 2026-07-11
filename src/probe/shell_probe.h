@@ -4,7 +4,11 @@
 #include "probe/probe_types.h"
 
 #include <Windows.h>
+#include <ShObjIdl_core.h>
+#include <ExDisp.h>
+#include <wrl/client.h>
 
+#include <span>
 #include <string>
 #include <vector>
 
@@ -26,6 +30,22 @@ struct ActiveShellViewEvidence final {
     std::vector<ShellViewEntryEvidence> entries;
 };
 
+struct ShellBrowserEntryCapture final {
+    Microsoft::WRL::ComPtr<IUnknown> canonical_identity;
+    Microsoft::WRL::ComPtr<IWebBrowser2> browser;
+    Microsoft::WRL::ComPtr<IShellBrowser> shell_browser;
+    bool target_matched;
+    HWND top_level;
+    HWND shell_tab;
+};
+
+struct ShellBrowserSetCapture final {
+    Status status;
+    ShellProbeTerminalStage terminal_stage;
+    DWORD owner_thread_id;
+    std::vector<ShellBrowserEntryCapture> entries;
+};
+
 [[nodiscard]] Status ClassifyFilesystemAttributes(
     HRESULT hresult,
     ULONG attributes,
@@ -45,6 +65,15 @@ struct ActiveShellViewEvidence final {
     HWND topLevel,
     HWND selectedShellTab,
     const ActiveShellViewEvidence& evidence,
+    ActiveShellViewSnapshot* output);
+[[nodiscard]] Status CaptureShellBrowserSet(
+    IShellWindows* shellWindows,
+    std::span<const HWND> targetTopLevels,
+    ShellBrowserSetCapture* output);
+[[nodiscard]] Status CaptureActiveShellViewFromBrowserSet(
+    const ShellBrowserSetCapture& browserSet,
+    HWND topLevel,
+    HWND selectedShellTab,
     ActiveShellViewSnapshot* output);
 [[nodiscard]] Status CaptureActiveShellView(
     HWND topLevel,

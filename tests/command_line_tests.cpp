@@ -101,7 +101,8 @@ WXI_TEST(report_escapes_control_characters, "report.escapes_control_characters")
         winexinfo::ErrorCode::OK,
     };
 
-    const std::string output = winexinfo::WriteProbeReport(report);
+    std::string output;
+    WXI_REQUIRE(winexinfo::WriteProbeReport(report, &output).ok());
 
     WXI_REQUIRE_EQ(
         output,
@@ -132,8 +133,10 @@ WXI_TEST(report_orders_keys, "report.orders_keys") {
         winexinfo::ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH,
     };
 
+    std::string output;
+    WXI_REQUIRE(winexinfo::WriteProbeReport(report, &output).ok());
     WXI_REQUIRE_EQ(
-        winexinfo::WriteProbeReport(report),
+        output,
         std::string{
             "probe_version=1\n"
             "mode=observe\n"

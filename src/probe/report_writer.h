@@ -8,7 +8,12 @@
 
 namespace winexinfo {
 
-[[nodiscard]] std::string WriteProbeReport(const ProbeReport& report);
+[[nodiscard]] Status WriteProbeReport(
+    const ProbeReport& report,
+    std::string* output);
+[[nodiscard]] Status AppendEventObservationReportFields(
+    const EventObservationSnapshot& snapshot,
+    ProbeReport* output);
 void AppendUiaCardinalityReportFields(
     std::string_view prefix,
     const UiaSelectorCardinalities& cardinalities,
