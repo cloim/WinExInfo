@@ -1,0 +1,13 @@
+HOST_EXIT=1
+ACTION_EXIT=0
+CONTROLLED_HWND=14225546
+ACTION=3406|window_opened|hwnd=14225546|pid=12096|tid=50232
+ACTION=4801|single_tab|name=winexinfo-gates-a-b
+ACTION=10696|tab_added|names=winexinfo-gates-a-b|내 PC
+ACTION=14474|original_selected
+ACTION=14769|navigate_docs
+ACTION=14988|back
+ACTION=17246|added_selected
+ACTION=19417|tab_closed|remaining=1
+ACTION=19420|window_close_sent
+ACTIONS_COMPLETE=OK

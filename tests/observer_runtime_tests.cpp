@@ -9,11 +9,22 @@
 #include <array>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <new>
 #include <thread>
 #include <vector>
 
 namespace {
+
+template <typename Operations>
+concept HasRegisteredShellResolver = requires(
+    Operations operations,
+    IShellWindows* shellWindows,
+    LONG lifecycleCookie,
+    Microsoft::WRL::ComPtr<IUnknown>& canonicalIdentity) {
+    operations.resolve_registered(
+        shellWindows, lifecycleCookie, canonicalIdentity);
+};
 
 HWND Handle(const std::uintptr_t value) {
     return reinterpret_cast<HWND>(value);
@@ -158,6 +169,16 @@ private:
 
 class FakeShellWindows final : public IShellWindows {
 public:
+    HRESULT find_hresult = E_NOTIMPL;
+    IDispatch* find_dispatch = nullptr;
+    std::size_t find_calls = 0;
+    VARTYPE find_location_vartype = VT_EMPTY;
+    LONG find_location_cookie = 0;
+    bool find_root_present = false;
+    VARTYPE find_root_vartype = VT_NULL;
+    int find_shell_class = 0;
+    int find_flags = 0;
+
     HRESULT STDMETHODCALLTYPE QueryInterface(
         REFIID iid,
         void** const output) override {
@@ -252,13 +273,31 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE FindWindowSW(
-        VARIANT*,
-        VARIANT*,
-        int,
+        VARIANT* const location,
+        VARIANT* const root,
+        const int shellClass,
         long*,
-        int,
-        IDispatch**) override {
-        return E_NOTIMPL;
+        const int flags,
+        IDispatch** const output) override {
+        ++find_calls;
+        if (location != nullptr) {
+            find_location_vartype = location->vt;
+            find_location_cookie = location->lVal;
+        }
+        find_root_present = root != nullptr;
+        if (root != nullptr) {
+            find_root_vartype = root->vt;
+        }
+        find_shell_class = shellClass;
+        find_flags = flags;
+        if (output != nullptr) {
+            *output = nullptr;
+            if (find_hresult == S_OK && find_dispatch != nullptr) {
+                find_dispatch->AddRef();
+                *output = find_dispatch;
+            }
+        }
+        return find_hresult;
     }
 
     HRESULT STDMETHODCALLTYPE OnCreated(long, IUnknown*) override {
@@ -425,6 +464,51 @@ winexinfo::ObserverOperationResult RuntimeOperationFailure(
                 : ERROR_SUCCESS,
         },
         origin,
+    };
+}
+
+winexinfo::EventObservationSnapshot PassingProductionGateSnapshot() {
+    const HWND topLevel = Handle(0x100);
+    const HWND shellTab = Handle(0x101);
+    const HWND previousView = Handle(0x102);
+    const HWND currentView = Handle(0x103);
+    const winexinfo::Status success{
+        winexinfo::ErrorCode::OK, S_OK, ERROR_SUCCESS};
+    return {
+        45000,
+        5,
+        0,
+        0,
+        {1, 1, 1, 1, 1},
+        success,
+        success,
+        {
+            {1, 1, winexinfo::ObservedEventKind::WindowRegistered,
+             winexinfo::ObservedEventTransition::Pending, topLevel, true,
+             shellTab, false, true, 42,
+             winexinfo::ObservedStructureChangeType::None, nullptr, nullptr, 0,
+             false, L"", false, L"", success},
+            {2, 1, winexinfo::ObservedEventKind::TabStructureChanged,
+             winexinfo::ObservedEventTransition::Remapped, topLevel, true,
+             shellTab, false, false, 0,
+             winexinfo::ObservedStructureChangeType::ChildAdded, nullptr,
+             previousView, 1, false, L"", true, L"C:\\A", success},
+            {3, 1, winexinfo::ObservedEventKind::TabSelected,
+             winexinfo::ObservedEventTransition::Remapped, topLevel, true,
+             shellTab, false, false, 0,
+             winexinfo::ObservedStructureChangeType::None, previousView,
+             currentView, 1, true, L"C:\\A", true, L"C:\\B", success},
+            {4, 1, winexinfo::ObservedEventKind::NavigateComplete2,
+             winexinfo::ObservedEventTransition::Remapped, topLevel, true,
+             shellTab, true, false, 0,
+             winexinfo::ObservedStructureChangeType::None, currentView,
+             previousView, 1, true, L"C:\\B", true, L"C:\\C", success},
+            {5, 1, winexinfo::ObservedEventKind::WindowRevoked,
+             winexinfo::ObservedEventTransition::Revoked, Handle(0x200), true,
+             Handle(0x201), false, true, 43,
+             winexinfo::ObservedStructureChangeType::None, Handle(0x202),
+             nullptr, 0, true, L"D:\\A", false, L"", success},
+        },
     };
 }
 
@@ -669,6 +753,7 @@ WXI_TEST(
         {winexinfo::ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH, S_FALSE, 0},
     };
     WXI_REQUIRE(queue.CompleteFailure(failed, failure).ok());
+    WXI_REQUIRE(queue.has_callback_failure());
 
     std::vector<winexinfo::ObserverCallbackEnvelope> drained;
     WXI_REQUIRE(queue.Drain(&drained).ok());
@@ -891,6 +976,7 @@ WXI_TEST(
                     localFailure,
                     current.sequence)
                     .ok());
+    WXI_REQUIRE(!queue.has_callback_failure());
     const auto emergency = queue.emergency();
     WXI_REQUIRE(emergency.has_value());
     WXI_REQUIRE_EQ(
@@ -1065,13 +1151,15 @@ WXI_TEST(
             WXI_REQUIRE(location != nullptr);
             WXI_REQUIRE_EQ(location->vt, VT_I4);
             WXI_REQUIRE_EQ(location->lVal, LONG{73});
-            WXI_REQUIRE(root == nullptr);
+            WXI_REQUIRE(root != nullptr);
+            WXI_REQUIRE_EQ(root->vt, VT_EMPTY);
             WXI_REQUIRE_EQ(shellClass, int{SWC_EXPLORER});
             WXI_REQUIRE(legacyHwnd != nullptr);
             *legacyHwnd = 999;
             WXI_REQUIRE_EQ(
                 flags,
-                int{SWFO_COOKIEPASSED | SWFO_NEEDDISPATCH});
+                int{SWFO_COOKIEPASSED | SWFO_NEEDDISPATCH |
+                    SWFO_INCLUDEPENDING});
             *output = &dispatch;
             dispatch.AddRef();
             return S_OK;
@@ -1084,6 +1172,47 @@ WXI_TEST(
     WXI_REQUIRE(!result.failure_origin.has_value());
     WXI_REQUIRE(called);
     WXI_REQUIRE_EQ(resolved.Get(), static_cast<IDispatch*>(&dispatch));
+}
+
+WXI_TEST(
+    observer_runtime_findwindow_does_not_guess_deferred_cookie,
+    "observer_runtime.findwindow_cookie_deferred_failure") {
+    for (const HRESULT deferred : {S_FALSE, E_PENDING}) {
+        std::size_t calls = 0;
+        const winexinfo::ShellWindowResolverOperations operations{
+            [&](VARIANT* const location,
+                VARIANT* const root,
+                const int shellClass,
+                long* const legacyHwnd,
+                const int flags,
+                IDispatch** const output) {
+                ++calls;
+                WXI_REQUIRE(location != nullptr);
+                WXI_REQUIRE_EQ(location->vt, VT_I4);
+                WXI_REQUIRE_EQ(location->lVal, LONG{91});
+                WXI_REQUIRE(root != nullptr);
+                WXI_REQUIRE_EQ(root->vt, VT_EMPTY);
+                WXI_REQUIRE_EQ(shellClass, int{SWC_EXPLORER});
+                WXI_REQUIRE(legacyHwnd != nullptr);
+                WXI_REQUIRE_EQ(
+                    flags,
+                    int{SWFO_COOKIEPASSED | SWFO_NEEDDISPATCH |
+                        SWFO_INCLUDEPENDING});
+                WXI_REQUIRE(output != nullptr);
+                return deferred;
+            },
+        };
+        Microsoft::WRL::ComPtr<IDispatch> resolved;
+        const winexinfo::ObserverOperationResult result =
+            winexinfo::FindRegisteredShellDispatch(91, operations, resolved);
+        WXI_REQUIRE(!result.ok());
+        WXI_REQUIRE_EQ(
+            result.failure_origin,
+            std::optional{winexinfo::ObserverFailureOrigin::Contract});
+        WXI_REQUIRE_EQ(result.status.hresult, deferred);
+        WXI_REQUIRE_EQ(calls, std::size_t{1});
+        WXI_REQUIRE(resolved == nullptr);
+    }
 }
 
 WXI_TEST(
@@ -2012,6 +2141,207 @@ WXI_TEST(
 }
 
 WXI_TEST(
+    observer_runtime_shell_lifecycle_correlates_existing_and_new_targets,
+    "observer_runtime.shell_lifecycle_correlation.registered") {
+    const HWND existingTop = Handle(0x100);
+    const HWND newTop = Handle(0x200);
+    const std::array<winexinfo::ObserverShellEntryMetadata, 1> previous{
+        winexinfo::ObserverShellEntryMetadata{
+            11, true, existingTop, Handle(0x101)},
+    };
+    const std::array<winexinfo::ObserverShellEntryMetadata, 2> addedTab{
+        previous[0],
+        winexinfo::ObserverShellEntryMetadata{
+            22, true, existingTop, Handle(0x102)},
+    };
+    const std::map<HWND, std::uint64_t> active{{existingTop, 3}};
+    const std::map<HWND, std::uint64_t> latest{
+        {existingTop, 3}, {newTop, 7}};
+    winexinfo::ObserverShellLifecycleCorrelation correlation{};
+    WXI_REQUIRE(winexinfo::CorrelateObserverShellLifecycle(
+                    winexinfo::ObservedEventKind::WindowRegistered,
+                    previous,
+                    addedTab,
+                    22,
+                    active,
+                    latest,
+                    &correlation)
+                    .ok());
+    WXI_REQUIRE(correlation.target_matched);
+    WXI_REQUIRE(!correlation.new_top_level);
+    WXI_REQUIRE_EQ(correlation.entry.canonical_identity, std::uintptr_t{22});
+    WXI_REQUIRE_EQ(correlation.generation, std::uint64_t{3});
+    WXI_REQUIRE_EQ(correlation.top_level_entry_count, std::size_t{2});
+
+    const std::array<winexinfo::ObserverShellEntryMetadata, 2> addedWindow{
+        previous[0],
+        winexinfo::ObserverShellEntryMetadata{
+            33, true, newTop, Handle(0x201)},
+    };
+    WXI_REQUIRE(winexinfo::CorrelateObserverShellLifecycle(
+                    winexinfo::ObservedEventKind::WindowRegistered,
+                    previous,
+                    addedWindow,
+                    33,
+                    active,
+                    latest,
+                    &correlation)
+                    .ok());
+    WXI_REQUIRE(correlation.target_matched);
+    WXI_REQUIRE(correlation.new_top_level);
+    WXI_REQUIRE_EQ(correlation.generation, std::uint64_t{8});
+    WXI_REQUIRE_EQ(correlation.top_level_entry_count, std::size_t{1});
+}
+
+WXI_TEST(
+    observer_runtime_shell_lifecycle_uses_exact_registration_identity,
+    "observer_runtime.shell_lifecycle_correlation.exact_registration") {
+    const HWND existingTop = Handle(0x100);
+    const HWND firstNewTop = Handle(0x200);
+    const HWND exactNewTop = Handle(0x300);
+    const std::array<winexinfo::ObserverShellEntryMetadata, 1> previous{
+        winexinfo::ObserverShellEntryMetadata{
+            11, true, existingTop, Handle(0x101)},
+    };
+    const std::array<winexinfo::ObserverShellEntryMetadata, 3> current{
+        previous[0],
+        winexinfo::ObserverShellEntryMetadata{
+            22, true, firstNewTop, Handle(0x201)},
+        winexinfo::ObserverShellEntryMetadata{
+            33, true, exactNewTop, Handle(0x301)},
+    };
+    const std::map<HWND, std::uint64_t> active{{existingTop, 1}};
+    const std::map<HWND, std::uint64_t> latest{
+        {existingTop, 1}, {exactNewTop, 4}};
+    winexinfo::ObserverShellLifecycleCorrelation correlation{};
+
+    WXI_REQUIRE(winexinfo::CorrelateObserverShellLifecycle(
+                    winexinfo::ObservedEventKind::WindowRegistered,
+                    previous,
+                    current,
+                    33,
+                    active,
+                    latest,
+                    &correlation)
+                    .ok());
+    WXI_REQUIRE(correlation.target_matched);
+    WXI_REQUIRE(correlation.new_top_level);
+    WXI_REQUIRE_EQ(correlation.entry.canonical_identity, std::uintptr_t{33});
+    WXI_REQUIRE_EQ(correlation.entry.top_level, exactNewTop);
+    WXI_REQUIRE_EQ(correlation.generation, std::uint64_t{5});
+    WXI_REQUIRE_EQ(correlation.top_level_entry_count, std::size_t{1});
+
+    RequireActiveFailure(
+        winexinfo::CorrelateObserverShellLifecycle(
+            winexinfo::ObservedEventKind::WindowRegistered,
+            previous,
+            previous,
+            11,
+            active,
+            latest,
+            &correlation),
+        S_FALSE);
+}
+
+WXI_TEST(
+    observer_runtime_shell_lifecycle_rejects_registration_without_exact_identity,
+    "observer_runtime.shell_lifecycle_correlation.unresolved_registration") {
+    const HWND existingTop = Handle(0x100);
+    const HWND addedTop = Handle(0x200);
+    const std::array<winexinfo::ObserverShellEntryMetadata, 1> previous{
+        winexinfo::ObserverShellEntryMetadata{
+            11, true, existingTop, Handle(0x101)},
+    };
+    const std::array<winexinfo::ObserverShellEntryMetadata, 2> current{
+        previous[0],
+        winexinfo::ObserverShellEntryMetadata{
+            22, true, addedTop, Handle(0x201)},
+    };
+    winexinfo::ObserverShellLifecycleCorrelation correlation{};
+
+    RequireActiveFailure(
+        winexinfo::CorrelateObserverShellLifecycle(
+            winexinfo::ObservedEventKind::WindowRegistered,
+            previous,
+            current,
+            0,
+            {{existingTop, 1}},
+            {{existingTop, 1}},
+            &correlation),
+        E_INVALIDARG);
+}
+
+WXI_TEST(
+    observer_runtime_shell_lifecycle_requires_active_revocation_mapping,
+    "observer_runtime.shell_lifecycle_correlation.revoked") {
+    const HWND topLevel = Handle(0x100);
+    const std::array<winexinfo::ObserverShellEntryMetadata, 2> previous{
+        winexinfo::ObserverShellEntryMetadata{
+            11, true, topLevel, Handle(0x101)},
+        winexinfo::ObserverShellEntryMetadata{
+            22, true, topLevel, Handle(0x102)},
+    };
+    const std::array<winexinfo::ObserverShellEntryMetadata, 1> current{
+        previous[0],
+    };
+    const std::map<HWND, std::uint64_t> active{{topLevel, 4}};
+    const std::map<HWND, std::uint64_t> latest{{topLevel, 4}};
+    winexinfo::ObserverShellLifecycleCorrelation correlation{};
+    WXI_REQUIRE(winexinfo::CorrelateObserverShellLifecycle(
+                    winexinfo::ObservedEventKind::WindowRevoked,
+                    previous,
+                    current,
+                    22,
+                    active,
+                    latest,
+                    &correlation)
+                    .ok());
+    WXI_REQUIRE(correlation.target_matched);
+    WXI_REQUIRE_EQ(correlation.entry.canonical_identity, std::uintptr_t{22});
+    WXI_REQUIRE_EQ(correlation.generation, std::uint64_t{4});
+    WXI_REQUIRE_EQ(correlation.top_level_entry_count, std::size_t{1});
+
+    const std::map<HWND, std::uint64_t> inactive;
+    RequireActiveFailure(
+        winexinfo::CorrelateObserverShellLifecycle(
+            winexinfo::ObservedEventKind::WindowRevoked,
+            previous,
+            current,
+            0,
+            inactive,
+            latest,
+            &correlation),
+        S_FALSE);
+}
+
+WXI_TEST(
+    observer_runtime_shell_lifecycle_ignores_exact_nontarget_delta,
+    "observer_runtime.shell_lifecycle_correlation.nontarget") {
+    const std::array<winexinfo::ObserverShellEntryMetadata, 1> previous{
+        winexinfo::ObserverShellEntryMetadata{
+            11, true, Handle(0x100), Handle(0x101)},
+    };
+    const std::array<winexinfo::ObserverShellEntryMetadata, 2> current{
+        previous[0],
+        winexinfo::ObserverShellEntryMetadata{
+            22, false, Handle(0x200), nullptr},
+    };
+    winexinfo::ObserverShellLifecycleCorrelation correlation{};
+    WXI_REQUIRE(winexinfo::CorrelateObserverShellLifecycle(
+                    winexinfo::ObservedEventKind::WindowRegistered,
+                    previous,
+                    current,
+                    22,
+                    {},
+                    {},
+                    &correlation)
+                    .ok());
+    WXI_REQUIRE(!correlation.target_matched);
+    WXI_REQUIRE_EQ(correlation.generation, std::uint64_t{0});
+    WXI_REQUIRE_EQ(correlation.top_level_entry_count, std::size_t{0});
+}
+
+WXI_TEST(
     observer_runtime_shell_startup_is_lifecycle_first_double_capture_and_reverse_cleanup,
     "observer_runtime.shell_startup_order") {
     DWORD lastError = ERROR_SUCCESS;
@@ -2372,6 +2702,53 @@ WXI_TEST(
         winexinfo::StartObserverShellSubscriptions(
             &nonTargetQueue, nonTargetOnly, &state, &outcome),
         S_FALSE);
+}
+
+WXI_TEST(
+    observer_runtime_shell_startup_accepts_empty_stable_baseline,
+    "observer_runtime.shell_startup_empty_baseline") {
+    DWORD lastError = ERROR_SUCCESS;
+    std::vector<int> wakeCalls;
+    std::vector<int> fallbackCalls;
+    winexinfo::ObserverCallbackQueue queue(
+        reinterpret_cast<HANDLE>(std::uintptr_t{1}),
+        QueueOperations(&lastError, &wakeCalls, &fallbackCalls));
+    std::size_t captureCalls = 0;
+    std::vector<std::uint64_t> cleanup;
+    const winexinfo::ObserverShellStartupOperations operations{
+        [](std::uint64_t* const registrationId) {
+            *registrationId = 100;
+            return RuntimeOperationSuccess();
+        },
+        [&captureCalls](
+            std::vector<winexinfo::ObserverShellEntryMetadata>* const output) {
+            ++captureCalls;
+            WXI_REQUIRE(output->empty());
+            return RuntimeOperationSuccess();
+        },
+        [](const winexinfo::ObserverShellEntryMetadata&, std::uint64_t*) {
+            WXI_REQUIRE(false);
+            return RuntimeOperationSuccess();
+        },
+        [&cleanup](const std::uint64_t registrationId) {
+            cleanup.push_back(registrationId);
+            return RuntimeOperationSuccess();
+        },
+    };
+    winexinfo::ObserverShellStartupState state{};
+    winexinfo::ObserverShellStartupOutcome outcome{};
+    WXI_REQUIRE(winexinfo::StartObserverShellSubscriptions(
+                    &queue, operations, &state, &outcome)
+                    .ok());
+    WXI_REQUIRE_EQ(captureCalls, std::size_t{2});
+    WXI_REQUIRE_EQ(state.lifecycle_registration_id, std::uint64_t{100});
+    WXI_REQUIRE(state.browser_registrations.empty());
+    WXI_REQUIRE(state.baseline.empty());
+    WXI_REQUIRE(winexinfo::CleanupObserverShellSubscriptions(
+                    operations, &state)
+                    .status
+                    .ok());
+    WXI_REQUIRE_EQ(cleanup, (std::vector<std::uint64_t>{100}));
 }
 
 WXI_TEST(
@@ -4114,6 +4491,11 @@ WXI_TEST(
             });
             return RuntimeOperationSuccess();
         },
+        [](IShellWindows*,
+           LONG,
+           Microsoft::WRL::ComPtr<IUnknown>&) {
+            return RuntimeOperationSuccess();
+        },
         [&calls, &lifecycleSink](
             winexinfo::ObserverCallbackQueue*,
             Microsoft::WRL::ComPtr<IDispatch>& output) {
@@ -4234,4 +4616,158 @@ WXI_TEST(
     WXI_REQUIRE_EQ(graph.owner_thread_id, DWORD{0});
     WXI_REQUIRE(graph.shell_windows == nullptr);
     WXI_REQUIRE(graph.browser_resources.empty());
+}
+
+WXI_TEST(
+    observer_runtime_shell_lifecycle_exposes_exact_cookie_resolver,
+    "observer_runtime.shell_lifecycle_exact_cookie_resolver") {
+    WXI_REQUIRE(
+        HasRegisteredShellResolver<
+            winexinfo::ObserverShellStaOperations>);
+
+    FakeDispatch dispatch;
+    FakeShellWindows shellWindows;
+    shellWindows.find_hresult = S_OK;
+    shellWindows.find_dispatch = &dispatch;
+    const winexinfo::ObserverShellStaOperations operations =
+        winexinfo::CreateProductionObserverShellStaOperations();
+    Microsoft::WRL::ComPtr<IUnknown> canonicalIdentity;
+    winexinfo::ObserverOperationResult resolved =
+        operations.resolve_registered(
+            &shellWindows, 73, canonicalIdentity);
+
+    WXI_REQUIRE(resolved.ok());
+    WXI_REQUIRE(!resolved.failure_origin.has_value());
+    WXI_REQUIRE_EQ(shellWindows.find_calls, std::size_t{1});
+    WXI_REQUIRE_EQ(shellWindows.find_location_vartype, VARTYPE{VT_I4});
+    WXI_REQUIRE_EQ(shellWindows.find_location_cookie, LONG{73});
+    WXI_REQUIRE(shellWindows.find_root_present);
+    WXI_REQUIRE_EQ(shellWindows.find_root_vartype, VARTYPE{VT_EMPTY});
+    WXI_REQUIRE_EQ(shellWindows.find_shell_class, int{SWC_EXPLORER});
+    WXI_REQUIRE_EQ(
+        shellWindows.find_flags,
+        int{SWFO_COOKIEPASSED | SWFO_NEEDDISPATCH |
+            SWFO_INCLUDEPENDING});
+    WXI_REQUIRE_EQ(
+        canonicalIdentity.Get(),
+        static_cast<IUnknown*>(static_cast<IDispatch*>(&dispatch)));
+    WXI_REQUIRE_EQ(dispatch.references(), ULONG{2});
+
+    const std::array<winexinfo::ObserverShellEntryMetadata, 0> previous{};
+    const std::array<winexinfo::ObserverShellEntryMetadata, 1> current{
+        winexinfo::ObserverShellEntryMetadata{
+            reinterpret_cast<std::uintptr_t>(canonicalIdentity.Get()),
+            true,
+            Handle(0x100),
+            Handle(0x101),
+        },
+    };
+    winexinfo::ObserverShellLifecycleCorrelation correlation{};
+    WXI_REQUIRE(winexinfo::CorrelateObserverShellLifecycle(
+                    winexinfo::ObservedEventKind::WindowRegistered,
+                    previous,
+                    current,
+                    reinterpret_cast<std::uintptr_t>(canonicalIdentity.Get()),
+                    {},
+                    {},
+                    &correlation)
+                    .ok());
+    WXI_REQUIRE_EQ(
+        correlation.entry.canonical_identity,
+        reinterpret_cast<std::uintptr_t>(canonicalIdentity.Get()));
+    canonicalIdentity.Reset();
+    WXI_REQUIRE_EQ(dispatch.references(), ULONG{1});
+
+    shellWindows.find_hresult = E_NOINTERFACE;
+    shellWindows.find_dispatch = nullptr;
+    resolved = operations.resolve_registered(
+        &shellWindows, 74, canonicalIdentity);
+    WXI_REQUIRE(!resolved.ok());
+    WXI_REQUIRE_EQ(resolved.status.hresult, E_NOINTERFACE);
+    WXI_REQUIRE_EQ(
+        resolved.failure_origin,
+        std::optional{winexinfo::ObserverFailureOrigin::Contract});
+    WXI_REQUIRE(canonicalIdentity == nullptr);
+
+    shellWindows.find_hresult = RPC_E_DISCONNECTED;
+    resolved = operations.resolve_registered(
+        &shellWindows, 75, canonicalIdentity);
+    WXI_REQUIRE(!resolved.ok());
+    WXI_REQUIRE_EQ(resolved.status.hresult, RPC_E_DISCONNECTED);
+    WXI_REQUIRE_EQ(
+        resolved.failure_origin,
+        std::optional{winexinfo::ObserverFailureOrigin::Transport});
+}
+
+WXI_TEST(
+    observer_runtime_gate_requires_all_correlated_event_kinds,
+    "observer_runtime.production_gate") {
+    winexinfo::EventObservationSnapshot snapshot{};
+    snapshot.runtime_status = {
+        winexinfo::ErrorCode::OK, S_OK, ERROR_SUCCESS};
+    snapshot.cleanup_status = {
+        winexinfo::ErrorCode::OK, S_OK, ERROR_SUCCESS};
+    bool passed = true;
+    WXI_REQUIRE(winexinfo::EvaluateEventObservationGate(snapshot, &passed).ok());
+    WXI_REQUIRE(!passed);
+}
+
+WXI_TEST(
+    observer_runtime_gate_accepts_complete_synthetic_event_matrix,
+    "observer_runtime.production_gate.complete_event_matrix") {
+    winexinfo::EventObservationSnapshot snapshot =
+        PassingProductionGateSnapshot();
+    bool passed = false;
+    WXI_REQUIRE(winexinfo::EvaluateEventObservationGate(snapshot, &passed).ok());
+    WXI_REQUIRE(passed);
+}
+
+WXI_TEST(
+    observer_runtime_gate_rejects_nonunique_active_view_remap,
+    "observer_runtime.production_gate.active_view_cardinality") {
+    winexinfo::EventObservationSnapshot snapshot =
+        PassingProductionGateSnapshot();
+    snapshot.events[3].active_view_count = 2;
+    bool passed = true;
+    WXI_REQUIRE(winexinfo::EvaluateEventObservationGate(snapshot, &passed).ok());
+    WXI_REQUIRE(!passed);
+}
+
+WXI_TEST(
+    observer_runtime_gate_rejects_nonterminal_revocation,
+    "observer_runtime.production_gate.revoked_cardinality") {
+    winexinfo::EventObservationSnapshot snapshot =
+        PassingProductionGateSnapshot();
+    snapshot.events[4].current_active_view = Handle(0x203);
+    snapshot.events[4].active_view_count = 1;
+    bool passed = true;
+    WXI_REQUIRE(winexinfo::EvaluateEventObservationGate(snapshot, &passed).ok());
+    WXI_REQUIRE(!passed);
+}
+
+WXI_TEST(
+    observer_runtime_gate_rejects_visible_pending_registration,
+    "observer_runtime.production_gate.pending_cardinality") {
+    winexinfo::EventObservationSnapshot snapshot =
+        PassingProductionGateSnapshot();
+    snapshot.events[0].current_active_view = Handle(0x104);
+    snapshot.events[0].active_view_count = 1;
+    bool passed = true;
+    WXI_REQUIRE(winexinfo::EvaluateEventObservationGate(snapshot, &passed).ok());
+    WXI_REQUIRE(!passed);
+}
+
+WXI_TEST(
+    observer_runtime_gate_rejects_runtime_failure,
+    "observer_runtime.production_gate.runtime_failure") {
+    winexinfo::EventObservationSnapshot snapshot =
+        PassingProductionGateSnapshot();
+    snapshot.runtime_status = {
+        winexinfo::ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH,
+        RPC_E_DISCONNECTED,
+        ERROR_SUCCESS,
+    };
+    bool passed = true;
+    WXI_REQUIRE(winexinfo::EvaluateEventObservationGate(snapshot, &passed).ok());
+    WXI_REQUIRE(!passed);
 }

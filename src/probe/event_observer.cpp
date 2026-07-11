@@ -273,7 +273,8 @@ Status ClassifyUiaEvent(
     const bool senderInScope =
         evidence.sender_relation == UiaSenderRelation::RegistrationElement ||
         evidence.sender_relation == UiaSenderRelation::DirectChild ||
-        evidence.sender_relation == UiaSenderRelation::Descendant;
+        evidence.sender_relation == UiaSenderRelation::Descendant ||
+        evidence.sender_relation == UiaSenderRelation::RegisteredSubtree;
     if (evidence.registered_scope != TreeScope_Subtree || !senderInScope ||
         evidence.structure_sender_role == UiaStructureSenderRole::NotApplicable ||
         !evidence.structure_change_type.has_value()) {
@@ -283,6 +284,7 @@ Status ClassifyUiaEvent(
         *evidence.structure_change_type == StructureChangeType_ChildAdded;
     const bool childRemoved =
         *evidence.structure_change_type == StructureChangeType_ChildRemoved;
+    const bool runtimeIdChange = childAdded || childRemoved;
     const bool validChangeType = childAdded || childRemoved ||
         *evidence.structure_change_type == StructureChangeType_ChildrenInvalidated ||
         *evidence.structure_change_type == StructureChangeType_ChildrenBulkAdded ||
@@ -294,10 +296,10 @@ Status ClassifyUiaEvent(
           evidence.sender_relation == UiaSenderRelation::RegistrationElement)) ||
         (!childAdded &&
          evidence.structure_sender_role != UiaStructureSenderRole::Container) ||
-        (childRemoved &&
+        (runtimeIdChange &&
          (!evidence.runtime_id_present || evidence.runtime_id_dimensions != 1 ||
           evidence.runtime_id_vartype != VT_I4)) ||
-        (!childRemoved &&
+        (!runtimeIdChange &&
          (evidence.runtime_id_present || evidence.runtime_id_dimensions != 0 ||
           evidence.runtime_id_vartype != VT_EMPTY))) {
         return ContractFailure();
@@ -559,7 +561,7 @@ Status EventCorrelationReducer::FinalizeInitialShellEntries(
 }
 
 Status EventCorrelationReducer::FinalizeInitialBaseline() {
-    if (initial_baseline_finalized_ || initial_windows_.empty() ||
+    if (initial_baseline_finalized_ ||
         initial_windows_ != finalized_initial_windows_) {
         return ContractFailure();
     }
@@ -841,16 +843,13 @@ Status EventCorrelationReducer::RecordRevoked(
     const std::size_t remainingEntryCount,
     const LogicalActiveViewState& current,
     ObservedEventRecord* const output) {
-    const bool terminalState = remainingEntryCount == 0 &&
-        IsExactSuccessStatus(current.status) &&
+    const bool terminalState = IsExactSuccessStatus(current.status) &&
         current.active_view_count == 0 && current.active_view == nullptr &&
         !current.filesystem_path_available && current.filesystem_path.empty();
-    const bool continuingState =
-        remainingEntryCount > 0 && IsLogicalStateValid(current);
     if (output == nullptr || pending_remap_.has_value() ||
         trigger.kind != ObservedEventKind::WindowRevoked ||
         !IsTriggerMetadataValid(trigger) ||
-        (!terminalState && !continuingState)) {
+        !terminalState) {
         return ContractFailure();
     }
     const auto shellEntry = shell_entries_.find(trigger.shell_cookie);
@@ -887,32 +886,21 @@ Status EventCorrelationReducer::RecordRevoked(
         {ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH, S_FALSE, ERROR_SUCCESS},
     };
     const LogicalActiveViewState previous = window->second.active_view;
-    ObservedEventTransition transition = ObservedEventTransition::Revoked;
-    LogicalActiveViewState recordedCurrent = hidden;
-    Status recordStatus{ErrorCode::OK, S_OK, ERROR_SUCCESS};
     if (remainingEntryCount == 0) {
         windows_.erase(window);
-    } else if (IsExactSuccessStatus(current.status)) {
-        transition = ObservedEventTransition::Remapped;
-        recordedCurrent = current;
-        window->second.active_view = current;
     } else {
-        transition = ObservedEventTransition::Mismatch;
-        recordStatus = current.status;
         window->second.active_view = hidden;
-    }
-    if (remainingEntryCount > 0) {
         window->second.last_observed_entry_count = remainingEntryCount;
     }
     shell_entries_.erase(shellEntry);
     *output = MakeEventRecord(
         next_sequence_++,
         trigger,
-        transition,
+        ObservedEventTransition::Revoked,
         previous,
-        recordedCurrent,
+        hidden,
         current.active_view_count,
-        recordStatus);
+        current.status);
     return {ErrorCode::OK, S_OK, ERROR_SUCCESS};
 }
 

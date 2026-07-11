@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -110,6 +111,7 @@ public:
     [[nodiscard]] std::optional<ObserverCallbackEmergency> emergency() const noexcept;
     [[nodiscard]] std::size_t late_event_count() const noexcept;
     [[nodiscard]] std::size_t ignored_event_count() const noexcept;
+    [[nodiscard]] bool has_callback_failure() const noexcept;
     [[nodiscard]] HANDLE wake_event() const noexcept;
 
 private:
@@ -141,6 +143,7 @@ private:
     std::size_t in_flight_ = 0;
     std::size_t late_event_count_ = 0;
     std::size_t ignored_event_count_ = 0;
+    bool has_callback_failure_ = false;
 };
 
 enum class ObserverWaitOutcome {
@@ -200,12 +203,28 @@ struct ObserverShellSetTransition final {
     bool operator==(const ObserverShellSetTransition&) const = default;
 };
 
+struct ObserverShellLifecycleCorrelation final {
+    bool target_matched;
+    bool new_top_level;
+    ObserverShellEntryMetadata entry;
+    std::uint64_t generation;
+    std::size_t top_level_entry_count;
+};
+
 [[nodiscard]] Status ClassifyObserverShellSetTransition(
     ObserverShellTransitionKind kind,
     std::span<const ObserverShellEntryMetadata> previous,
     std::span<const ObserverShellEntryMetadata> current,
     std::uintptr_t resolvedAddedIdentity,
     ObserverShellSetTransition* output);
+[[nodiscard]] Status CorrelateObserverShellLifecycle(
+    ObservedEventKind kind,
+    std::span<const ObserverShellEntryMetadata> previous,
+    std::span<const ObserverShellEntryMetadata> current,
+    std::uintptr_t resolvedAddedIdentity,
+    const std::map<HWND, std::uint64_t>& activeGenerations,
+    const std::map<HWND, std::uint64_t>& latestGenerations,
+    ObserverShellLifecycleCorrelation* output);
 
 struct ObserverOperationResult final {
     Status status;
@@ -403,6 +422,10 @@ struct ObserverShellStaOperations final {
         std::span<const HWND>,
         ObserverShellStaCapture*)> capture;
     std::function<ObserverOperationResult(
+        IShellWindows*,
+        LONG,
+        Microsoft::WRL::ComPtr<IUnknown>&)> resolve_registered;
+    std::function<ObserverOperationResult(
         ObserverCallbackQueue*,
         Microsoft::WRL::ComPtr<IDispatch>&)> create_lifecycle_sink;
     std::function<ObserverOperationResult(
@@ -444,6 +467,10 @@ struct ObserverRuntimeOutcome final {
     ObserverFailureState failures;
     ObserverCompletion completion;
 };
+
+[[nodiscard]] ObserverOperationResult EvaluateEventObservationGate(
+    const EventObservationSnapshot& snapshot,
+    bool* output) noexcept;
 
 [[nodiscard]] Status RunObserverRuntime(
     std::uint32_t durationMs,

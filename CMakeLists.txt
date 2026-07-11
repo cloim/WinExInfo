@@ -23,11 +23,13 @@ add_executable(WinExInfoTests
   src/probe/event_observer.cpp
   src/probe/observer_runtime.cpp
   src/probe/observer_runtime_contract.cpp
+  src/probe/observer_production_runtime.cpp
   src/probe/probe_runner.cpp
   src/probe/report_writer.cpp
   src/probe/shell_probe.cpp
   src/probe/target_validator.cpp
   src/probe/uia_probe.cpp
+  src/probe/uia_observer_worker.cpp
   src/probe/win32_probe.cpp
   tests/active_view_tests.cpp
   tests/com_apartment_tests.cpp
@@ -41,6 +43,7 @@ add_executable(WinExInfoTests
   tests/test_framework.cpp
   tests/test_main.cpp
   tests/uia_contract_tests.cpp
+  tests/uia_observer_worker_tests.cpp
 )
 
 target_include_directories(WinExInfoTests PRIVATE
@@ -88,11 +91,13 @@ add_executable(WinExInfoHost
   src/probe/event_observer.cpp
   src/probe/observer_runtime.cpp
   src/probe/observer_runtime_contract.cpp
+  src/probe/observer_production_runtime.cpp
   src/probe/probe_runner.cpp
   src/probe/report_writer.cpp
   src/probe/shell_probe.cpp
   src/probe/target_validator.cpp
   src/probe/uia_probe.cpp
+  src/probe/uia_observer_worker.cpp
   src/probe/win32_probe.cpp
 )
 

@@ -28,6 +28,7 @@ enum class UiaSenderRelation {
     RegistrationElement,
     DirectChild,
     Descendant,
+    RegisteredSubtree,
     Outside,
 };
 

@@ -2,6 +2,7 @@
 
 #include "common/utf8.h"
 #include "probe/report_writer.h"
+#include "probe/observer_runtime.h"
 #include "probe/shell_probe.h"
 #include "probe/target_validator.h"
 #include "probe/uia_probe.h"
@@ -371,6 +372,84 @@ ProbeRunResult RunSnapshotProbe() {
                          : (firstError == ErrorCode::OK ? HostExitCode::Pass
                                                        : HostExitCode::ContractFailure),
     };
+}
+
+ProbeRunResult CreateObserveInfrastructureFailure(
+    const std::uint32_t durationMs,
+    const Status& failure,
+    const std::string_view runtimeStage) {
+    EventObservationSnapshot snapshot{
+        durationMs,
+        0,
+        0,
+        0,
+        {0, 0, 0, 0, 0},
+        failure,
+        {ErrorCode::OK, S_OK, ERROR_SUCCESS},
+        {},
+        std::string{runtimeStage},
+    };
+    ProbeReport report{
+        ProbeMode::Observe,
+        false,
+        {},
+        ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH,
+    };
+    const Status appended = AppendEventObservationReportFields(
+        snapshot, &report);
+    if (!appended.ok()) {
+        report = {
+            ProbeMode::Observe,
+            false,
+            {},
+            ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH,
+        };
+        return {
+            std::move(report),
+            IsProbeTransportFailure(appended)
+                ? HostExitCode::Win32ComFailure
+                : HostExitCode::ContractFailure,
+        };
+    }
+    return {
+        std::move(report),
+        IsProbeTransportFailure(failure)
+            ? HostExitCode::Win32ComFailure
+            : HostExitCode::ContractFailure,
+    };
+}
+
+ProbeRunResult RunObserveProbe(const std::uint32_t durationMs) {
+    ObserverRuntimeOutcome outcome{};
+    const Status runtime = RunObserverRuntime(durationMs, &outcome);
+    HostExitCode exitCode = HostExitCode::ContractFailure;
+    const Status exitStatus = outcome.failures.ResolveHostExitCode(
+        outcome.completion, &exitCode);
+    if (!exitStatus.ok()) {
+        exitCode = HostExitCode::ContractFailure;
+    }
+
+    ErrorCode reportError = ErrorCode::OK;
+    if (!outcome.snapshot.runtime_status.ok()) {
+        reportError = outcome.snapshot.runtime_status.code;
+    } else if (!outcome.snapshot.cleanup_status.ok()) {
+        reportError = outcome.snapshot.cleanup_status.code;
+    } else if (!runtime.ok() || !outcome.completion.gate_passed) {
+        reportError = ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH;
+    }
+    ProbeReport report{
+        ProbeMode::Observe,
+        outcome.completion.gate_passed,
+        {},
+        reportError,
+    };
+    const Status appended = AppendEventObservationReportFields(
+        outcome.snapshot, &report);
+    if (!appended.ok()) {
+        return CreateObserveInfrastructureFailure(
+            durationMs, appended, "report.append");
+    }
+    return {std::move(report), exitCode};
 }
 
 }  // namespace winexinfo
