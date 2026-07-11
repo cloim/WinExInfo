@@ -409,7 +409,10 @@ Status AppendEventObservationReportFields(
     ObservedEventKindCounts actualCounts{};
     bool hasMismatch = false;
     bool hasNonSuccessEvent = false;
-    bool hasTerminalRevoke = false;
+    bool hasTabAddition = false;
+    bool hasTabRemoval = false;
+    bool hasSelectionRemap = false;
+    bool hasLifecycleRemoval = false;
     bool hasNavigatePathTransition = false;
     std::set<std::tuple<std::uintptr_t, std::uint64_t, LONG>> unresolvedPending;
     std::vector<ReportSection> additions;
@@ -460,6 +463,16 @@ Status AppendEventObservationReportFields(
              event.previous_active_view == nullptr) ||
             (event.current_filesystem_path_available &&
              event.current_active_view == nullptr)) {
+            return ReportFailure();
+        }
+        if (event.removed_tab_count > event.previous_tab_count ||
+            event.added_tab_count > event.current_tab_count ||
+            event.retained_tab_count !=
+                event.previous_tab_count - event.removed_tab_count ||
+            event.retained_tab_count !=
+                event.current_tab_count - event.added_tab_count ||
+            (event.current_tab_count == 0) !=
+                (event.reconciled_active_shell_tab == nullptr)) {
             return ReportFailure();
         }
 
@@ -574,6 +587,13 @@ Status AppendEventObservationReportFields(
                     !event.current_filesystem_path_available && !eventSuccess;
                 hasMismatch = true;
                 break;
+            case ObservedEventTransition::Reconciled:
+                transitionName = "reconciled";
+                transitionValid = lifecycleKind &&
+                    event.current_active_view == nullptr &&
+                    event.active_view_count == 0 &&
+                    !event.current_filesystem_path_available && eventSuccess;
+                break;
             default:
                 return ReportFailure();
         }
@@ -581,10 +601,12 @@ Status AppendEventObservationReportFields(
             (event.kind == ObservedEventKind::WindowRegistered &&
              (event.transition == ObservedEventTransition::Pending ||
               event.transition == ObservedEventTransition::Remapped ||
-              event.transition == ObservedEventTransition::Mismatch)) ||
+              event.transition == ObservedEventTransition::Mismatch ||
+              event.transition == ObservedEventTransition::Reconciled)) ||
             (event.kind == ObservedEventKind::WindowRevoked &&
               (event.transition == ObservedEventTransition::Revoked ||
-               event.transition == ObservedEventTransition::Mismatch)) ||
+               event.transition == ObservedEventTransition::Mismatch ||
+               event.transition == ObservedEventTransition::Reconciled)) ||
             ((event.kind == ObservedEventKind::NavigateComplete2 ||
               event.kind == ObservedEventKind::TabSelected ||
               event.kind == ObservedEventKind::TabStructureChanged) &&
@@ -594,9 +616,15 @@ Status AppendEventObservationReportFields(
             return ReportFailure();
         }
         hasNonSuccessEvent = hasNonSuccessEvent || !eventSuccess;
-        hasTerminalRevoke = hasTerminalRevoke ||
+        hasTabAddition = hasTabAddition || event.added_tab_count > 0;
+        hasTabRemoval = hasTabRemoval || event.removed_tab_count > 0;
+        hasSelectionRemap = hasSelectionRemap ||
+            (event.kind == ObservedEventKind::TabSelected &&
+             event.transition == ObservedEventTransition::Remapped &&
+             event.active_view_count == 1);
+        hasLifecycleRemoval = hasLifecycleRemoval ||
             (event.kind == ObservedEventKind::WindowRevoked &&
-             event.transition == ObservedEventTransition::Revoked);
+             event.removed_tab_count > 0);
         hasNavigatePathTransition = hasNavigatePathTransition ||
             (event.kind == ObservedEventKind::NavigateComplete2 &&
              event.transition == ObservedEventTransition::Remapped &&
@@ -659,9 +687,13 @@ Status AppendEventObservationReportFields(
             {prefix + "source_shell_tab_present", event.source_shell_tab_present ? "true" : "false"},
             {prefix + "source_shell_tab_hwnd", FormatReportHwnd(event.source_shell_tab)},
             {prefix + "source_was_active", event.source_was_active ? "true" : "false"},
-            {prefix + "shell_window_cookie_present", event.shell_cookie_present ? "true" : "false"},
-            {prefix + "shell_window_cookie", std::to_string(event.shell_cookie)},
             {prefix + "structure_change_type", std::move(structureName)},
+            {prefix + "reconcile.previous_tab_count", std::to_string(event.previous_tab_count)},
+            {prefix + "reconcile.current_tab_count", std::to_string(event.current_tab_count)},
+            {prefix + "reconcile.added_tab_count", std::to_string(event.added_tab_count)},
+            {prefix + "reconcile.removed_tab_count", std::to_string(event.removed_tab_count)},
+            {prefix + "reconcile.retained_tab_count", std::to_string(event.retained_tab_count)},
+            {prefix + "reconcile.active_shell_tab", FormatReportHwnd(event.reconciled_active_shell_tab)},
             {prefix + "previous_active_view_hwnd", FormatReportHwnd(event.previous_active_view)},
             {prefix + "current_active_view_hwnd", FormatReportHwnd(event.current_active_view)},
             {prefix + "active_view_count", std::to_string(event.active_view_count)},
@@ -673,6 +705,12 @@ Status AppendEventObservationReportFields(
             {prefix + "status.hresult", std::to_string(event.status.hresult)},
             {prefix + "status.win32", std::to_string(event.status.win32)},
         };
+        if (lifecycleKind) {
+            section.fields.push_back({
+                prefix + "lifecycle.cookie",
+                std::to_string(event.shell_cookie),
+            });
+        }
         additions.push_back(std::move(section));
     }
 
@@ -688,10 +726,12 @@ Status AppendEventObservationReportFields(
         actualCounts.tab_selected > 0 && actualCounts.tab_structure_changed > 0;
     const bool passShape = hasAllKinds && runtimeSuccess && cleanupSuccess &&
         !hasMismatch && !hasNonSuccessEvent && unresolvedPending.empty() &&
-        hasTerminalRevoke && hasNavigatePathTransition;
+        hasTabAddition && hasTabRemoval && hasSelectionRemap &&
+        hasLifecycleRemoval && hasNavigatePathTransition;
     const bool failureEvidence = !hasAllKinds || !runtimeSuccess ||
         !cleanupSuccess || hasMismatch || hasNonSuccessEvent ||
-        !unresolvedPending.empty() || !hasTerminalRevoke ||
+        !unresolvedPending.empty() || !hasTabAddition || !hasTabRemoval ||
+        !hasSelectionRemap || !hasLifecycleRemoval ||
         !hasNavigatePathTransition;
     if ((output->passed && !passShape) || (!output->passed && !failureEvidence)) {
         return ReportFailure();

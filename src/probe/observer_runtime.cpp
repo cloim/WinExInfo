@@ -1,3 +1,4 @@
+
 #include "probe/observer_runtime.h"
 
 #include <ExDisp.h>
@@ -248,6 +249,7 @@ public:
             {
                 ObserverCallbackSource::BrowserNavigate,
                 eventKind,
+
                 0,
                 top_level_,
                 generation_,
@@ -282,227 +284,6 @@ ObserverOperationResult ClassifyObserverWin32Failure(
             HRESULT_FROM_WIN32(lastError),
             lastError,
         });
-}
-
-Status ClassifyObserverShellSetTransition(
-    const ObserverShellTransitionKind kind,
-    const std::span<const ObserverShellEntryMetadata> previous,
-    const std::span<const ObserverShellEntryMetadata> current,
-    const std::uintptr_t resolvedAddedIdentity,
-    ObserverShellSetTransition* const output) {
-    const bool validKind = kind == ObserverShellTransitionKind::Stable ||
-        kind == ObserverShellTransitionKind::Registered ||
-        kind == ObserverShellTransitionKind::Revoked;
-    if (!validKind || output == nullptr ||
-        (kind == ObserverShellTransitionKind::Registered &&
-         resolvedAddedIdentity == 0) ||
-        (kind != ObserverShellTransitionKind::Registered &&
-         resolvedAddedIdentity != 0)) {
-        return ContractFailure(E_INVALIDARG, ERROR_INVALID_PARAMETER);
-    }
-
-    const std::array<std::span<const ObserverShellEntryMetadata>, 2> sets{
-        previous,
-        current,
-    };
-    for (const auto set : sets) {
-        for (std::size_t index = 0; index < set.size(); ++index) {
-            const ObserverShellEntryMetadata& entry = set[index];
-            if (entry.canonical_identity == 0 || entry.top_level == nullptr ||
-                entry.target_matched != (entry.shell_tab != nullptr)) {
-                return ContractFailure();
-            }
-            for (std::size_t prior = 0; prior < index; ++prior) {
-                if (set[prior].canonical_identity == entry.canonical_identity ||
-                    (entry.target_matched && set[prior].target_matched &&
-                     set[prior].top_level == entry.top_level &&
-                     set[prior].shell_tab == entry.shell_tab)) {
-                    return ContractFailure();
-                }
-            }
-        }
-    }
-
-    ObserverShellSetTransition candidate{};
-    for (const ObserverShellEntryMetadata& oldEntry : previous) {
-        const auto match = std::find_if(
-            current.begin(),
-            current.end(),
-            [&oldEntry](const ObserverShellEntryMetadata& entry) {
-                return entry.canonical_identity == oldEntry.canonical_identity;
-            });
-        if (match == current.end()) {
-            if (candidate.removed.has_value()) {
-                return ContractFailure();
-            }
-            candidate.removed = oldEntry;
-        } else if (*match != oldEntry) {
-            return ContractFailure();
-        }
-    }
-    for (const ObserverShellEntryMetadata& newEntry : current) {
-        const auto match = std::find_if(
-            previous.begin(),
-            previous.end(),
-            [&newEntry](const ObserverShellEntryMetadata& entry) {
-                return entry.canonical_identity == newEntry.canonical_identity;
-            });
-        if (match == previous.end()) {
-            if (candidate.added.has_value()) {
-                return ContractFailure();
-            }
-            candidate.added = newEntry;
-        }
-    }
-
-    const bool exactStable = !candidate.added.has_value() &&
-        !candidate.removed.has_value();
-    const bool exactRegistered = candidate.added.has_value() &&
-        !candidate.removed.has_value() &&
-        candidate.added->canonical_identity == resolvedAddedIdentity;
-    const bool exactRevoked = !candidate.added.has_value() &&
-        candidate.removed.has_value();
-    if ((kind == ObserverShellTransitionKind::Stable && !exactStable) ||
-        (kind == ObserverShellTransitionKind::Registered && !exactRegistered) ||
-        (kind == ObserverShellTransitionKind::Revoked && !exactRevoked)) {
-        return ContractFailure();
-    }
-    *output = candidate;
-    return Success();
-}
-
-Status CorrelateObserverShellLifecycle(
-    const ObservedEventKind kind,
-    const std::span<const ObserverShellEntryMetadata> previous,
-    const std::span<const ObserverShellEntryMetadata> current,
-    const std::uintptr_t resolvedAddedIdentity,
-    const std::map<HWND, std::uint64_t>& activeGenerations,
-    const std::map<HWND, std::uint64_t>& latestGenerations,
-    ObserverShellLifecycleCorrelation* const output) {
-    if (output == nullptr ||
-        (kind != ObservedEventKind::WindowRegistered &&
-         kind != ObservedEventKind::WindowRevoked) ||
-        (kind == ObservedEventKind::WindowRegistered &&
-         resolvedAddedIdentity == 0)) {
-        return ContractFailure(E_INVALIDARG, ERROR_INVALID_PARAMETER);
-    }
-    for (const auto& [topLevel, generation] : latestGenerations) {
-        if (topLevel == nullptr || generation == 0) {
-            return ContractFailure();
-        }
-    }
-    for (const auto& [topLevel, generation] : activeGenerations) {
-        const auto latest = latestGenerations.find(topLevel);
-        if (topLevel == nullptr || generation == 0 ||
-            latest == latestGenerations.end() ||
-            latest->second != generation) {
-            return ContractFailure();
-        }
-    }
-
-    ObserverShellSetTransition transition{};
-    ObserverShellEntryMetadata entry{};
-    if (kind == ObservedEventKind::WindowRegistered) {
-        ObserverShellSetTransition validated{};
-        Status classified = ClassifyObserverShellSetTransition(
-            ObserverShellTransitionKind::Stable,
-            previous,
-            previous,
-            0,
-            &validated);
-        if (!classified.ok()) {
-            return classified;
-        }
-        classified = ClassifyObserverShellSetTransition(
-            ObserverShellTransitionKind::Stable,
-            current,
-            current,
-            0,
-            &validated);
-        if (!classified.ok()) {
-            return classified;
-        }
-        const auto resolved = std::find_if(
-            current.begin(),
-            current.end(),
-            [resolvedAddedIdentity](
-                const ObserverShellEntryMetadata& candidate) {
-                return candidate.canonical_identity ==
-                    resolvedAddedIdentity;
-            });
-        if (resolved == current.end()) {
-            return ContractFailure();
-        }
-        const auto previousResolved = std::find_if(
-            previous.begin(),
-            previous.end(),
-            [resolvedAddedIdentity](
-                const ObserverShellEntryMetadata& candidate) {
-                    return candidate.canonical_identity ==
-                        resolvedAddedIdentity;
-            });
-        if (previousResolved != previous.end()) {
-            return ContractFailure();
-        }
-        entry = *resolved;
-    } else {
-        const Status classified = ClassifyObserverShellSetTransition(
-            ObserverShellTransitionKind::Revoked,
-            previous,
-            current,
-            0,
-            &transition);
-        if (!classified.ok()) {
-            return classified;
-        }
-        entry = *transition.removed;
-    }
-    ObserverShellLifecycleCorrelation candidate{
-        entry.target_matched,
-        false,
-        entry,
-        0,
-        0,
-    };
-    if (!entry.target_matched) {
-        *output = candidate;
-        return Success();
-    }
-
-    const auto active = activeGenerations.find(entry.top_level);
-    if (kind == ObservedEventKind::WindowRevoked) {
-        if (active == activeGenerations.end()) {
-            return ContractFailure();
-        }
-        candidate.generation = active->second;
-    } else if (active != activeGenerations.end()) {
-        candidate.generation = active->second;
-    } else {
-        candidate.new_top_level = true;
-        const auto latest = latestGenerations.find(entry.top_level);
-        if (latest != latestGenerations.end()) {
-            if (latest->second == std::numeric_limits<std::uint64_t>::max()) {
-                return ContractFailure();
-            }
-            candidate.generation = latest->second + 1;
-        } else {
-            candidate.generation = 1;
-        }
-    }
-    candidate.top_level_entry_count = static_cast<std::size_t>(
-        std::count_if(
-            current.begin(),
-            current.end(),
-            [&](const ObserverShellEntryMetadata& candidateEntry) {
-                return candidateEntry.target_matched &&
-                    candidateEntry.top_level == entry.top_level;
-            }));
-    if (kind == ObservedEventKind::WindowRegistered &&
-        candidate.top_level_entry_count == 0) {
-        return ContractFailure();
-    }
-    *output = candidate;
-    return Success();
 }
 
 Status ReconcileObserverShellSubscriptions(
@@ -748,6 +529,7 @@ Status ReconcileObserverShellSubscriptions(
         state->subscriptions = std::move(committed);
         state->next_registration_id = nextRegistrationId;
     } catch (const std::bad_alloc&) {
+
         candidate.operation = TransportOperationFailure(E_OUTOFMEMORY);
         rollback();
         *output = candidate;
@@ -998,6 +780,7 @@ ObserverShellCleanupOutcome CleanupObserverShellSubscriptions(
     };
 }
 
+
 Status StartObserverShellSubscriptions(
     ObserverCallbackQueue* const queue,
     const ObserverShellStartupOperations& operations,
@@ -1080,15 +863,9 @@ Status StartObserverShellSubscriptions(
             operation = mergeOperationResult(operation);
         }
 
-        ObserverShellSetTransition validatedFirst{};
         bool hasTarget = false;
         if (candidate.setup.ok()) {
-            const Status validation = ClassifyObserverShellSetTransition(
-                ObserverShellTransitionKind::Stable,
-                first,
-                first,
-                0,
-                &validatedFirst);
+            const Status validation = ValidateObserverShellEntrySet(first);
             for (const ObserverShellEntryMetadata& entry : first) {
                 hasTarget = hasTarget || entry.target_matched;
             }
@@ -1149,13 +926,14 @@ Status StartObserverShellSubscriptions(
             operation = mergeOperationResult(operation);
         }
         if (candidate.setup.ok()) {
-            ObserverShellSetTransition stable{};
-            const Status stability = ClassifyObserverShellSetTransition(
-                ObserverShellTransitionKind::Stable,
-                first,
-                second,
-                0,
-                &stable);
+            const Status secondShape = ValidateObserverShellEntrySet(second);
+            const bool sameEntries = secondShape.ok() &&
+                first.size() == second.size() &&
+                std::is_permutation(
+                    first.begin(), first.end(), second.begin(), second.end());
+            const Status stability = sameEntries
+                ? Success()
+                : ContractFailure();
             if (!stability.ok()) {
                 candidate.setup = {
                     stability,
@@ -1253,6 +1031,7 @@ Status ObserverCallbackQueue::SignalWakeLocked(
             fallback = ClassifyObserverWin32Failure(
                 operations_.get_last_error());
         } catch (const std::bad_alloc&) {
+
             fallback = TransportOperationFailure(E_OUTOFMEMORY);
         } catch (...) {
             fallback = TransportOperationFailure(E_FAIL);
@@ -1503,6 +1282,7 @@ Status ObserverCallbackQueue::RecordCoordinatorFailure(
     std::scoped_lock lock{mutex_};
     if (rawCutoff.has_value() &&
         (*rawCutoff == 0 || *rawCutoff >= next_sequence_)) {
+
         return ContractFailure(E_INVALIDARG, ERROR_INVALID_PARAMETER);
     }
     const std::uint64_t cutoff = rawCutoff.value_or(next_sequence_);
@@ -1753,6 +1533,7 @@ Status ValidateObserverEventProcessingResult(
                 payload.kind == ObservedEventKind::TabStructureChanged &&
                 payload.shell_cookie == 0 && payload.top_level != nullptr &&
                 payload.generation != 0 && payload.shell_tab != nullptr &&
+
                 (payload.structure_change_type ==
                      ObservedStructureChangeType::ChildAdded ||
                  payload.structure_change_type ==
@@ -2003,6 +1784,7 @@ Status RunObserverCoordinator(
                 result.operation = TransportOperationFailure(E_OUTOFMEMORY);
             } catch (...) {
                 result.operation = TransportOperationFailure(E_FAIL);
+
             }
             if (!applyProcessingResult(
                     std::move(result),
@@ -2253,6 +2035,7 @@ Status RunObserverCoordinator(
         shutdownReady = operations.wait.now();
         const Status shutdownStarted =
             shutdownDeadline.Start(shutdownReady, shutdownGraceMs);
+
         if (!shutdownStarted.ok()) {
             (void)recordOperation(OperationFailure(
                 ObserverFailureOrigin::Contract,
@@ -2503,6 +2286,7 @@ Status RunObserverCoordinator(
         gate = TransportOperationFailure(E_FAIL);
     }
     gate = recordOperation(gate);
+
     candidate.completion.gate_passed = gate.ok() && gatePassed;
     candidate.snapshot.runtime_status = candidate.failures.has_runtime_failure()
         ? candidate.failures.runtime_status()
@@ -2519,47 +2303,6 @@ Status RunObserverCoordinator(
         return ContractFailure();
     }
     return Success();
-}
-
-ObserverOperationResult FindRegisteredShellDispatch(
-    const LONG lifecycleCookie,
-    const ShellWindowResolverOperations& operations,
-    Microsoft::WRL::ComPtr<IDispatch>& output) {
-    if (!operations.find_window) {
-        return ContractOperationFailure(E_INVALIDARG, ERROR_INVALID_PARAMETER);
-    }
-
-    VARIANT location{};
-    VariantInit(&location);
-    location.vt = VT_I4;
-    location.lVal = lifecycleCookie;
-    VARIANT root{};
-    VariantInit(&root);
-    long legacyHwnd = 0;
-    IDispatch* rawDispatch = nullptr;
-    const HRESULT hresult = operations.find_window(
-        &location,
-        &root,
-        SWC_EXPLORER,
-        &legacyHwnd,
-        SWFO_COOKIEPASSED | SWFO_NEEDDISPATCH | SWFO_INCLUDEPENDING,
-        &rawDispatch);
-    Microsoft::WRL::ComPtr<IDispatch> dispatch;
-    dispatch.Attach(rawDispatch);
-    if (FAILED(hresult)) {
-        if (hresult == E_NOINTERFACE || hresult == E_PENDING) {
-            return ContractOperationFailure(hresult);
-        }
-        return TransportOperationFailure(hresult);
-    }
-    if (hresult != S_OK) {
-        return ContractOperationFailure(hresult);
-    }
-    if (dispatch == nullptr) {
-        return ContractOperationFailure();
-    }
-    output = std::move(dispatch);
-    return OperationSuccess();
 }
 
 ObserverOperationResult ClassifyObserverConnectionPointResult(
@@ -2753,6 +2496,7 @@ ObserverShellStaOperations CreateProductionObserverShellStaOperations() {
                             entry.top_level,
                             entry.shell_tab,
                         },
+
                         entry.canonical_identity,
                         std::move(browser),
                     });
@@ -3003,6 +2747,7 @@ Status StartObserverShellStaResources(
                 return ContractOperationFailure();
             }
             graph->browser_set = std::move(capture.browser_set);
+
             graph->captured_browsers = std::move(capture.browsers);
             *metadata = std::move(capturedMetadata);
         } catch (const std::bad_alloc&) {

@@ -27,6 +27,7 @@ enum class ObservedEventTransition {
     Remapped,
     Revoked,
     Mismatch,
+    Reconciled,
 };
 
 enum class ObservedStructureChangeType {
@@ -108,6 +109,12 @@ struct ObservedEventRecord final {
     bool current_filesystem_path_available;
     std::wstring current_filesystem_path;
     Status status;
+    std::size_t previous_tab_count;
+    std::size_t current_tab_count;
+    std::size_t added_tab_count;
+    std::size_t removed_tab_count;
+    std::size_t retained_tab_count;
+    HWND reconciled_active_shell_tab;
 };
 
 struct ObservedEventKindCounts final {

@@ -280,11 +280,49 @@ public:
         }
         if (envelope.payload.source == ObserverCallbackSource::ShellLifecycle) {
             runtime_stage_ = "lifecycle.reconciled";
+            const ObserverTabIdentity* representative = nullptr;
+            if (!currentReconciliation.tabs.added.empty()) {
+                representative = &currentReconciliation.tabs.added.front();
+            } else if (!currentReconciliation.tabs.removed.empty()) {
+                representative = &currentReconciliation.tabs.removed.front();
+            } else if (!currentReconciliation.tabs.current.empty()) {
+                representative = &currentReconciliation.tabs.current.front();
+            }
+            if (representative == nullptr) {
+                return {
+                    RuntimeSuccessOperation(),
+                    ObserverEventDisposition::Ignored,
+                    envelope.sequence,
+                    std::nullopt,
+                };
+            }
+            ObservedEventRecord record{
+                next_event_sequence_++,
+                representative->top_level_generation,
+                envelope.payload.kind,
+                ObservedEventTransition::Reconciled,
+                representative->top_level,
+                true,
+                representative->shell_tab,
+                false,
+                true,
+                envelope.payload.shell_cookie,
+                ObservedStructureChangeType::None,
+                nullptr,
+                nullptr,
+                0,
+                false,
+                {},
+                false,
+                {},
+                RuntimeSuccessStatus(),
+            };
+            AttachReconciliation(currentReconciliation.tabs, &record);
             return {
                 RuntimeSuccessOperation(),
-                ObserverEventDisposition::Ignored,
+                ObserverEventDisposition::Completed,
                 envelope.sequence,
-                std::nullopt,
+                std::move(record),
             };
         }
         if (envelope.payload.top_level == nullptr) {
@@ -480,6 +518,8 @@ public:
             return FailureResult(
                 envelope.sequence, RuntimeOperationFromStatus(completed));
         }
+        record.sequence = next_event_sequence_++;
+        AttachReconciliation(currentReconciliation.tabs, &record);
         runtime_stage_ = "event.complete";
         return {
             RuntimeSuccessOperation(),
@@ -553,6 +593,8 @@ public:
             return FailureResult(
                 rawSequence, RuntimeOperationFromStatus(completed));
         }
+        record.sequence = next_event_sequence_++;
+        AttachReconciliation(currentReconciliation.tabs, &record);
         runtime_stage_ = "response.complete";
         return {
             RuntimeSuccessOperation(),
@@ -595,6 +637,27 @@ public:
     }
 
 private:
+    static void AttachReconciliation(
+        const ObserverTabSetReconciliation& reconciliation,
+        ObservedEventRecord* const record) {
+        record->previous_tab_count =
+            reconciliation.retained.size() + reconciliation.removed.size();
+        record->current_tab_count = reconciliation.current.size();
+        record->added_tab_count = reconciliation.added.size();
+        record->removed_tab_count = reconciliation.removed.size();
+        record->retained_tab_count = reconciliation.retained.size();
+        const auto active = reconciliation.active_shell_tabs.find(
+            record->source_top_level);
+        if (active != reconciliation.active_shell_tabs.end()) {
+            record->reconciled_active_shell_tab = active->second;
+        } else if (!reconciliation.active_shell_tabs.empty()) {
+            record->reconciled_active_shell_tab =
+                reconciliation.active_shell_tabs.begin()->second;
+        } else {
+            record->reconciled_active_shell_tab = nullptr;
+        }
+    }
+
     ObserverStartupOutcome FailAfterShellStartup(
         const ObserverOperationResult& failure) {
         static_cast<void>(queue_->BeginStopping());
@@ -1025,6 +1088,7 @@ private:
     std::vector<ObserverUiaTarget> uia_targets_;
     std::optional<std::uint64_t> pending_command_id_;
     std::uint64_t pending_raw_sequence_ = 0;
+    std::uint64_t next_event_sequence_ = 1;
     HWND pending_top_level_ = nullptr;
     bool cleanup_complete_ = false;
     const char* runtime_stage_ = "created";
@@ -1044,7 +1108,10 @@ ObserverOperationResult EvaluateEventObservationGate(
         return RuntimeContractFailure();
     }
     ObservedEventKindCounts counts{};
-    bool terminalRevoke = false;
+    bool hasTabAddition = false;
+    bool hasTabRemoval = false;
+    bool hasSelectionRemap = false;
+    bool hasLifecycleRemoval = false;
     bool navigatePathTransition = false;
     bool cleanEvents = true;
     std::set<std::tuple<std::uintptr_t, std::uint64_t, LONG>> pending;
@@ -1095,12 +1162,36 @@ ObserverOperationResult EvaluateEventObservationGate(
             case ObservedEventTransition::Mismatch:
                 transitionShapeValid = false;
                 break;
+            case ObservedEventTransition::Reconciled:
+                transitionShapeValid =
+                    (event.kind == ObservedEventKind::WindowRegistered ||
+                     event.kind == ObservedEventKind::WindowRevoked) &&
+                    event.current_active_view == nullptr &&
+                    event.active_view_count == 0 &&
+                    !event.current_filesystem_path_available;
+                break;
         }
         cleanEvents = cleanEvents && event.status.ok() &&
             transitionShapeValid;
-        terminalRevoke = terminalRevoke ||
+        const bool reconciliationCountsValid =
+            event.removed_tab_count <= event.previous_tab_count &&
+            event.added_tab_count <= event.current_tab_count &&
+            event.retained_tab_count ==
+                event.previous_tab_count - event.removed_tab_count &&
+            event.retained_tab_count ==
+                event.current_tab_count - event.added_tab_count &&
+            ((event.current_tab_count == 0) ==
+             (event.reconciled_active_shell_tab == nullptr));
+        cleanEvents = cleanEvents && reconciliationCountsValid;
+        hasTabAddition = hasTabAddition || event.added_tab_count > 0;
+        hasTabRemoval = hasTabRemoval || event.removed_tab_count > 0;
+        hasSelectionRemap = hasSelectionRemap ||
+            (event.kind == ObservedEventKind::TabSelected &&
+             event.transition == ObservedEventTransition::Remapped &&
+             event.active_view_count == 1);
+        hasLifecycleRemoval = hasLifecycleRemoval ||
             (event.kind == ObservedEventKind::WindowRevoked &&
-             event.transition == ObservedEventTransition::Revoked);
+             event.removed_tab_count > 0);
         navigatePathTransition = navigatePathTransition ||
             (event.kind == ObservedEventKind::NavigateComplete2 &&
              event.transition == ObservedEventTransition::Remapped &&
@@ -1139,8 +1230,9 @@ ObserverOperationResult EvaluateEventObservationGate(
         return RuntimeContractFailure();
     }
     *output = snapshot.runtime_status.ok() && snapshot.cleanup_status.ok() &&
-        cleanEvents && pending.empty() && terminalRevoke &&
-        navigatePathTransition && counts.window_registered > 0 &&
+        cleanEvents && pending.empty() && hasTabAddition && hasTabRemoval &&
+        hasSelectionRemap && hasLifecycleRemoval && navigatePathTransition &&
+        counts.window_registered > 0 &&
         counts.window_revoked > 0 && counts.navigate_complete2 > 0 &&
         counts.tab_selected > 0 && counts.tab_structure_changed > 0;
     return RuntimeSuccessOperation();

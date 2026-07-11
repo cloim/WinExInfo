@@ -49,6 +49,22 @@ Status NextGeneration(
 
 }  // namespace
 
+Status ValidateObserverShellEntrySet(
+    const std::span<const ObserverShellEntryMetadata> entries) noexcept {
+    std::set<std::uintptr_t> canonicalIdentities;
+    std::set<HWND> targetTabs;
+    for (const ObserverShellEntryMetadata& entry : entries) {
+        if (entry.canonical_identity == 0 || entry.top_level == nullptr ||
+            entry.target_matched != (entry.shell_tab != nullptr) ||
+            !canonicalIdentities.insert(entry.canonical_identity).second ||
+            (entry.target_matched &&
+             !targetTabs.insert(entry.shell_tab).second)) {
+            return ContractFailure();
+        }
+    }
+    return Success();
+}
+
 Status ReconcileObserverTabSet(
     const std::span<const ObserverTabIdentity> previous,
     const std::span<const ObserverShellEntryMetadata> currentShellEntries,
@@ -96,15 +112,15 @@ Status ReconcileObserverTabSet(
         }
     }
 
-    std::set<std::uintptr_t> currentCanonical;
+    const Status currentShape =
+        ValidateObserverShellEntrySet(currentShellEntries);
+    if (!currentShape.ok()) {
+        return currentShape;
+    }
     std::set<HWND> currentTargetTabs;
     for (const ObserverShellEntryMetadata& entry : currentShellEntries) {
-        if (entry.canonical_identity == 0 || entry.top_level == nullptr ||
-            entry.target_matched != (entry.shell_tab != nullptr) ||
-            !currentCanonical.insert(entry.canonical_identity).second ||
-            (entry.target_matched &&
-             !currentTargetTabs.insert(entry.shell_tab).second)) {
-            return ContractFailure();
+        if (entry.target_matched) {
+            currentTargetTabs.insert(entry.shell_tab);
         }
     }
 

@@ -129,7 +129,7 @@ void RequireDropped(const winexinfo::Status& status, const bool accepted) {
 }
 
 winexinfo::EventObservationSnapshot ExactObservation() {
-    const winexinfo::ObservedEventRecord event{
+    winexinfo::ObservedEventRecord event{
         1,
         7,
         winexinfo::ObservedEventKind::NavigateComplete2,
@@ -150,6 +150,12 @@ winexinfo::EventObservationSnapshot ExactObservation() {
         L"C:\\work\\child",
         {winexinfo::ErrorCode::OK, S_OK, 0},
     };
+    event.previous_tab_count = 2;
+    event.current_tab_count = 2;
+    event.added_tab_count = 0;
+    event.removed_tab_count = 0;
+    event.retained_tab_count = 2;
+    event.reconciled_active_shell_tab = Handle(0xDEF);
     return {
         45000,
         1,
@@ -173,13 +179,18 @@ winexinfo::EventObservationSnapshot PassingObservation() {
     auto& registered = snapshot.events[0];
     registered.sequence = 1;
     registered.kind = winexinfo::ObservedEventKind::WindowRegistered;
-    registered.transition = winexinfo::ObservedEventTransition::Pending;
+    registered.transition = winexinfo::ObservedEventTransition::Reconciled;
     registered.shell_cookie_present = true;
     registered.shell_cookie = 41;
     registered.current_active_view = nullptr;
     registered.active_view_count = 0;
     registered.current_filesystem_path_available = false;
     registered.current_filesystem_path.clear();
+    registered.previous_tab_count = 2;
+    registered.current_tab_count = 3;
+    registered.added_tab_count = 1;
+    registered.removed_tab_count = 0;
+    registered.retained_tab_count = 2;
 
     auto& structure = snapshot.events[1];
     structure.sequence = 2;
@@ -189,6 +200,9 @@ winexinfo::EventObservationSnapshot PassingObservation() {
     structure.shell_cookie = 0;
     structure.structure_change_type =
         winexinfo::ObservedStructureChangeType::ChildAdded;
+    structure.previous_tab_count = 3;
+    structure.current_tab_count = 3;
+    structure.retained_tab_count = 3;
 
     auto& navigate = snapshot.events[2];
     navigate.sequence = 3;
@@ -196,6 +210,9 @@ winexinfo::EventObservationSnapshot PassingObservation() {
     navigate.transition = winexinfo::ObservedEventTransition::Remapped;
     navigate.shell_cookie_present = false;
     navigate.shell_cookie = 0;
+    navigate.previous_tab_count = 3;
+    navigate.current_tab_count = 3;
+    navigate.retained_tab_count = 3;
 
     auto& selected = snapshot.events[3];
     selected.sequence = 4;
@@ -206,17 +223,25 @@ winexinfo::EventObservationSnapshot PassingObservation() {
     selected.source_was_active = false;
     selected.shell_cookie_present = false;
     selected.shell_cookie = 0;
+    selected.previous_tab_count = 3;
+    selected.current_tab_count = 3;
+    selected.retained_tab_count = 3;
 
     auto& revoked = snapshot.events[4];
     revoked.sequence = 5;
     revoked.kind = winexinfo::ObservedEventKind::WindowRevoked;
-    revoked.transition = winexinfo::ObservedEventTransition::Revoked;
+    revoked.transition = winexinfo::ObservedEventTransition::Reconciled;
     revoked.shell_cookie_present = true;
     revoked.shell_cookie = 41;
     revoked.current_active_view = nullptr;
     revoked.active_view_count = 0;
     revoked.current_filesystem_path_available = false;
     revoked.current_filesystem_path.clear();
+    revoked.previous_tab_count = 3;
+    revoked.current_tab_count = 2;
+    revoked.added_tab_count = 0;
+    revoked.removed_tab_count = 1;
+    revoked.retained_tab_count = 2;
     return snapshot;
 }
 
@@ -1481,9 +1506,13 @@ WXI_TEST(event_filter_report_serializes_exact_schema, "event_filter.report_schem
         "event.00000000000000000001.source_shell_tab_present=true\n",
         "event.00000000000000000001.source_shell_tab_hwnd=0x0000000000000DEF\n",
         "event.00000000000000000001.source_was_active=true\n",
-        "event.00000000000000000001.shell_window_cookie_present=false\n",
-        "event.00000000000000000001.shell_window_cookie=0\n",
         "event.00000000000000000001.structure_change_type=none\n",
+        "event.00000000000000000001.reconcile.previous_tab_count=2\n",
+        "event.00000000000000000001.reconcile.current_tab_count=2\n",
+        "event.00000000000000000001.reconcile.added_tab_count=0\n",
+        "event.00000000000000000001.reconcile.removed_tab_count=0\n",
+        "event.00000000000000000001.reconcile.retained_tab_count=2\n",
+        "event.00000000000000000001.reconcile.active_shell_tab=0x0000000000000DEF\n",
         "event.00000000000000000001.previous_active_view_hwnd=0x000000000000ABCD\n",
         "event.00000000000000000001.current_active_view_hwnd=0x000000000000CDEF\n",
         "event.00000000000000000001.active_view_count=1\n",
@@ -1592,6 +1621,13 @@ WXI_TEST(event_filter_report_accepts_complete_gate_pass, "event_filter.report_co
     WXI_REQUIRE(winexinfo::WriteProbeReport(report, &output).ok());
     WXI_REQUIRE(output.find("result=pass\n") != std::string::npos);
     WXI_REQUIRE(output.ends_with("error_code=OK\n"));
+    WXI_REQUIRE(output.find(
+                    "event.00000000000000000001.lifecycle.cookie=41\n") !=
+                std::string::npos);
+    WXI_REQUIRE(output.find(
+                    "event.00000000000000000005.lifecycle.cookie=41\n") !=
+                std::string::npos);
+    WXI_REQUIRE(output.find("shell_window_cookie") == std::string::npos);
     std::size_t previous = 0;
     for (std::uint64_t sequence = 1; sequence <= 5; ++sequence) {
         std::ostringstream prefix;
@@ -1603,21 +1639,19 @@ WXI_TEST(event_filter_report_accepts_complete_gate_pass, "event_filter.report_co
     }
 }
 
-WXI_TEST(event_filter_report_rejects_unresolved_pending_and_missing_terminal_revoke, "event_filter.report_temporal_pass_invariants") {
+WXI_TEST(event_filter_report_rejects_invalid_reconciliation_and_missing_lifecycle_removal, "event_filter.report_temporal_pass_invariants") {
     winexinfo::ProbeReport report{
         winexinfo::ProbeMode::Observe, true, {}, winexinfo::ErrorCode::OK};
     winexinfo::EventObservationSnapshot unresolved = PassingObservation();
-    unresolved.events[0].source_top_level = Handle(0xAAAA);
-    unresolved.events[0].generation = 8;
+    unresolved.events[0].retained_tab_count = 1;
     RequireMismatch(winexinfo::AppendEventObservationReportFields(unresolved, &report));
 
     winexinfo::EventObservationSnapshot noTerminal = PassingObservation();
     auto& revoked = noTerminal.events[4];
-    revoked.transition = winexinfo::ObservedEventTransition::Remapped;
-    revoked.current_active_view = Handle(0xCDEF);
-    revoked.active_view_count = 1;
-    revoked.current_filesystem_path_available = true;
-    revoked.current_filesystem_path = L"C:\\work\\child";
+    revoked.previous_tab_count = 2;
+    revoked.current_tab_count = 2;
+    revoked.removed_tab_count = 0;
+    revoked.retained_tab_count = 2;
     RequireMismatch(winexinfo::AppendEventObservationReportFields(noTerminal, &report));
 }
 

@@ -172,52 +172,6 @@ struct ObserverOperationResult;
     const ObserverWaitOperations& operations,
     ObserverWaitResult* output) noexcept;
 
-struct ShellWindowResolverOperations final {
-    std::function<HRESULT(
-        VARIANT*,
-        VARIANT*,
-        int,
-        long*,
-        int,
-        IDispatch**)> find_window;
-};
-
-enum class ObserverShellTransitionKind {
-    Stable,
-    Registered,
-    Revoked,
-};
-
-struct ObserverShellSetTransition final {
-    std::optional<ObserverShellEntryMetadata> added;
-    std::optional<ObserverShellEntryMetadata> removed;
-
-    bool operator==(const ObserverShellSetTransition&) const = default;
-};
-
-struct ObserverShellLifecycleCorrelation final {
-    bool target_matched;
-    bool new_top_level;
-    ObserverShellEntryMetadata entry;
-    std::uint64_t generation;
-    std::size_t top_level_entry_count;
-};
-
-[[nodiscard]] Status ClassifyObserverShellSetTransition(
-    ObserverShellTransitionKind kind,
-    std::span<const ObserverShellEntryMetadata> previous,
-    std::span<const ObserverShellEntryMetadata> current,
-    std::uintptr_t resolvedAddedIdentity,
-    ObserverShellSetTransition* output);
-[[nodiscard]] Status CorrelateObserverShellLifecycle(
-    ObservedEventKind kind,
-    std::span<const ObserverShellEntryMetadata> previous,
-    std::span<const ObserverShellEntryMetadata> current,
-    std::uintptr_t resolvedAddedIdentity,
-    const std::map<HWND, std::uint64_t>& activeGenerations,
-    const std::map<HWND, std::uint64_t>& latestGenerations,
-    ObserverShellLifecycleCorrelation* output);
-
 struct ObserverOperationResult final {
     Status status;
     std::optional<ObserverFailureOrigin> failure_origin;
@@ -404,11 +358,6 @@ struct ObserverRuntimeOutcome;
     HWND topLevel,
     std::uint64_t generation,
     HWND shellTab,
-    Microsoft::WRL::ComPtr<IDispatch>& output);
-
-[[nodiscard]] ObserverOperationResult FindRegisteredShellDispatch(
-    LONG lifecycleCookie,
-    const ShellWindowResolverOperations& operations,
     Microsoft::WRL::ComPtr<IDispatch>& output);
 
 [[nodiscard]] ObserverOperationResult ClassifyObserverConnectionPointResult(

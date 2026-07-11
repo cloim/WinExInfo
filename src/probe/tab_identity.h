@@ -62,6 +62,9 @@ struct ObserverTabSetReconciliation final {
     bool operator==(const ObserverTabSetReconciliation&) const = default;
 };
 
+[[nodiscard]] Status ValidateObserverShellEntrySet(
+    std::span<const ObserverShellEntryMetadata> entries) noexcept;
+
 [[nodiscard]] Status ReconcileObserverTabSet(
     std::span<const ObserverTabIdentity> previous,
     std::span<const ObserverShellEntryMetadata> currentShellEntries,
