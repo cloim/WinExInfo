@@ -20,6 +20,8 @@ enable_testing()
 add_executable(WinExInfoTests
   src/common/utf8.cpp
   src/host/command_line.cpp
+  src/injection/hook_platform.cpp
+  src/injection/thread_hook_injector.cpp
   src/ipc/named_pipe.cpp
   src/ipc/protocol.cpp
   src/probe/event_observer.cpp
@@ -40,6 +42,7 @@ add_executable(WinExInfoTests
   tests/contracts_tests.cpp
   tests/event_filter_tests.cpp
   tests/host_manifest_tests.cpp
+  tests/hook_injector_tests.cpp
   tests/ipc_protocol_tests.cpp
   tests/observer_runtime_tests.cpp
   tests/observer_runtime_contract_tests.cpp
@@ -95,6 +98,8 @@ add_executable(WinExInfoHost
   src/host/command_line.cpp
   src/host/main.cpp
   src/host/WinExInfoHost.manifest
+  src/injection/hook_platform.cpp
+  src/injection/thread_hook_injector.cpp
   src/ipc/named_pipe.cpp
   src/ipc/protocol.cpp
   src/probe/event_observer.cpp
