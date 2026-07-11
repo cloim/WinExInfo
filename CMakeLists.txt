@@ -20,6 +20,8 @@ enable_testing()
 add_executable(WinExInfoTests
   src/common/utf8.cpp
   src/host/command_line.cpp
+  src/ipc/named_pipe.cpp
+  src/ipc/protocol.cpp
   src/probe/event_observer.cpp
   src/probe/observer_runtime.cpp
   src/probe/observer_runtime_contract.cpp
@@ -38,6 +40,7 @@ add_executable(WinExInfoTests
   tests/contracts_tests.cpp
   tests/event_filter_tests.cpp
   tests/host_manifest_tests.cpp
+  tests/ipc_protocol_tests.cpp
   tests/observer_runtime_tests.cpp
   tests/observer_runtime_contract_tests.cpp
   tests/observer_shell_reconcile_tests.cpp
@@ -72,6 +75,7 @@ target_compile_options(WinExInfoTests PRIVATE
 target_link_options(WinExInfoTests PRIVATE /guard:cf)
 
 target_link_libraries(WinExInfoTests PRIVATE
+  advapi32
   crypt32
   ole32
   shell32
@@ -91,6 +95,8 @@ add_executable(WinExInfoHost
   src/host/command_line.cpp
   src/host/main.cpp
   src/host/WinExInfoHost.manifest
+  src/ipc/named_pipe.cpp
+  src/ipc/protocol.cpp
   src/probe/event_observer.cpp
   src/probe/observer_runtime.cpp
   src/probe/observer_runtime_contract.cpp
@@ -127,6 +133,7 @@ target_compile_options(WinExInfoHost PRIVATE
 target_link_options(WinExInfoHost PRIVATE /guard:cf)
 
 target_link_libraries(WinExInfoHost PRIVATE
+  advapi32
   crypt32
   ole32
   shell32
