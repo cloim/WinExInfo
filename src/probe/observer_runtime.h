@@ -246,6 +246,38 @@ struct ObserverShellCleanupOutcome final {
     bool any_transport_failure;
 };
 
+struct ObserverShellTabSubscription final {
+    ObserverTabIdentity identity;
+    std::uint64_t registration_id;
+
+    bool operator==(const ObserverShellTabSubscription&) const = default;
+};
+
+struct ObserverShellSubscriptionState final {
+    std::vector<ObserverShellTabSubscription> subscriptions;
+    std::uint64_t next_registration_id = 1;
+
+    bool operator==(const ObserverShellSubscriptionState&) const = default;
+};
+
+struct ObserverShellReconcileOperations final {
+    std::function<ObserverOperationResult(
+        const ObserverTabIdentity&,
+        std::uint64_t)> subscribe;
+    std::function<ObserverOperationResult(std::uint64_t)> unsubscribe;
+};
+
+struct ObserverShellReconcileOutcome final {
+    ObserverOperationResult operation;
+    ObserverShellCleanupOutcome rollback;
+};
+
+[[nodiscard]] Status ReconcileObserverShellSubscriptions(
+    std::span<const ObserverTabIdentity> desired,
+    const ObserverShellReconcileOperations& operations,
+    ObserverShellSubscriptionState* state,
+    ObserverShellReconcileOutcome* output) noexcept;
+
 struct ObserverShellStartupOutcome final {
     ObserverOperationResult setup;
     bool any_setup_transport_failure;

@@ -9,6 +9,7 @@
 #include <atomic>
 #include <limits>
 #include <new>
+#include <type_traits>
 #include <utility>
 
 namespace winexinfo {
@@ -502,6 +503,258 @@ Status CorrelateObserverShellLifecycle(
     }
     *output = candidate;
     return Success();
+}
+
+Status ReconcileObserverShellSubscriptions(
+    const std::span<const ObserverTabIdentity> desired,
+    const ObserverShellReconcileOperations& operations,
+    ObserverShellSubscriptionState* const state,
+    ObserverShellReconcileOutcome* const output) noexcept {
+    if (state == nullptr || output == nullptr || !operations.subscribe ||
+        !operations.unsubscribe || state->next_registration_id == 0) {
+        return ContractFailure(E_INVALIDARG, ERROR_INVALID_PARAMETER);
+    }
+
+    const auto validIdentity = [](const ObserverTabIdentity& identity) {
+        return identity.canonical_identity != 0 &&
+            identity.top_level != nullptr && identity.shell_tab != nullptr &&
+            identity.top_level_generation != 0 && identity.tab_generation != 0;
+    };
+    const auto sameIdentity = [](const ObserverTabIdentity& left,
+                                 const ObserverTabIdentity& right) {
+        return left.canonical_identity == right.canonical_identity &&
+            left.top_level == right.top_level &&
+            left.shell_tab == right.shell_tab &&
+            left.top_level_generation == right.top_level_generation &&
+            left.tab_generation == right.tab_generation;
+    };
+    const auto containsIdentity = [&](const auto& entries,
+                                      const ObserverTabIdentity& identity) {
+        return std::find_if(
+                   entries.begin(),
+                   entries.end(),
+                   [&](const auto& entry) {
+                       if constexpr (std::is_same_v<
+                                         std::remove_cvref_t<decltype(entry)>,
+                                         ObserverShellTabSubscription>) {
+                           return sameIdentity(entry.identity, identity);
+                       } else {
+                           return sameIdentity(entry, identity);
+                       }
+                   }) != entries.end();
+    };
+
+    for (std::size_t index = 0; index < desired.size(); ++index) {
+        if (!validIdentity(desired[index])) {
+            return ContractFailure();
+        }
+        for (std::size_t prior = 0; prior < index; ++prior) {
+            if (desired[prior].canonical_identity ==
+                    desired[index].canonical_identity ||
+                desired[prior].shell_tab == desired[index].shell_tab) {
+                return ContractFailure();
+            }
+        }
+    }
+    for (std::size_t index = 0; index < state->subscriptions.size(); ++index) {
+        const ObserverShellTabSubscription& subscription =
+            state->subscriptions[index];
+        if (!validIdentity(subscription.identity) ||
+            subscription.registration_id == 0 ||
+            subscription.registration_id >= state->next_registration_id) {
+            return ContractFailure();
+        }
+        for (std::size_t prior = 0; prior < index; ++prior) {
+            const ObserverShellTabSubscription& existing =
+                state->subscriptions[prior];
+            if (existing.registration_id == subscription.registration_id ||
+                existing.identity.canonical_identity ==
+                    subscription.identity.canonical_identity ||
+                existing.identity.shell_tab == subscription.identity.shell_tab) {
+                return ContractFailure();
+            }
+        }
+    }
+
+    ObserverShellReconcileOutcome candidate{
+        OperationSuccess(),
+        {Success(), std::nullopt, false},
+    };
+    std::vector<ObserverShellTabSubscription> live;
+    std::vector<ObserverShellTabSubscription> additions;
+    std::vector<ObserverShellTabSubscription> removals;
+    std::vector<ObserverShellTabSubscription> completedAdditions;
+    std::vector<ObserverShellTabSubscription> completedRemovals;
+    std::vector<ObserverShellTabSubscription> originalSubscriptions;
+    std::uint64_t nextRegistrationId = state->next_registration_id;
+    try {
+        originalSubscriptions = state->subscriptions;
+        live = state->subscriptions;
+        live.reserve(state->subscriptions.size() + desired.size());
+        additions.reserve(desired.size());
+        removals.reserve(state->subscriptions.size());
+        completedAdditions.reserve(desired.size());
+        completedRemovals.reserve(state->subscriptions.size());
+        for (const ObserverTabIdentity& identity : desired) {
+            if (!containsIdentity(state->subscriptions, identity)) {
+                if (nextRegistrationId ==
+                    std::numeric_limits<std::uint64_t>::max()) {
+                    return ContractFailure();
+                }
+                additions.push_back({identity, nextRegistrationId++});
+            }
+        }
+        for (const ObserverShellTabSubscription& subscription :
+             state->subscriptions) {
+            if (!containsIdentity(desired, subscription.identity)) {
+                removals.push_back(subscription);
+            }
+        }
+    } catch (const std::bad_alloc&) {
+        return TransportFailure(E_OUTOFMEMORY);
+    }
+
+    const auto invoke = [](const std::function<ObserverOperationResult()>& call) {
+        try {
+            ObserverOperationResult result = call();
+            return IsCoherentOperationResult(result)
+                ? result
+                : ContractOperationFailure();
+        } catch (const std::bad_alloc&) {
+            return TransportOperationFailure(E_OUTOFMEMORY);
+        } catch (...) {
+            return TransportOperationFailure(E_FAIL);
+        }
+    };
+    const auto eraseById = [](std::vector<ObserverShellTabSubscription>* entries,
+                              const std::uint64_t id) {
+        const auto found = std::find_if(
+            entries->begin(),
+            entries->end(),
+            [id](const ObserverShellTabSubscription& entry) {
+                return entry.registration_id == id;
+            });
+        if (found != entries->end()) {
+            entries->erase(found);
+        }
+    };
+    const auto recordRollback = [&](const ObserverOperationResult& result) {
+        if (result.ok()) {
+            return;
+        }
+        if (candidate.rollback.status.ok()) {
+            candidate.rollback.status = result.status;
+            candidate.rollback.failure_origin = result.failure_origin;
+        }
+        if (result.failure_origin == ObserverFailureOrigin::Transport) {
+            candidate.rollback.any_transport_failure = true;
+        }
+    };
+    const auto rollback = [&]() {
+        for (auto removed = completedRemovals.rbegin();
+             removed != completedRemovals.rend();
+             ++removed) {
+            const ObserverOperationResult restored = invoke([&]() {
+                return operations.subscribe(
+                    removed->identity, removed->registration_id);
+            });
+            if (restored.ok()) {
+                try {
+                    live.push_back(*removed);
+                } catch (const std::bad_alloc&) {
+                    recordRollback(TransportOperationFailure(E_OUTOFMEMORY));
+                }
+            } else {
+                recordRollback(restored);
+            }
+        }
+        for (auto added = completedAdditions.rbegin();
+             added != completedAdditions.rend();
+             ++added) {
+            const ObserverOperationResult removed = invoke([&]() {
+                return operations.unsubscribe(added->registration_id);
+            });
+            if (removed.ok()) {
+                eraseById(&live, added->registration_id);
+            } else {
+                recordRollback(removed);
+            }
+        }
+        state->next_registration_id = nextRegistrationId;
+        if (candidate.rollback.status.ok()) {
+            state->subscriptions = std::move(originalSubscriptions);
+        } else {
+            state->subscriptions = std::move(live);
+        }
+    };
+
+    for (const ObserverShellTabSubscription& addition : additions) {
+        const ObserverOperationResult subscribed = invoke([&]() {
+            return operations.subscribe(addition.identity, addition.registration_id);
+        });
+        if (!subscribed.ok()) {
+            candidate.operation = subscribed;
+            rollback();
+            *output = candidate;
+            return candidate.operation.status;
+        }
+        try {
+            live.push_back(addition);
+            completedAdditions.push_back(addition);
+        } catch (const std::bad_alloc&) {
+            candidate.operation = TransportOperationFailure(E_OUTOFMEMORY);
+            rollback();
+            *output = candidate;
+            return candidate.operation.status;
+        }
+    }
+
+    for (const ObserverShellTabSubscription& removal : removals) {
+        const ObserverOperationResult unsubscribed = invoke([&]() {
+            return operations.unsubscribe(removal.registration_id);
+        });
+        if (!unsubscribed.ok()) {
+            candidate.operation = unsubscribed;
+            rollback();
+            *output = candidate;
+            return candidate.operation.status;
+        }
+        eraseById(&live, removal.registration_id);
+        try {
+            completedRemovals.push_back(removal);
+        } catch (const std::bad_alloc&) {
+            candidate.operation = TransportOperationFailure(E_OUTOFMEMORY);
+            rollback();
+            *output = candidate;
+            return candidate.operation.status;
+        }
+    }
+
+    try {
+        std::vector<ObserverShellTabSubscription> committed;
+        committed.reserve(desired.size());
+        for (const ObserverTabIdentity& identity : desired) {
+            const auto found = std::find_if(
+                live.begin(),
+                live.end(),
+                [&](const ObserverShellTabSubscription& subscription) {
+                    return sameIdentity(subscription.identity, identity);
+                });
+            if (found == live.end()) {
+                return ContractFailure();
+            }
+            committed.push_back(*found);
+        }
+        state->subscriptions = std::move(committed);
+        state->next_registration_id = nextRegistrationId;
+    } catch (const std::bad_alloc&) {
+        candidate.operation = TransportOperationFailure(E_OUTOFMEMORY);
+        rollback();
+        *output = candidate;
+        return candidate.operation.status;
+    }
+    *output = candidate;
+    return candidate.operation.status;
 }
 
 ObserverOperationResult CreateShellLifecycleEventSink(
