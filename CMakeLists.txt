@@ -20,6 +20,10 @@ enable_testing()
 add_executable(WinExInfoTests
   src/common/utf8.cpp
   src/host/command_line.cpp
+  src/hook/dll_main.cpp
+  src/hook/hook_entry.cpp
+  src/hook/runtime.cpp
+  src/hook/status_pane.cpp
   src/injection/hook_platform.cpp
   src/injection/thread_hook_injector.cpp
   src/ipc/named_pipe.cpp
@@ -43,6 +47,10 @@ add_executable(WinExInfoTests
   tests/event_filter_tests.cpp
   tests/host_manifest_tests.cpp
   tests/hook_injector_tests.cpp
+  tests/hook_controller_mode.cpp
+  tests/hook_runtime_tests.cpp
+  tests/hook_target_mode.cpp
+  tests/hook_test_modes.cpp
   tests/ipc_protocol_tests.cpp
   tests/observer_runtime_tests.cpp
   tests/observer_runtime_contract_tests.cpp
@@ -79,6 +87,7 @@ target_link_options(WinExInfoTests PRIVATE /guard:cf)
 
 target_link_libraries(WinExInfoTests PRIVATE
   advapi32
+  comctl32
   crypt32
   ole32
   shell32
@@ -92,6 +101,50 @@ set_target_properties(WinExInfoTests PROPERTIES
 )
 
 add_test(NAME WinExInfo.Unit COMMAND WinExInfoTests --unit)
+
+add_library(WinExInfoHook SHARED
+  src/common/utf8.cpp
+  src/hook/dll_main.cpp
+  src/hook/hook_entry.cpp
+  src/hook/hook_export.cpp
+  src/hook/runtime.cpp
+  src/hook/status_pane.cpp
+  src/injection/thread_hook_injector.cpp
+  src/ipc/named_pipe.cpp
+  src/ipc/protocol.cpp
+  src/hook/WinExInfoHook.def
+)
+
+target_include_directories(WinExInfoHook PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/src"
+)
+
+target_compile_definitions(WinExInfoHook PRIVATE
+  NOMINMAX
+  UNICODE
+  WIN32_LEAN_AND_MEAN
+  _UNICODE
+)
+
+target_compile_options(WinExInfoHook PRIVATE
+  /W4
+  /WX
+  /permissive-
+  /utf-8
+  /guard:cf
+)
+
+target_link_options(WinExInfoHook PRIVATE /guard:cf)
+
+target_link_libraries(WinExInfoHook PRIVATE
+  advapi32
+  comctl32
+)
+
+set_target_properties(WinExInfoHook PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+  LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
 
 add_executable(WinExInfoHost
   src/common/utf8.cpp
@@ -151,4 +204,4 @@ set_target_properties(WinExInfoHost PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
-add_dependencies(WinExInfoTests WinExInfoHost)
+add_dependencies(WinExInfoTests WinExInfoHost WinExInfoHook)
