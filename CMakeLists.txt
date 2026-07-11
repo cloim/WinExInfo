@@ -27,6 +27,7 @@ add_executable(WinExInfoTests
   src/probe/probe_runner.cpp
   src/probe/report_writer.cpp
   src/probe/shell_probe.cpp
+  src/probe/tab_identity.cpp
   src/probe/target_validator.cpp
   src/probe/uia_probe.cpp
   src/probe/uia_observer_worker.cpp
@@ -40,6 +41,7 @@ add_executable(WinExInfoTests
   tests/observer_runtime_tests.cpp
   tests/observer_runtime_contract_tests.cpp
   tests/target_validation_tests.cpp
+  tests/tab_identity_tests.cpp
   tests/test_framework.cpp
   tests/test_main.cpp
   tests/uia_contract_tests.cpp
@@ -95,6 +97,7 @@ add_executable(WinExInfoHost
   src/probe/probe_runner.cpp
   src/probe/report_writer.cpp
   src/probe/shell_probe.cpp
+  src/probe/tab_identity.cpp
   src/probe/target_validator.cpp
   src/probe/uia_probe.cpp
   src/probe/uia_observer_worker.cpp

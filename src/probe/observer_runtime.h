@@ -5,6 +5,7 @@
 #include "probe/observer_runtime_contract.h"
 #include "probe/probe_types.h"
 #include "probe/shell_probe.h"
+#include "probe/tab_identity.h"
 #include "probe/win32_probe.h"
 
 #include <Windows.h>
@@ -179,15 +180,6 @@ struct ShellWindowResolverOperations final {
         long*,
         int,
         IDispatch**)> find_window;
-};
-
-struct ObserverShellEntryMetadata final {
-    std::uintptr_t canonical_identity;
-    bool target_matched;
-    HWND top_level;
-    HWND shell_tab;
-
-    bool operator==(const ObserverShellEntryMetadata&) const = default;
 };
 
 enum class ObserverShellTransitionKind {
