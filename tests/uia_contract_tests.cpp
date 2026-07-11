@@ -239,9 +239,14 @@ WXI_TEST(uia_contract_shell_tab_cardinality, "uia_contract.shell_tab_cardinality
     multipleVisible.nodes.push_back(
         {Handle(7), Handle(6), L"DUIViewWndClassName", true, RECT{0, 0, 1, 1}});
     multipleVisible.top_level_child_z_order = {Handle(6), Handle(2), Handle(5)};
+    const winexinfo::Win32ContractResult selected =
+        winexinfo::ValidateWin32Contract(multipleVisible);
+    WXI_REQUIRE(selected.status.ok());
+    WXI_REQUIRE_EQ(selected.active_shell_tab, Handle(6));
+    WXI_REQUIRE_EQ(selected.active_view, Handle(7));
     WXI_REQUIRE_EQ(
-        winexinfo::ValidateWin32Contract(multipleVisible).status.code,
-        winexinfo::ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH);
+        selected.ordered_shell_tabs,
+        (std::vector<HWND>{Handle(6), Handle(2)}));
 }
 
 WXI_TEST(uia_contract_diview_counts_hidden_duplicates, "uia_contract.diview_counts_hidden_duplicates") {

@@ -757,6 +757,77 @@ Status ReconcileObserverShellSubscriptions(
     return candidate.operation.status;
 }
 
+Status ReconcileObserverCurrentTabState(
+    const ObservedEventKind wakeKind,
+    const LONG lifecycleCookie,
+    const ObserverCurrentReconcileOperations& operations,
+    ObserverCurrentTabState* const state,
+    ObserverCurrentReconcileOutcome* const output) noexcept {
+    static_cast<void>(lifecycleCookie);
+    const bool validWakeKind =
+        wakeKind == ObservedEventKind::WindowRegistered ||
+        wakeKind == ObservedEventKind::WindowRevoked ||
+        wakeKind == ObservedEventKind::NavigateComplete2 ||
+        wakeKind == ObservedEventKind::TabSelected ||
+        wakeKind == ObservedEventKind::TabStructureChanged;
+    if (!validWakeKind || state == nullptr || output == nullptr ||
+        !operations.capture || !operations.subscriptions.subscribe ||
+        !operations.subscriptions.unsubscribe) {
+        return ContractFailure(E_INVALIDARG, ERROR_INVALID_PARAMETER);
+    }
+
+    ObserverCurrentTabCapture capture{};
+    ObserverOperationResult captured{};
+    try {
+        captured = operations.capture(&capture);
+    } catch (const std::bad_alloc&) {
+        captured = TransportOperationFailure(E_OUTOFMEMORY);
+    } catch (...) {
+        captured = TransportOperationFailure(E_FAIL);
+    }
+    if (!IsCoherentOperationResult(captured)) {
+        return ContractFailure();
+    }
+    if (!captured.ok()) {
+        return captured.status;
+    }
+
+    ObserverCurrentReconcileOutcome candidate{};
+    const Status reconciled = ReconcileObserverTabSet(
+        state->tabs,
+        capture.shell_entries,
+        capture.orders,
+        state->generations,
+        &candidate.tabs);
+    if (!reconciled.ok()) {
+        return reconciled;
+    }
+
+    std::vector<ObserverTabIdentity> committedTabs;
+    ObserverTabGenerationState committedGenerations;
+    try {
+        committedTabs = candidate.tabs.current;
+        committedGenerations = candidate.tabs.generations;
+    } catch (const std::bad_alloc&) {
+        return TransportFailure(E_OUTOFMEMORY);
+    }
+
+    const Status subscriptions = ReconcileObserverShellSubscriptions(
+        candidate.tabs.current,
+        operations.subscriptions,
+        &state->subscriptions,
+        &candidate.subscriptions);
+    if (!subscriptions.ok()) {
+        *output = std::move(candidate);
+        return subscriptions;
+    }
+
+    state->tabs = std::move(committedTabs);
+    state->generations = std::move(committedGenerations);
+    *output = std::move(candidate);
+    return Success();
+}
+
 ObserverOperationResult CreateShellLifecycleEventSink(
     ObserverCallbackQueue* const queue,
     Microsoft::WRL::ComPtr<IDispatch>& output) {
@@ -2692,46 +2763,6 @@ ObserverShellStaOperations CreateProductionObserverShellStaOperations() {
             *output = std::move(candidate);
             return OperationSuccess();
         },
-        [](IShellWindows* const shellWindows,
-           const LONG lifecycleCookie,
-           Microsoft::WRL::ComPtr<IUnknown>& output) {
-            if (shellWindows == nullptr) {
-                return ContractOperationFailure(
-                    E_INVALIDARG, ERROR_INVALID_PARAMETER);
-            }
-            const ShellWindowResolverOperations resolver{
-                [shellWindows](
-                    VARIANT* const location,
-                    VARIANT* const root,
-                    const int shellClass,
-                    long* const legacyHwnd,
-                    const int flags,
-                    IDispatch** const dispatch) {
-                    return shellWindows->FindWindowSW(
-                        location,
-                        root,
-                        shellClass,
-                        legacyHwnd,
-                        flags,
-                    dispatch);
-                },
-            };
-            Microsoft::WRL::ComPtr<IDispatch> dispatch;
-            ObserverOperationResult resolved = FindRegisteredShellDispatch(
-                lifecycleCookie, resolver, dispatch);
-            if (!resolved.ok()) {
-                return resolved;
-            }
-            Microsoft::WRL::ComPtr<IUnknown> canonicalIdentity;
-            const HRESULT queried = dispatch.As(&canonicalIdentity);
-            resolved = ClassifyObserverConnectionPointResult(
-                queried, canonicalIdentity != nullptr);
-            if (!resolved.ok()) {
-                return resolved;
-            }
-            output = std::move(canonicalIdentity);
-            return OperationSuccess();
-        },
         [](ObserverCallbackQueue* const queue,
            Microsoft::WRL::ComPtr<IDispatch>& output) {
             return CreateShellLifecycleEventSink(queue, output);
@@ -2790,7 +2821,6 @@ Status StartObserverShellStaResources(
         !graph->target_top_levels.empty() || graph->next_registration_id != 1 ||
         !operations.prepare_message_queue || !operations.enumerate_windows ||
         !operations.create_shell_windows || !operations.capture ||
-        !operations.resolve_registered ||
         !operations.create_lifecycle_sink || !operations.create_browser_sink ||
         !operations.advise || !operations.unadvise ||
         !operations.peek_message || !operations.translate_message ||
@@ -3015,6 +3045,8 @@ Status StartObserverShellStaResources(
             metadata.canonical_identity,
             browser->browser,
             {},
+            {},
+            browser->canonical_identity,
         };
         try {
             graph->browser_resources.reserve(

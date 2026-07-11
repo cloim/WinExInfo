@@ -278,6 +278,36 @@ struct ObserverShellReconcileOutcome final {
     ObserverShellSubscriptionState* state,
     ObserverShellReconcileOutcome* output) noexcept;
 
+struct ObserverCurrentTabCapture final {
+    std::vector<ObserverShellEntryMetadata> shell_entries;
+    std::vector<ObserverTopLevelTabOrder> orders;
+};
+
+struct ObserverCurrentTabState final {
+    std::vector<ObserverTabIdentity> tabs;
+    ObserverTabGenerationState generations;
+    ObserverShellSubscriptionState subscriptions;
+
+    bool operator==(const ObserverCurrentTabState&) const = default;
+};
+
+struct ObserverCurrentReconcileOperations final {
+    std::function<ObserverOperationResult(ObserverCurrentTabCapture*)> capture;
+    ObserverShellReconcileOperations subscriptions;
+};
+
+struct ObserverCurrentReconcileOutcome final {
+    ObserverTabSetReconciliation tabs;
+    ObserverShellReconcileOutcome subscriptions;
+};
+
+[[nodiscard]] Status ReconcileObserverCurrentTabState(
+    ObservedEventKind wakeKind,
+    LONG lifecycleCookie,
+    const ObserverCurrentReconcileOperations& operations,
+    ObserverCurrentTabState* state,
+    ObserverCurrentReconcileOutcome* output) noexcept;
+
 struct ObserverShellStartupOutcome final {
     ObserverOperationResult setup;
     bool any_setup_transport_failure;
@@ -421,6 +451,8 @@ struct ObserverShellStaBrowserResource final {
     std::uintptr_t canonical_identity;
     Microsoft::WRL::ComPtr<IUnknown> browser;
     ObserverConnectionPointRegistration connection;
+    ObserverTabIdentity identity;
+    Microsoft::WRL::ComPtr<IUnknown> canonical_source;
 };
 
 struct ObserverShellStaResourceGraph final {
@@ -445,10 +477,6 @@ struct ObserverShellStaOperations final {
         IShellWindows*,
         std::span<const HWND>,
         ObserverShellStaCapture*)> capture;
-    std::function<ObserverOperationResult(
-        IShellWindows*,
-        LONG,
-        Microsoft::WRL::ComPtr<IUnknown>&)> resolve_registered;
     std::function<ObserverOperationResult(
         ObserverCallbackQueue*,
         Microsoft::WRL::ComPtr<IDispatch>&)> create_lifecycle_sink;

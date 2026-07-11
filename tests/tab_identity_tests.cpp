@@ -214,15 +214,25 @@ WXI_TEST(
     RequireContractFailure(winexinfo::ReconcileObserverTabSet(
         previous, valid, noVisible, {}, &output));
 
-    const std::array twoVisible{Order(
-        0x100,
-        {{Handle(0x101), true}, {Handle(0x102), true}})};
-    const std::array secondTarget{
+}
+
+WXI_TEST(
+    tab_identity_selects_first_visible_tab_when_multiple_hwnds_are_visible,
+    "tab_identity.first_visible") {
+    const std::array<winexinfo::ObserverTabIdentity, 0> previous{};
+    const std::array current{
         Target(11, 0x100, 0x101),
         Target(22, 0x100, 0x102),
     };
-    RequireContractFailure(winexinfo::ReconcileObserverTabSet(
-        previous, secondTarget, twoVisible, {}, &output));
+    const std::array orders{Order(
+        0x100,
+        {{Handle(0x101), true}, {Handle(0x102), true}})};
+    winexinfo::ObserverTabSetReconciliation output{};
+
+    WXI_REQUIRE(winexinfo::ReconcileObserverTabSet(
+                    previous, current, orders, {}, &output)
+                    .ok());
+    WXI_REQUIRE_EQ(output.active_shell_tabs.at(Handle(0x100)), Handle(0x101));
 }
 
 WXI_TEST(
@@ -250,4 +260,3 @@ WXI_TEST(
     RequireContractFailure(winexinfo::ReconcileObserverTabSet(
         none, current, orders, overflow, &output));
 }
-

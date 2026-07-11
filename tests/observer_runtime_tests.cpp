@@ -4491,11 +4491,6 @@ WXI_TEST(
             });
             return RuntimeOperationSuccess();
         },
-        [](IShellWindows*,
-           LONG,
-           Microsoft::WRL::ComPtr<IUnknown>&) {
-            return RuntimeOperationSuccess();
-        },
         [&calls, &lifecycleSink](
             winexinfo::ObserverCallbackQueue*,
             Microsoft::WRL::ComPtr<IDispatch>& output) {
@@ -4619,84 +4614,11 @@ WXI_TEST(
 }
 
 WXI_TEST(
-    observer_runtime_shell_lifecycle_exposes_exact_cookie_resolver,
-    "observer_runtime.shell_lifecycle_exact_cookie_resolver") {
+    observer_runtime_shell_lifecycle_has_no_cookie_resolver,
+    "observer_runtime.shell_lifecycle_no_cookie_resolver") {
     WXI_REQUIRE(
-        HasRegisteredShellResolver<
+        !HasRegisteredShellResolver<
             winexinfo::ObserverShellStaOperations>);
-
-    FakeDispatch dispatch;
-    FakeShellWindows shellWindows;
-    shellWindows.find_hresult = S_OK;
-    shellWindows.find_dispatch = &dispatch;
-    const winexinfo::ObserverShellStaOperations operations =
-        winexinfo::CreateProductionObserverShellStaOperations();
-    Microsoft::WRL::ComPtr<IUnknown> canonicalIdentity;
-    winexinfo::ObserverOperationResult resolved =
-        operations.resolve_registered(
-            &shellWindows, 73, canonicalIdentity);
-
-    WXI_REQUIRE(resolved.ok());
-    WXI_REQUIRE(!resolved.failure_origin.has_value());
-    WXI_REQUIRE_EQ(shellWindows.find_calls, std::size_t{1});
-    WXI_REQUIRE_EQ(shellWindows.find_location_vartype, VARTYPE{VT_I4});
-    WXI_REQUIRE_EQ(shellWindows.find_location_cookie, LONG{73});
-    WXI_REQUIRE(shellWindows.find_root_present);
-    WXI_REQUIRE_EQ(shellWindows.find_root_vartype, VARTYPE{VT_EMPTY});
-    WXI_REQUIRE_EQ(shellWindows.find_shell_class, int{SWC_EXPLORER});
-    WXI_REQUIRE_EQ(
-        shellWindows.find_flags,
-        int{SWFO_COOKIEPASSED | SWFO_NEEDDISPATCH |
-            SWFO_INCLUDEPENDING});
-    WXI_REQUIRE_EQ(
-        canonicalIdentity.Get(),
-        static_cast<IUnknown*>(static_cast<IDispatch*>(&dispatch)));
-    WXI_REQUIRE_EQ(dispatch.references(), ULONG{2});
-
-    const std::array<winexinfo::ObserverShellEntryMetadata, 0> previous{};
-    const std::array<winexinfo::ObserverShellEntryMetadata, 1> current{
-        winexinfo::ObserverShellEntryMetadata{
-            reinterpret_cast<std::uintptr_t>(canonicalIdentity.Get()),
-            true,
-            Handle(0x100),
-            Handle(0x101),
-        },
-    };
-    winexinfo::ObserverShellLifecycleCorrelation correlation{};
-    WXI_REQUIRE(winexinfo::CorrelateObserverShellLifecycle(
-                    winexinfo::ObservedEventKind::WindowRegistered,
-                    previous,
-                    current,
-                    reinterpret_cast<std::uintptr_t>(canonicalIdentity.Get()),
-                    {},
-                    {},
-                    &correlation)
-                    .ok());
-    WXI_REQUIRE_EQ(
-        correlation.entry.canonical_identity,
-        reinterpret_cast<std::uintptr_t>(canonicalIdentity.Get()));
-    canonicalIdentity.Reset();
-    WXI_REQUIRE_EQ(dispatch.references(), ULONG{1});
-
-    shellWindows.find_hresult = E_NOINTERFACE;
-    shellWindows.find_dispatch = nullptr;
-    resolved = operations.resolve_registered(
-        &shellWindows, 74, canonicalIdentity);
-    WXI_REQUIRE(!resolved.ok());
-    WXI_REQUIRE_EQ(resolved.status.hresult, E_NOINTERFACE);
-    WXI_REQUIRE_EQ(
-        resolved.failure_origin,
-        std::optional{winexinfo::ObserverFailureOrigin::Contract});
-    WXI_REQUIRE(canonicalIdentity == nullptr);
-
-    shellWindows.find_hresult = RPC_E_DISCONNECTED;
-    resolved = operations.resolve_registered(
-        &shellWindows, 75, canonicalIdentity);
-    WXI_REQUIRE(!resolved.ok());
-    WXI_REQUIRE_EQ(resolved.status.hresult, RPC_E_DISCONNECTED);
-    WXI_REQUIRE_EQ(
-        resolved.failure_origin,
-        std::optional{winexinfo::ObserverFailureOrigin::Transport});
 }
 
 WXI_TEST(

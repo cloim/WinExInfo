@@ -41,16 +41,9 @@ Win32ContractResult ValidateWin32Contract(const Win32ClassTree& classTree) {
         if (!node->visible) {
             continue;
         }
-        if (selectedShellTab != nullptr) {
-            return {
-                {ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH, S_FALSE, ERROR_SUCCESS},
-                classTree,
-                node->hwnd,
-                nullptr,
-                orderedShellTabs,
-            };
+        if (selectedShellTab == nullptr) {
+            selectedShellTab = node;
         }
-        selectedShellTab = node;
     }
 
     if (selectedShellTab == nullptr || orderedShellTabs.empty()) {

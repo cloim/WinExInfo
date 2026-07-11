@@ -135,6 +135,10 @@ public:
             return outcome;
         }
         current_shell_metadata_ = shell_graph_.startup_state.baseline;
+        ObserverOperationResult initialized = InitializeCurrentTabState();
+        if (!initialized.ok()) {
+            return FailAfterShellStartup(initialized);
+        }
 
         std::vector<ObserverUiaTarget> initialTargets;
         for (const HWND topLevel : shell_graph_.target_top_levels) {
@@ -263,680 +267,24 @@ public:
 
     ObserverEventProcessingResult ProcessEvent(
         const ObserverCallbackEnvelope& envelope) {
+        ObserverCurrentReconcileOutcome currentReconciliation{};
+        runtime_stage_ = "event.reconcile_current_tabs";
+        ObserverOperationResult currentReconciled = RefreshCurrentTabState(
+            envelope.payload.kind,
+            envelope.payload.source == ObserverCallbackSource::ShellLifecycle
+                ? envelope.payload.shell_cookie
+                : 0,
+            &currentReconciliation);
+        if (!currentReconciled.ok()) {
+            return FailureResult(envelope.sequence, currentReconciled);
+        }
         if (envelope.payload.source == ObserverCallbackSource::ShellLifecycle) {
-            runtime_stage_ = "lifecycle.begin";
-            std::uintptr_t resolvedAddedIdentity = 0;
-            Microsoft::WRL::ComPtr<IUnknown> resolvedAddedCanonicalIdentity;
-            if (envelope.payload.kind != ObservedEventKind::WindowRegistered &&
-                envelope.payload.kind != ObservedEventKind::WindowRevoked) {
-                switch (envelope.payload.kind) {
-                    case ObservedEventKind::NavigateComplete2:
-                        runtime_stage_ =
-                            "lifecycle.invalid.navigate_complete2";
-                        break;
-                    case ObservedEventKind::TabSelected:
-                        runtime_stage_ = "lifecycle.invalid.tab_selected";
-                        break;
-                    case ObservedEventKind::TabStructureChanged:
-                        runtime_stage_ =
-                            "lifecycle.invalid.tab_structure_changed";
-                        break;
-                    default:
-                        runtime_stage_ = "lifecycle.invalid.unknown";
-                        break;
-                }
-                return FailureResult(
-                    envelope.sequence, RuntimeContractFailure());
-            }
-            if (envelope.payload.kind ==
-                ObservedEventKind::WindowRegistered) {
-                if (registered_shell_entries_.contains(
-                        envelope.payload.shell_cookie)) {
-                    return FailureResult(
-                        envelope.sequence, RuntimeContractFailure());
-                }
-            }
-
-            std::vector<ExplorerWindowRecord> windows;
-            runtime_stage_ = "lifecycle.enumerate_windows";
-            ObserverOperationResult enumerated =
-                shell_operations_.enumerate_windows(&windows);
-            if (!enumerated.ok()) {
-                return FailureResult(envelope.sequence, enumerated);
-            }
-            std::vector<HWND> refreshedTargets;
-            for (const ExplorerWindowRecord& window : windows) {
-                if (window.hwnd == nullptr || window.process_id == 0 ||
-                    window.thread_id == 0 ||
-                    std::find(
-                        refreshedTargets.begin(),
-                        refreshedTargets.end(),
-                        window.hwnd) != refreshedTargets.end()) {
-                    return FailureResult(
-                        envelope.sequence, RuntimeContractFailure());
-                }
-                refreshedTargets.push_back(window.hwnd);
-            }
-            const std::vector<HWND>& captureTargets = refreshedTargets.empty()
-                ? shell_graph_.target_top_levels
-                : refreshedTargets;
-            if (captureTargets.empty()) {
-                return FailureResult(
-                    envelope.sequence, RuntimeContractFailure());
-            }
-            ObserverShellStaCapture refreshedCapture{};
-            runtime_stage_ = "lifecycle.capture_shell";
-            ObserverOperationResult refreshed = shell_operations_.capture(
-                shell_graph_.shell_windows.Get(),
-                captureTargets,
-                &refreshedCapture);
-            if (!refreshed.ok()) {
-                return FailureResult(envelope.sequence, refreshed);
-            }
-            std::vector<ObserverShellEntryMetadata> refreshedMetadata;
-            refreshedMetadata.reserve(refreshedCapture.browsers.size());
-            for (const ObserverShellStaCapturedBrowser& browser :
-                 refreshedCapture.browsers) {
-                if (browser.metadata.canonical_identity == 0 ||
-                    browser.metadata.top_level == nullptr ||
-                    browser.canonical_identity == nullptr ||
-                    browser.browser == nullptr ||
-                    browser.metadata.target_matched !=
-                        (browser.metadata.shell_tab != nullptr) ||
-                    reinterpret_cast<std::uintptr_t>(
-                        browser.canonical_identity.Get()) !=
-                        browser.metadata.canonical_identity) {
-                    return FailureResult(
-                        envelope.sequence, RuntimeContractFailure());
-                }
-                refreshedMetadata.push_back(browser.metadata);
-            }
-
-            if (envelope.payload.kind ==
-                ObservedEventKind::WindowRegistered) {
-                runtime_stage_ = "lifecycle.resolve_registered";
-                ObserverOperationResult resolved =
-                    shell_operations_.resolve_registered(
-                        shell_graph_.shell_windows.Get(),
-                        envelope.payload.shell_cookie,
-                        resolvedAddedCanonicalIdentity);
-                if (!resolved.ok() ||
-                    resolvedAddedCanonicalIdentity == nullptr) {
-                    return FailureResult(
-                        envelope.sequence,
-                        resolved.ok() ? RuntimeContractFailure() : resolved);
-                }
-                resolvedAddedIdentity = reinterpret_cast<std::uintptr_t>(
-                    resolvedAddedCanonicalIdentity.Get());
-            }
-
-            bool initialRevocation = false;
-            bool retainedLifecycleDelta = false;
-            std::vector<ObserverShellEntryMetadata>
-                correlationCurrentStorage;
-            std::span<const ObserverShellEntryMetadata> correlationPrevious{
-                current_shell_metadata_};
-            std::span<const ObserverShellEntryMetadata> correlationCurrent{
-                refreshedMetadata};
-            if (envelope.payload.kind == ObservedEventKind::WindowRegistered) {
-                const auto resolvedEntry = std::find_if(
-                    refreshedMetadata.begin(),
-                    refreshedMetadata.end(),
-                    [resolvedAddedIdentity](
-                        const ObserverShellEntryMetadata& entry) {
-                        return entry.canonical_identity ==
-                            resolvedAddedIdentity;
-                    });
-                if (resolvedEntry != refreshedMetadata.end()) {
-                    try {
-                        correlationCurrentStorage = current_shell_metadata_;
-                        correlationCurrentStorage.push_back(*resolvedEntry);
-                    } catch (const std::bad_alloc&) {
-                        return FailureResult(
-                            envelope.sequence,
-                            RuntimeTransportFailure(E_OUTOFMEMORY));
-                    }
-                    correlationCurrent =
-                        std::span<const ObserverShellEntryMetadata>{
-                            correlationCurrentStorage};
-                    retainedLifecycleDelta = true;
-                }
-            }
-            if (envelope.payload.kind == ObservedEventKind::WindowRevoked) {
-                const auto registered = registered_shell_entries_.find(
-                    envelope.payload.shell_cookie);
-                std::optional<ObserverShellEntryMetadata> tombstone;
-                if (registered != registered_shell_entries_.end()) {
-                    tombstone = registered->second;
-                } else {
-                    std::size_t missingInitialCount = 0;
-                    for (const auto& [identity, entry] :
-                         initial_shell_entries_) {
-                        const bool stillPresent = std::any_of(
-                            refreshedMetadata.begin(),
-                            refreshedMetadata.end(),
-                            [identity](
-                                const ObserverShellEntryMetadata& current) {
-                                return current.canonical_identity == identity;
-                            });
-                        if (!stillPresent) {
-                            ++missingInitialCount;
-                            tombstone = entry;
-                        }
-                    }
-                    if (missingInitialCount == 1) {
-                        std::vector<ObserverShellEntryMetadata>
-                            initialLiveComparison;
-                        try {
-                            initialLiveComparison = refreshedMetadata;
-                            for (const auto& [cookie, entry] :
-                                 registered_shell_entries_) {
-                                static_cast<void>(cookie);
-                                const bool present = std::any_of(
-                                    initialLiveComparison.begin(),
-                                    initialLiveComparison.end(),
-                                    [&](const ObserverShellEntryMetadata& live) {
-                                        return live.canonical_identity ==
-                                            entry.canonical_identity;
-                                    });
-                                if (!present) {
-                                    initialLiveComparison.push_back(entry);
-                                }
-                            }
-                        } catch (const std::bad_alloc&) {
-                            return FailureResult(
-                                envelope.sequence,
-                                RuntimeTransportFailure(E_OUTOFMEMORY));
-                        }
-                        ObserverShellSetTransition exactTransition{};
-                        const Status exactInitialDelta =
-                            ClassifyObserverShellSetTransition(
-                                ObserverShellTransitionKind::Revoked,
-                                current_shell_metadata_,
-                                initialLiveComparison,
-                                0,
-                                &exactTransition);
-                        initialRevocation = exactInitialDelta.ok() &&
-                            exactTransition.removed.has_value() &&
-                            exactTransition.removed->canonical_identity ==
-                                tombstone->canonical_identity;
-                        if (!initialRevocation) {
-                            tombstone.reset();
-                        }
-                    } else {
-                        tombstone.reset();
-                    }
-                }
-                if (tombstone.has_value()) {
-                    try {
-                        correlationCurrentStorage.reserve(
-                            current_shell_metadata_.size());
-                        for (const ObserverShellEntryMetadata& entry :
-                             current_shell_metadata_) {
-                            if (entry.canonical_identity !=
-                                tombstone->canonical_identity) {
-                                correlationCurrentStorage.push_back(entry);
-                            }
-                        }
-                    } catch (const std::bad_alloc&) {
-                        return FailureResult(
-                            envelope.sequence,
-                            RuntimeTransportFailure(E_OUTOFMEMORY));
-                    }
-                    correlationCurrent =
-                        std::span<const ObserverShellEntryMetadata>{
-                            correlationCurrentStorage};
-                    retainedLifecycleDelta = true;
-                }
-            }
-
-            ObserverShellLifecycleCorrelation correlation{};
-            runtime_stage_ = "lifecycle.correlate";
-            const Status correlated = CorrelateObserverShellLifecycle(
-                envelope.payload.kind,
-                correlationPrevious,
-                correlationCurrent,
-                resolvedAddedIdentity,
-                active_generations_,
-                latest_generations_,
-                &correlation);
-            if (!correlated.ok()) {
-                return FailureResult(
-                    envelope.sequence, RuntimeOperationFromStatus(correlated));
-            }
-            if (!correlation.target_matched) {
-                shell_graph_.target_top_levels = captureTargets;
-                shell_graph_.browser_set =
-                    std::move(refreshedCapture.browser_set);
-                shell_graph_.captured_browsers =
-                    std::move(refreshedCapture.browsers);
-                current_shell_metadata_ = retainedLifecycleDelta
-                    ? std::move(correlationCurrentStorage)
-                    : std::move(refreshedMetadata);
-                runtime_stage_ = "lifecycle.ignored";
-                return {
-                    RuntimeSuccessOperation(),
-                    ObserverEventDisposition::Ignored,
-                    envelope.sequence,
-                    std::nullopt,
-                };
-            }
-
-            if (envelope.payload.kind == ObservedEventKind::WindowRevoked) {
-                const auto registered = registered_shell_entries_.find(
-                    envelope.payload.shell_cookie);
-                if ((registered == registered_shell_entries_.end() &&
-                     !initialRevocation) ||
-                    (registered != registered_shell_entries_.end() &&
-                     (registered->second != correlation.entry ||
-                      initialRevocation))) {
-                    return FailureResult(
-                        envelope.sequence, RuntimeContractFailure());
-                }
-                if (initialRevocation &&
-                    !initial_shell_entries_.contains(
-                        correlation.entry.canonical_identity)) {
-                    return FailureResult(
-                        envelope.sequence, RuntimeContractFailure());
-                }
-            }
-
-            std::vector<CanonicalShellEntryIdentity> previousInitialEntries;
-            std::vector<CanonicalShellEntryIdentity> currentInitialEntries;
-            if (initialRevocation) {
-                try {
-                    previousInitialEntries.reserve(
-                        initial_shell_entries_.size());
-                    currentInitialEntries.reserve(
-                        initial_shell_entries_.size() - 1);
-                    for (const auto& [identity, entry] :
-                         initial_shell_entries_) {
-                        const auto generation = active_generations_.find(
-                            entry.top_level);
-                        if (generation == active_generations_.end()) {
-                            return FailureResult(
-                                envelope.sequence,
-                                RuntimeContractFailure());
-                        }
-                        previousInitialEntries.push_back({
-                            static_cast<std::uint64_t>(identity),
-                            entry.top_level,
-                            generation->second,
-                            entry.shell_tab,
-                        });
-                    }
-                    for (const ObserverShellEntryMetadata& entry :
-                         correlationCurrent) {
-                        if (!initial_shell_entries_.contains(
-                                entry.canonical_identity)) {
-                            continue;
-                        }
-                        const auto generation = active_generations_.find(
-                            entry.top_level);
-                        if (generation == active_generations_.end()) {
-                            return FailureResult(
-                                envelope.sequence,
-                                RuntimeContractFailure());
-                        }
-                        currentInitialEntries.push_back({
-                            static_cast<std::uint64_t>(
-                                entry.canonical_identity),
-                            entry.top_level,
-                            generation->second,
-                            entry.shell_tab,
-                        });
-                    }
-                } catch (const std::bad_alloc&) {
-                    return FailureResult(
-                        envelope.sequence,
-                        RuntimeTransportFailure(E_OUTOFMEMORY));
-                }
-            }
-
-            if (envelope.payload.kind ==
-                ObservedEventKind::WindowRegistered) {
-                const auto capturedBrowser = std::find_if(
-                    refreshedCapture.browsers.begin(),
-                    refreshedCapture.browsers.end(),
-                    [&](const ObserverShellStaCapturedBrowser& browser) {
-                        return browser.metadata.canonical_identity ==
-                            correlation.entry.canonical_identity;
-                    });
-                if (capturedBrowser == refreshedCapture.browsers.end() ||
-                    shell_graph_.next_registration_id == 0 ||
-                    shell_graph_.next_registration_id == UINT64_MAX) {
-                    return FailureResult(
-                        envelope.sequence, RuntimeContractFailure());
-                }
-                shell_graph_.browser_resources.reserve(
-                    shell_graph_.browser_resources.size() + 1);
-                shell_graph_.startup_state.browser_registrations.reserve(
-                    shell_graph_.startup_state.browser_registrations.size() +
-                    1);
-                Microsoft::WRL::ComPtr<IDispatch> sink;
-                runtime_stage_ = "lifecycle.create_browser_sink";
-                ObserverOperationResult created =
-                    shell_operations_.create_browser_sink(
-                        queue_,
-                        capturedBrowser->canonical_identity.Get(),
-                        correlation.entry.top_level,
-                        correlation.generation,
-                        correlation.entry.shell_tab,
-                        sink);
-                if (!created.ok() || sink == nullptr) {
-                    return FailureResult(
-                        envelope.sequence,
-                        created.ok() ? RuntimeContractFailure() : created);
-                }
-                const std::uint64_t registrationId =
-                    shell_graph_.next_registration_id;
-                ObserverShellStaBrowserResource resource{
-                    registrationId,
-                    correlation.entry.canonical_identity,
-                    capturedBrowser->browser,
-                    {},
-                };
-                runtime_stage_ = "lifecycle.advise_browser";
-                ObserverOperationResult advised = shell_operations_.advise(
-                    resource.browser.Get(),
-                    DIID_DWebBrowserEvents2,
-                    sink.Get(),
-                    &resource.connection);
-                if (!advised.ok() ||
-                    resource.connection.connection_point == nullptr ||
-                    resource.connection.sink == nullptr ||
-                    resource.connection.subscription_cookie == 0 ||
-                    resource.connection.owner_thread_id !=
-                        shell_graph_.owner_thread_id) {
-                    return FailureResult(
-                        envelope.sequence,
-                        advised.ok() ? RuntimeContractFailure() : advised);
-                }
-                shell_graph_.browser_resources.push_back(std::move(resource));
-                shell_graph_.startup_state.browser_registrations.push_back({
-                    correlation.entry.canonical_identity,
-                    registrationId,
-                });
-                ++shell_graph_.next_registration_id;
-            } else {
-                const auto resource = std::find_if(
-                    shell_graph_.browser_resources.begin(),
-                    shell_graph_.browser_resources.end(),
-                    [&](const ObserverShellStaBrowserResource& browser) {
-                        return browser.canonical_identity ==
-                            correlation.entry.canonical_identity;
-                    });
-                if (resource == shell_graph_.browser_resources.end()) {
-                    return FailureResult(
-                        envelope.sequence, RuntimeContractFailure());
-                }
-                const std::uint64_t registrationId =
-                    resource->registration_id;
-                runtime_stage_ = "lifecycle.unadvise_browser";
-                ObserverOperationResult unadvised =
-                    shell_operations_.unadvise(&resource->connection);
-                if (!unadvised.ok()) {
-                    return FailureResult(envelope.sequence, unadvised);
-                }
-                shell_graph_.browser_resources.erase(resource);
-                const auto startupRegistration = std::find_if(
-                    shell_graph_.startup_state.browser_registrations.begin(),
-                    shell_graph_.startup_state.browser_registrations.end(),
-                    [registrationId](
-                        const ObserverShellBrowserRegistration& registration) {
-                        return registration.registration_id == registrationId;
-                    });
-                if (startupRegistration ==
-                    shell_graph_.startup_state.browser_registrations.end()) {
-                    return FailureResult(
-                        envelope.sequence, RuntimeContractFailure());
-                }
-                shell_graph_.startup_state.browser_registrations.erase(
-                    startupRegistration);
-            }
-
-            shell_graph_.target_top_levels = captureTargets;
-            shell_graph_.browser_set = std::move(refreshedCapture.browser_set);
-            shell_graph_.captured_browsers =
-                std::move(refreshedCapture.browsers);
-            current_shell_metadata_ = retainedLifecycleDelta
-                ? std::move(correlationCurrentStorage)
-                : std::move(refreshedMetadata);
-
-            const ObservedEventTrigger trigger{
-                envelope.payload.kind,
-                correlation.entry.top_level,
-                correlation.generation,
-                true,
-                correlation.entry.shell_tab,
-                envelope.payload.kind == ObservedEventKind::WindowRevoked,
-                true,
-                envelope.payload.shell_cookie,
-                ObservedStructureChangeType::None,
-            };
-            if (envelope.payload.kind ==
-                ObservedEventKind::WindowRegistered) {
-                registered_shell_entries_.emplace(
-                    envelope.payload.shell_cookie,
-                    correlation.entry);
-                if (correlation.new_top_level) {
-                    active_generations_[correlation.entry.top_level] =
-                        correlation.generation;
-                    latest_generations_[correlation.entry.top_level] =
-                        correlation.generation;
-                }
-                LogicalActiveViewState logical{};
-                HWND selectedShellTab = nullptr;
-                HWND uiaActiveView = nullptr;
-                runtime_stage_ = "lifecycle.capture_logical";
-                ObserverOperationResult captured = CaptureLogicalState(
-                    correlation.entry.top_level,
-                    &selectedShellTab,
-                    &uiaActiveView,
-                    &logical);
-                const bool pendingCapture =
-                    IsPendingContractResult(captured);
-                if (!captured.ok() && !pendingCapture) {
-                    return FailureResult(envelope.sequence, captured);
-                }
-                if (pendingCapture) {
-                    logical = {
-                        nullptr,
-                        0,
-                        false,
-                        {},
-                        {
-                            ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH,
-                            S_FALSE,
-                            ERROR_SUCCESS,
-                        },
-                    };
-                    selectedShellTab = nullptr;
-                    uiaActiveView = nullptr;
-                }
-                if (correlation.new_top_level && logical.status.ok()) {
-                    const ObserverUiaTarget target{
-                        correlation.entry.top_level,
-                        correlation.generation,
-                        uiaActiveView,
-                        selectedShellTab,
-                    };
-                    std::uint64_t commandId = 0;
-                    runtime_stage_ = "lifecycle.add_uia_target";
-                    ObserverOperationResult submitted = uia_worker_.Submit(
-                        ObserverUiaCommandKind::AddTarget,
-                        target,
-                        &commandId);
-                    if (!submitted.ok()) {
-                        return FailureResult(envelope.sequence, submitted);
-                    }
-                    const DWORD waited = WaitForSingleObject(
-                        response_event_, 5000);
-                    if (waited != WAIT_OBJECT_0) {
-                        return FailureResult(
-                            envelope.sequence,
-                            waited == WAIT_FAILED
-                                ? RuntimeTransportFailure(
-                                    HRESULT_FROM_WIN32(GetLastError()))
-                                : RuntimeTransportFailure(
-                                    HRESULT_FROM_WIN32(ERROR_TIMEOUT)));
-                    }
-                    ObserverUiaResponse response{};
-                    ObserverOperationResult consumed = uia_worker_.Consume(
-                        commandId, &response);
-                    const bool pendingTarget =
-                        IsPendingContractResult(response.operation);
-                    if (!consumed.ok() ||
-                        (!response.operation.ok() && !pendingTarget)) {
-                        return FailureResult(
-                            envelope.sequence,
-                            consumed.ok() ? response.operation : consumed);
-                    }
-                    if (response.operation.ok()) {
-                        uia_targets_.push_back(target);
-                    }
-                }
-                ObservedEventRecord record{};
-                const LogicalActiveViewState registrationState =
-                    logical.status.ok()
-                    ? LogicalActiveViewState{
-                          nullptr,
-                          0,
-                          false,
-                          {},
-                          {
-                              ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH,
-                              S_FALSE,
-                              ERROR_SUCCESS,
-                          },
-                      }
-                    : logical;
-                runtime_stage_ = "lifecycle.record_registered";
-                const Status recorded = reducer_.RecordRegistered(
-                    trigger,
-                    correlation.top_level_entry_count,
-                    registrationState,
-                    &record);
-                if (!recorded.ok()) {
-                    return FailureResult(
-                        envelope.sequence,
-                        RuntimeOperationFromStatus(recorded));
-                }
-                runtime_stage_ = "lifecycle.complete";
-                return {
-                    RuntimeSuccessOperation(),
-                    ObserverEventDisposition::Completed,
-                    envelope.sequence,
-                    std::move(record),
-                };
-            }
-
-            const LogicalActiveViewState terminal{
-                nullptr,
-                0,
-                false,
-                {},
-                RuntimeSuccessStatus(),
-            };
-            ObservedEventRecord record{};
-            Status recorded{};
-            if (initialRevocation) {
-                std::uint64_t removedEntryId = 0;
-                recorded = reducer_.ReconcileInitialEntryRevoke(
-                    envelope.payload.shell_cookie,
-                    previousInitialEntries,
-                    currentInitialEntries,
-                    trigger,
-                    correlation.top_level_entry_count,
-                    terminal,
-                    &record,
-                    &removedEntryId);
-                if (recorded.ok() &&
-                    (removedEntryId != static_cast<std::uint64_t>(
-                         correlation.entry.canonical_identity) ||
-                     initial_shell_entries_.erase(
-                         correlation.entry.canonical_identity) != 1)) {
-                    recorded = {
-                        ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH,
-                        S_FALSE,
-                        ERROR_SUCCESS,
-                    };
-                }
-            } else {
-                const auto registered = registered_shell_entries_.find(
-                    envelope.payload.shell_cookie);
-                if (registered == registered_shell_entries_.end() ||
-                    registered->second != correlation.entry) {
-                    return FailureResult(
-                        envelope.sequence, RuntimeContractFailure());
-                }
-                recorded = reducer_.RecordRevoked(
-                    trigger,
-                    correlation.top_level_entry_count,
-                    terminal,
-                    &record);
-                if (recorded.ok()) {
-                    registered_shell_entries_.erase(registered);
-                }
-            }
-            if (!recorded.ok()) {
-                return FailureResult(
-                    envelope.sequence, RuntimeOperationFromStatus(recorded));
-            }
-
-            if (correlation.top_level_entry_count > 0) {
-                closing_generations_[correlation.entry.top_level] =
-                    correlation.generation;
-            }
-
-            if (correlation.top_level_entry_count == 0) {
-                closing_generations_.erase(correlation.entry.top_level);
-                const auto target = std::find_if(
-                    uia_targets_.begin(),
-                    uia_targets_.end(),
-                    [&](const ObserverUiaTarget& candidate) {
-                        return candidate.top_level ==
-                                correlation.entry.top_level &&
-                            candidate.generation == correlation.generation;
-                    });
-                if (target != uia_targets_.end()) {
-                    std::uint64_t commandId = 0;
-                    ObserverOperationResult submitted = uia_worker_.Submit(
-                        ObserverUiaCommandKind::RemoveTarget,
-                        *target,
-                        &commandId);
-                    if (!submitted.ok()) {
-                        return FailureResult(envelope.sequence, submitted);
-                    }
-                    const DWORD waited = WaitForSingleObject(
-                        response_event_, 5000);
-                    if (waited != WAIT_OBJECT_0) {
-                        return FailureResult(
-                            envelope.sequence,
-                            waited == WAIT_FAILED
-                                ? RuntimeTransportFailure(
-                                    HRESULT_FROM_WIN32(GetLastError()))
-                                : RuntimeTransportFailure(
-                                    HRESULT_FROM_WIN32(ERROR_TIMEOUT)));
-                    }
-                    ObserverUiaResponse response{};
-                    ObserverOperationResult consumed = uia_worker_.Consume(
-                        commandId, &response);
-                    if (!consumed.ok() || !response.operation.ok()) {
-                        return FailureResult(
-                            envelope.sequence,
-                            consumed.ok() ? response.operation : consumed);
-                    }
-                    uia_targets_.erase(target);
-                }
-                active_generations_.erase(correlation.entry.top_level);
-            }
-            runtime_stage_ = "lifecycle.complete";
+            runtime_stage_ = "lifecycle.reconciled";
             return {
                 RuntimeSuccessOperation(),
-                ObserverEventDisposition::Completed,
+                ObserverEventDisposition::Ignored,
                 envelope.sequence,
-                std::move(record),
+                std::nullopt,
             };
         }
         if (envelope.payload.top_level == nullptr) {
@@ -953,45 +301,6 @@ public:
                 envelope.sequence,
                 std::nullopt,
             };
-        }
-        bool shellCaptureReady = false;
-        const auto closing = closing_generations_.find(
-            envelope.payload.top_level);
-        if (closing != closing_generations_.end() &&
-            closing->second == envelope.payload.generation) {
-            runtime_stage_ = "event.recheck_closing_target";
-            const ObserverOperationResult rechecked = RefreshShellCapture();
-            const bool closingUnavailable =
-                IsPendingContractResult(rechecked) ||
-                (!rechecked.ok() &&
-                 rechecked.status.code ==
-                     ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH &&
-                 rechecked.status.hresult == E_NOINTERFACE &&
-                 rechecked.status.win32 == ERROR_SUCCESS);
-            if (!rechecked.ok() && !closingUnavailable) {
-                return FailureResult(envelope.sequence, rechecked);
-            }
-            const std::size_t liveTopLevelEntryCount = rechecked.ok()
-                ? static_cast<std::size_t>(std::count_if(
-                      shell_graph_.captured_browsers.begin(),
-                      shell_graph_.captured_browsers.end(),
-                      [&](const ObserverShellStaCapturedBrowser& browser) {
-                          return browser.metadata.target_matched &&
-                              browser.metadata.top_level ==
-                                  envelope.payload.top_level;
-                      }))
-                : 0;
-            if (liveTopLevelEntryCount == 0) {
-                runtime_stage_ = "event.closing_target";
-                return {
-                    RuntimeSuccessOperation(),
-                    ObserverEventDisposition::Ignored,
-                    envelope.sequence,
-                    std::nullopt,
-                };
-            }
-            closing_generations_.erase(closing);
-            shellCaptureReady = true;
         }
         if (envelope.payload.source == ObserverCallbackSource::BrowserNavigate) {
             Win32ClassTree tree{};
@@ -1054,9 +363,7 @@ public:
             };
         }
         runtime_stage_ = "event.refresh_shell";
-        ObserverOperationResult refreshed = shellCaptureReady
-            ? RuntimeSuccessOperation()
-            : RefreshShellCapture();
+        ObserverOperationResult refreshed = RuntimeSuccessOperation();
         if (!refreshed.ok()) {
             return FailureResult(envelope.sequence, refreshed);
         }
@@ -1211,8 +518,12 @@ public:
         if (!response.operation.ok()) {
             return FailureResult(rawSequence, response.operation);
         }
-        runtime_stage_ = "response.refresh_shell";
-        ObserverOperationResult refreshed = RefreshShellCapture();
+        runtime_stage_ = "response.reconcile_current_tabs";
+        ObserverCurrentReconcileOutcome currentReconciliation{};
+        ObserverOperationResult refreshed = RefreshCurrentTabState(
+            ObservedEventKind::TabStructureChanged,
+            0,
+            &currentReconciliation);
         if (!refreshed.ok()) {
             return FailureResult(rawSequence, refreshed);
         }
@@ -1312,17 +623,313 @@ private:
         };
     }
 
-    ObserverOperationResult RefreshShellCapture() {
-        ObserverShellStaCapture capture{};
-        ObserverOperationResult refreshed = shell_operations_.capture(
-            shell_graph_.shell_windows.Get(),
-            shell_graph_.target_top_levels,
-            &capture);
-        if (!refreshed.ok()) {
-            return refreshed;
+    ObserverOperationResult CaptureCurrentTabOrders(
+        const std::vector<HWND>& topLevels,
+        std::vector<ObserverTopLevelTabOrder>* const output) {
+        if (output == nullptr || !output->empty()) {
+            return RuntimeContractFailure(
+                E_INVALIDARG, ERROR_INVALID_PARAMETER);
         }
-        shell_graph_.browser_set = std::move(capture.browser_set);
-        shell_graph_.captured_browsers = std::move(capture.browsers);
+        try {
+            output->reserve(topLevels.size());
+            for (const HWND topLevel : topLevels) {
+                Win32ClassTree tree{};
+                const Status captured = CaptureWin32ClassTree(topLevel, &tree);
+                if (!captured.ok()) {
+                    return RuntimeOperationFromStatus(captured);
+                }
+                const Win32ContractResult win32 = ValidateWin32Contract(tree);
+                if (!win32.status.ok()) {
+                    return RuntimeOperationFromStatus(win32.status);
+                }
+                ObserverTopLevelTabOrder order{topLevel, {}};
+                order.tabs.reserve(win32.ordered_shell_tabs.size());
+                for (const HWND shellTab : win32.ordered_shell_tabs) {
+                    const auto node = std::find_if(
+                        tree.nodes.begin(),
+                        tree.nodes.end(),
+                        [shellTab](const Win32ClassNode& candidate) {
+                            return candidate.hwnd == shellTab;
+                        });
+                    if (node == tree.nodes.end() ||
+                        node->parent != topLevel ||
+                        node->class_name != L"ShellTabWindowClass") {
+                        return RuntimeContractFailure();
+                    }
+                    order.tabs.push_back({shellTab, node->visible});
+                }
+                output->push_back(std::move(order));
+            }
+        } catch (const std::bad_alloc&) {
+            return RuntimeTransportFailure(E_OUTOFMEMORY);
+        }
+        return RuntimeSuccessOperation();
+    }
+
+    ObserverOperationResult InitializeCurrentTabState() {
+        std::vector<ObserverTopLevelTabOrder> orders;
+        ObserverOperationResult capturedOrders = CaptureCurrentTabOrders(
+            shell_graph_.target_top_levels, &orders);
+        if (!capturedOrders.ok()) {
+            return capturedOrders;
+        }
+        ObserverTabSetReconciliation reconciliation{};
+        const Status reconciled = ReconcileObserverTabSet(
+            {},
+            current_shell_metadata_,
+            orders,
+            {},
+            &reconciliation);
+        if (!reconciled.ok()) {
+            return RuntimeOperationFromStatus(reconciled);
+        }
+        try {
+            current_tab_state_.tabs = reconciliation.current;
+            current_tab_state_.generations = reconciliation.generations;
+            current_tab_state_.subscriptions.next_registration_id =
+                shell_graph_.next_registration_id;
+            current_tab_state_.subscriptions.subscriptions.reserve(
+                shell_graph_.browser_resources.size());
+            for (ObserverShellStaBrowserResource& resource :
+                 shell_graph_.browser_resources) {
+                const auto identity = std::find_if(
+                    current_tab_state_.tabs.begin(),
+                    current_tab_state_.tabs.end(),
+                    [&](const ObserverTabIdentity& candidate) {
+                        return candidate.canonical_identity ==
+                            resource.canonical_identity;
+                    });
+                if (identity == current_tab_state_.tabs.end() ||
+                    resource.registration_id == 0 ||
+                    resource.canonical_source == nullptr) {
+                    return RuntimeContractFailure();
+                }
+                resource.identity = *identity;
+                current_tab_state_.subscriptions.subscriptions.push_back({
+                    *identity,
+                    resource.registration_id,
+                });
+            }
+            if (current_tab_state_.subscriptions.subscriptions.size() !=
+                current_tab_state_.tabs.size()) {
+                return RuntimeContractFailure();
+            }
+        } catch (const std::bad_alloc&) {
+            return RuntimeTransportFailure(E_OUTOFMEMORY);
+        }
+        return RuntimeSuccessOperation();
+    }
+
+    ObserverOperationResult RefreshCurrentTabState(
+        const ObservedEventKind wakeKind,
+        const LONG lifecycleCookie,
+        ObserverCurrentReconcileOutcome* const output) {
+        if (output == nullptr) {
+            return RuntimeContractFailure(
+                E_INVALIDARG, ERROR_INVALID_PARAMETER);
+        }
+        std::vector<ExplorerWindowRecord> windows;
+        ObserverOperationResult enumerated =
+            shell_operations_.enumerate_windows(&windows);
+        if (!enumerated.ok()) {
+            return enumerated;
+        }
+        std::vector<HWND> targets;
+        try {
+            targets.reserve(windows.size());
+            for (const ExplorerWindowRecord& window : windows) {
+                if (window.hwnd == nullptr || window.process_id == 0 ||
+                    window.thread_id == 0 ||
+                    std::find(targets.begin(), targets.end(), window.hwnd) !=
+                        targets.end()) {
+                    return RuntimeContractFailure();
+                }
+                targets.push_back(window.hwnd);
+            }
+        } catch (const std::bad_alloc&) {
+            return RuntimeTransportFailure(E_OUTOFMEMORY);
+        }
+
+        std::vector<ObserverTopLevelTabOrder> orders;
+        ObserverOperationResult capturedOrders =
+            CaptureCurrentTabOrders(targets, &orders);
+        if (!capturedOrders.ok()) {
+            return capturedOrders;
+        }
+
+        ObserverShellStaCapture refreshedCapture{};
+        if (!targets.empty()) {
+            ObserverOperationResult captured = shell_operations_.capture(
+                shell_graph_.shell_windows.Get(), targets, &refreshedCapture);
+            if (!captured.ok()) {
+                return captured;
+            }
+        }
+        std::vector<ObserverShellEntryMetadata> metadata;
+        try {
+            metadata.reserve(refreshedCapture.browsers.size());
+            for (const ObserverShellStaCapturedBrowser& browser :
+                 refreshedCapture.browsers) {
+                if (browser.metadata.canonical_identity == 0 ||
+                    browser.metadata.top_level == nullptr ||
+                    browser.canonical_identity == nullptr ||
+                    browser.browser == nullptr ||
+                    browser.metadata.target_matched !=
+                        (browser.metadata.shell_tab != nullptr) ||
+                    reinterpret_cast<std::uintptr_t>(
+                        browser.canonical_identity.Get()) !=
+                        browser.metadata.canonical_identity) {
+                    return RuntimeContractFailure();
+                }
+                metadata.push_back(browser.metadata);
+            }
+            shell_graph_.browser_resources.reserve(
+                shell_graph_.browser_resources.size() + metadata.size());
+            shell_graph_.startup_state.browser_registrations.reserve(
+                shell_graph_.startup_state.browser_registrations.size() +
+                metadata.size());
+        } catch (const std::bad_alloc&) {
+            return RuntimeTransportFailure(E_OUTOFMEMORY);
+        }
+
+        const auto findSource = [&](const ObserverTabIdentity& identity)
+            -> const ObserverShellStaCapturedBrowser* {
+            const auto findIn = [&](const auto& browsers)
+                -> const ObserverShellStaCapturedBrowser* {
+                const auto found = std::find_if(
+                    browsers.begin(),
+                    browsers.end(),
+                    [&](const ObserverShellStaCapturedBrowser& browser) {
+                        return browser.metadata.canonical_identity ==
+                            identity.canonical_identity &&
+                            browser.metadata.top_level == identity.top_level &&
+                            browser.metadata.shell_tab == identity.shell_tab;
+                    });
+                return found == browsers.end() ? nullptr : &*found;
+            };
+            const ObserverShellStaCapturedBrowser* source =
+                findIn(refreshedCapture.browsers);
+            return source != nullptr
+                ? source
+                : findIn(shell_graph_.captured_browsers);
+        };
+
+        const ObserverCurrentReconcileOperations operations{
+            [&](ObserverCurrentTabCapture* const capture) {
+                if (capture == nullptr || !capture->shell_entries.empty() ||
+                    !capture->orders.empty()) {
+                    return RuntimeContractFailure(
+                        E_INVALIDARG, ERROR_INVALID_PARAMETER);
+                }
+                try {
+                    capture->shell_entries = metadata;
+                    capture->orders = orders;
+                } catch (const std::bad_alloc&) {
+                    return RuntimeTransportFailure(E_OUTOFMEMORY);
+                }
+                return RuntimeSuccessOperation();
+            },
+            {
+                [&](const ObserverTabIdentity& identity,
+                    const std::uint64_t registrationId) {
+                    const ObserverShellStaCapturedBrowser* source =
+                        findSource(identity);
+                    if (source == nullptr || source->canonical_identity == nullptr ||
+                        source->browser == nullptr || registrationId == 0) {
+                        return RuntimeContractFailure();
+                    }
+                    Microsoft::WRL::ComPtr<IDispatch> sink;
+                    ObserverOperationResult created =
+                        shell_operations_.create_browser_sink(
+                            queue_,
+                            source->canonical_identity.Get(),
+                            identity.top_level,
+                            identity.top_level_generation,
+                            identity.shell_tab,
+                            sink);
+                    if (!created.ok() || sink == nullptr) {
+                        return created.ok()
+                            ? RuntimeContractFailure()
+                            : created;
+                    }
+                    ObserverShellStaBrowserResource resource{
+                        registrationId,
+                        identity.canonical_identity,
+                        source->browser,
+                        {},
+                        identity,
+                        source->canonical_identity,
+                    };
+                    ObserverOperationResult advised = shell_operations_.advise(
+                        resource.browser.Get(),
+                        DIID_DWebBrowserEvents2,
+                        sink.Get(),
+                        &resource.connection);
+                    if (!advised.ok()) {
+                        return advised;
+                    }
+                    if (resource.connection.connection_point == nullptr ||
+                        resource.connection.sink == nullptr ||
+                        resource.connection.subscription_cookie == 0 ||
+                        resource.connection.owner_thread_id !=
+                            shell_graph_.owner_thread_id) {
+                        return RuntimeContractFailure();
+                    }
+                    shell_graph_.browser_resources.push_back(
+                        std::move(resource));
+                    shell_graph_.startup_state.browser_registrations.push_back({
+                        identity.canonical_identity,
+                        registrationId,
+                    });
+                    return RuntimeSuccessOperation();
+                },
+                [&](const std::uint64_t registrationId) {
+                    const auto resource = std::find_if(
+                        shell_graph_.browser_resources.begin(),
+                        shell_graph_.browser_resources.end(),
+                        [registrationId](
+                            const ObserverShellStaBrowserResource& candidate) {
+                            return candidate.registration_id == registrationId;
+                        });
+                    const auto registration = std::find_if(
+                        shell_graph_.startup_state.browser_registrations.begin(),
+                        shell_graph_.startup_state.browser_registrations.end(),
+                        [registrationId](
+                            const ObserverShellBrowserRegistration& candidate) {
+                            return candidate.registration_id == registrationId;
+                        });
+                    if (resource == shell_graph_.browser_resources.end() ||
+                        registration ==
+                            shell_graph_.startup_state.browser_registrations.end()) {
+                        return RuntimeContractFailure();
+                    }
+                    ObserverOperationResult unadvised =
+                        shell_operations_.unadvise(&resource->connection);
+                    if (!unadvised.ok()) {
+                        return unadvised;
+                    }
+                    shell_graph_.browser_resources.erase(resource);
+                    shell_graph_.startup_state.browser_registrations.erase(
+                        registration);
+                    return RuntimeSuccessOperation();
+                },
+            },
+        };
+        const Status reconciled = ReconcileObserverCurrentTabState(
+            wakeKind,
+            lifecycleCookie,
+            operations,
+            &current_tab_state_,
+            output);
+        if (!reconciled.ok()) {
+            return RuntimeOperationFromStatus(reconciled);
+        }
+        shell_graph_.target_top_levels = std::move(targets);
+        shell_graph_.browser_set = std::move(refreshedCapture.browser_set);
+        shell_graph_.captured_browsers = std::move(refreshedCapture.browsers);
+        shell_graph_.next_registration_id =
+            current_tab_state_.subscriptions.next_registration_id;
+        current_shell_metadata_ = std::move(metadata);
         return RuntimeSuccessOperation();
     }
 
@@ -1410,10 +1017,9 @@ private:
     ObserverUiaMtaWorker uia_worker_;
     bool uia_started_ = false;
     std::vector<ObserverShellEntryMetadata> current_shell_metadata_;
+    ObserverCurrentTabState current_tab_state_{};
     std::map<HWND, std::uint64_t> active_generations_;
     std::map<HWND, std::uint64_t> latest_generations_;
-    std::map<HWND, std::uint64_t> closing_generations_;
-    std::map<LONG, ObserverShellEntryMetadata> registered_shell_entries_;
     std::map<std::uintptr_t, ObserverShellEntryMetadata>
         initial_shell_entries_;
     std::vector<ObserverUiaTarget> uia_targets_;

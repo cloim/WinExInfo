@@ -123,10 +123,9 @@ Status ReconcileObserverTabSet(
                 return ContractFailure();
             }
             if (tab.visible) {
-                if (active != nullptr) {
-                    return ContractFailure();
+                if (active == nullptr) {
+                    active = tab.shell_tab;
                 }
-                active = tab.shell_tab;
             }
         }
         if (active == nullptr) {

@@ -3,6 +3,7 @@
 #include "probe/observer_runtime.h"
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -23,6 +24,33 @@ winexinfo::ObserverTabIdentity Identity(
         Handle(shellTab),
         1,
         tabGeneration,
+    };
+}
+
+winexinfo::ObserverShellEntryMetadata Target(
+    const std::uintptr_t canonicalIdentity,
+    const std::uintptr_t topLevel,
+    const std::uintptr_t shellTab) {
+    return {
+        canonicalIdentity,
+        true,
+        Handle(topLevel),
+        Handle(shellTab),
+    };
+}
+
+winexinfo::ObserverTopLevelTabOrder Order(
+    const std::uintptr_t topLevel,
+    const std::initializer_list<winexinfo::ObserverOrderedTab> tabs) {
+    return {Handle(topLevel), std::vector<winexinfo::ObserverOrderedTab>{tabs}};
+}
+
+winexinfo::ObserverTabGenerationState Generations(
+    const std::initializer_list<std::pair<const HWND, std::uint64_t>> topLevels,
+    const std::initializer_list<std::pair<const HWND, std::uint64_t>> tabs) {
+    return {
+        std::map<HWND, std::uint64_t>{topLevels},
+        std::map<HWND, std::uint64_t>{tabs},
     };
 }
 
@@ -208,4 +236,124 @@ WXI_TEST(
     WXI_REQUIRE_EQ(outcome.rollback.failure_origin, winexinfo::ObserverFailureOrigin::Transport);
     WXI_REQUIRE(outcome.rollback.any_transport_failure);
     WXI_REQUIRE_EQ(outcome.rollback.status.hresult, E_OUTOFMEMORY);
+}
+
+WXI_TEST(
+    observer_shell_reconcile_uses_every_event_kind_as_the_same_wake_signal,
+    "observer_shell_reconcile.wake_signals") {
+    const std::vector kinds{
+        winexinfo::ObservedEventKind::WindowRegistered,
+        winexinfo::ObservedEventKind::WindowRevoked,
+        winexinfo::ObservedEventKind::NavigateComplete2,
+        winexinfo::ObservedEventKind::TabSelected,
+        winexinfo::ObservedEventKind::TabStructureChanged,
+    };
+    for (const winexinfo::ObservedEventKind kind : kinds) {
+        winexinfo::ObserverCurrentTabState state{};
+        std::size_t captureCalls = 0;
+        std::size_t subscribeCalls = 0;
+        const winexinfo::ObserverCurrentReconcileOperations operations{
+            [&](winexinfo::ObserverCurrentTabCapture* output) {
+                ++captureCalls;
+                output->shell_entries = {Target(11, 0x100, 0x101)};
+                output->orders = {Order(0x100, {{Handle(0x101), true}})};
+                return Success();
+            },
+            {
+                [&](const winexinfo::ObserverTabIdentity&, std::uint64_t) {
+                    ++subscribeCalls;
+                    return Success();
+                },
+                [](std::uint64_t) { return Success(); },
+            },
+        };
+        winexinfo::ObserverCurrentReconcileOutcome outcome{};
+        WXI_REQUIRE(winexinfo::ReconcileObserverCurrentTabState(
+                        kind, 987654, operations, &state, &outcome)
+                        .ok());
+        WXI_REQUIRE_EQ(captureCalls, std::size_t{1});
+        WXI_REQUIRE_EQ(subscribeCalls, std::size_t{1});
+        WXI_REQUIRE_EQ(state.tabs.size(), std::size_t{1});
+        WXI_REQUIRE_EQ(state.tabs[0].canonical_identity, std::uintptr_t{11});
+    }
+}
+
+WXI_TEST(
+    observer_shell_reconcile_cookie_does_not_select_the_changed_tab,
+    "observer_shell_reconcile.cookie_diagnostic_only") {
+    const auto run = [](const LONG cookie) {
+        winexinfo::ObserverCurrentTabState state{};
+        const winexinfo::ObserverCurrentReconcileOperations operations{
+            [](winexinfo::ObserverCurrentTabCapture* output) {
+                output->shell_entries = {
+                    Target(11, 0x100, 0x101),
+                    Target(22, 0x100, 0x102),
+                };
+                output->orders = {Order(
+                    0x100,
+                    {{Handle(0x101), true}, {Handle(0x102), false}})};
+                return Success();
+            },
+            {
+                [](const winexinfo::ObserverTabIdentity&, std::uint64_t) {
+                    return Success();
+                },
+                [](std::uint64_t) { return Success(); },
+            },
+        };
+        winexinfo::ObserverCurrentReconcileOutcome outcome{};
+        WXI_REQUIRE(winexinfo::ReconcileObserverCurrentTabState(
+                        winexinfo::ObservedEventKind::WindowRegistered,
+                        cookie,
+                        operations,
+                        &state,
+                        &outcome)
+                        .ok());
+        return state;
+    };
+
+    WXI_REQUIRE_EQ(run(1), run(2147483647));
+}
+
+WXI_TEST(
+    observer_shell_reconcile_does_not_commit_tab_state_on_subscription_failure,
+    "observer_shell_reconcile.wake_failure") {
+    winexinfo::ObserverCurrentTabState state{};
+    state.tabs = {Identity(11, 0x101)};
+    state.generations = Generations(
+        {{Handle(0x100), 1}},
+        {{Handle(0x101), 1}});
+    state.subscriptions = State({{Identity(11, 0x101), 10}}, 11);
+    const auto original = state;
+    const winexinfo::ObserverCurrentReconcileOperations operations{
+        [](winexinfo::ObserverCurrentTabCapture* output) {
+            output->shell_entries = {
+                Target(11, 0x100, 0x101),
+                Target(22, 0x100, 0x102),
+            };
+            output->orders = {Order(
+                0x100,
+                {{Handle(0x101), true}, {Handle(0x102), false}})};
+            return Success();
+        },
+        {
+            [](const winexinfo::ObserverTabIdentity&, std::uint64_t) {
+                return TransportFailure();
+            },
+            [](std::uint64_t) { return Success(); },
+        },
+    };
+    winexinfo::ObserverCurrentReconcileOutcome outcome{};
+
+    WXI_REQUIRE(!winexinfo::ReconcileObserverCurrentTabState(
+                     winexinfo::ObservedEventKind::TabStructureChanged,
+                     0,
+                     operations,
+                     &state,
+                     &outcome)
+                     .ok());
+    WXI_REQUIRE_EQ(state.tabs, original.tabs);
+    WXI_REQUIRE_EQ(state.generations, original.generations);
+    WXI_REQUIRE_EQ(state.subscriptions.subscriptions, original.subscriptions.subscriptions);
+    WXI_REQUIRE_EQ(state.subscriptions.next_registration_id, std::uint64_t{12});
 }
