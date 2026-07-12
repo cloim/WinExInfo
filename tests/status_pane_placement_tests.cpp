@@ -442,6 +442,168 @@ WXI_TEST(status_pane_parent_subclass_install_failure_recovers, "status_pane.plac
     WXI_REQUIRE_EQ(installs, 2);
 }
 
+WXI_TEST(status_pane_parent_destroy_shelters_before_default, "status_pane.placement.parent_destroy_shelter") {
+    PlacementRecorder recorder;
+    winexinfo::hook::RuntimeSignalSourceState source{recorder.parent, false};
+    std::vector<std::string> order;
+    int wakes = 0;
+    const winexinfo::hook::RuntimeParentDestroyContext context{
+        true,
+        recorder.pid,
+        recorder.tid,
+        recorder.top,
+        recorder.pane,
+        recorder.parent,
+        &source,
+    };
+    const winexinfo::hook::RuntimeParentDestroyOperations operations{
+        [&](const HWND window, DWORD* const process) {
+            *process = recorder.pid;
+            return window == recorder.pane || window == recorder.parent ||
+                    window == recorder.top
+                ? recorder.tid
+                : DWORD{0};
+        },
+        [&](const HWND window, std::wstring* const name) {
+            *name = window == recorder.pane
+                ? std::wstring{winexinfo::hook::kStatusPaneClassName}
+                : window == recorder.top ? L"CabinetWClass" : L"DUIViewWndClassName";
+            return Success();
+        },
+        [&](const HWND window) {
+            return window == recorder.pane ? recorder.parent : HWND{nullptr};
+        },
+        [&](const HWND window) { return window == recorder.top ? recorder.top : recorder.top; },
+        [&](const HWND pane, const HWND parent) {
+            WXI_REQUIRE_EQ(pane, recorder.pane);
+            WXI_REQUIRE_EQ(parent, recorder.top);
+            order.emplace_back("set_parent");
+            return Success();
+        },
+        [&](const HWND pane, const HWND after, int, int, int, int, const UINT flags) {
+            WXI_REQUIRE_EQ(pane, recorder.pane);
+            WXI_REQUIRE_EQ(after, HWND_TOP);
+            WXI_REQUIRE_EQ(
+                flags,
+                UINT{SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_HIDEWINDOW});
+            order.emplace_back("hide");
+            return Success();
+        },
+    };
+    WXI_REQUIRE_EQ(
+        winexinfo::hook::ProcessRuntimeParentDestroy(
+            context,
+            operations,
+            [&] {
+                WXI_REQUIRE_EQ(source.parent, nullptr);
+                ++wakes;
+                order.emplace_back("signal");
+                return Success();
+            },
+            [&] {
+                order.emplace_back("default");
+                return LRESULT{77};
+            }),
+        LRESULT{77});
+    WXI_REQUIRE_EQ(
+        order,
+        (std::vector<std::string>{"set_parent", "hide", "signal", "default"}));
+    WXI_REQUIRE_EQ(source.parent, nullptr);
+    WXI_REQUIRE(!source.lifecycle_failed);
+    WXI_REQUIRE_EQ(wakes, 1);
+    WXI_REQUIRE(winexinfo::hook::RuntimeSignalCleanupSafe(source));
+
+    const HWND restored = reinterpret_cast<HWND>(std::uintptr_t{0x730});
+    const winexinfo::hook::RuntimeSignalSubclassOperations sourceOperations{
+        [](HWND) { return Success(); },
+        [&](const HWND parent) {
+            WXI_REQUIRE_EQ(parent, restored);
+            return Success();
+        },
+    };
+    WXI_REQUIRE(winexinfo::hook::UpdateRuntimeSignalParent(
+                    &source, restored, sourceOperations)
+                    .ok());
+    WXI_REQUIRE_EQ(source.parent, restored);
+    recorder.parent = restored;
+    recorder.calls.clear();
+    WXI_REQUIRE(winexinfo::hook::ApplyStatusPanePlacementWithOperations(
+                    recorder.pane,
+                    restored,
+                    RECT{0, 0, 200, 30},
+                    true,
+                    recorder.Operations())
+                    .ok());
+    WXI_REQUIRE(!recorder.calls.empty());
+}
+
+WXI_TEST(status_pane_parent_destroy_ignores_untrusted_or_stopping, "status_pane.placement.parent_destroy_rejections") {
+    PlacementRecorder recorder;
+    const auto run = [&](const bool active, const HWND messageWindow) {
+        winexinfo::hook::RuntimeSignalSourceState source{recorder.parent, false};
+        int mutations = 0;
+        int wakes = 0;
+        const winexinfo::hook::RuntimeParentDestroyOperations operations{
+            [&](HWND, DWORD* process) { *process = recorder.pid; return recorder.tid; },
+            [&](HWND, std::wstring* name) { *name = L"unused"; return Success(); },
+            [&](HWND) { return recorder.parent; },
+            [&](HWND) { return recorder.top; },
+            [&](HWND, HWND) { ++mutations; return Success(); },
+            [&](HWND, HWND, int, int, int, int, UINT) { ++mutations; return Success(); },
+        };
+        WXI_REQUIRE_EQ(
+            winexinfo::hook::ProcessRuntimeParentDestroy(
+                {active, recorder.pid, recorder.tid, recorder.top, recorder.pane,
+                 messageWindow, &source},
+                operations,
+                [&] { ++wakes; return Success(); },
+                [] { return LRESULT{88}; }),
+            LRESULT{88});
+        WXI_REQUIRE_EQ(mutations, 0);
+        WXI_REQUIRE_EQ(wakes, 0);
+        WXI_REQUIRE_EQ(source.parent, recorder.parent);
+    };
+    run(false, recorder.parent);
+    run(true, recorder.top);
+    run(true, reinterpret_cast<HWND>(std::uintptr_t{0x799}));
+}
+
+WXI_TEST(status_pane_parent_destroy_failure_blocks_cleanup_ack, "status_pane.placement.parent_destroy_failure") {
+    PlacementRecorder recorder;
+    for (const bool failHide : {false, true}) {
+        winexinfo::hook::RuntimeSignalSourceState source{recorder.parent, false};
+        int wakes = 0;
+        const winexinfo::hook::RuntimeParentDestroyOperations operations{
+            [&](HWND, DWORD* process) { *process = recorder.pid; return recorder.tid; },
+            [&](const HWND window, std::wstring* name) {
+                *name = window == recorder.pane
+                    ? std::wstring{winexinfo::hook::kStatusPaneClassName}
+                    : window == recorder.top ? L"CabinetWClass" : L"DUIViewWndClassName";
+                return Success();
+            },
+            [&](const HWND window) { return window == recorder.pane ? recorder.parent : HWND{nullptr}; },
+            [&](HWND) { return recorder.top; },
+            [&](HWND, HWND) {
+                return failHide ? Success() : winexinfo::Status{
+                    winexinfo::ErrorCode::WINDOW_ATTACH_FAILED, E_FAIL, ERROR_INVALID_STATE};
+            },
+            [&](HWND, HWND, int, int, int, int, UINT) {
+                return winexinfo::Status{
+                    winexinfo::ErrorCode::WINDOW_ATTACH_FAILED, E_FAIL, ERROR_INVALID_STATE};
+            },
+        };
+        static_cast<void>(winexinfo::hook::ProcessRuntimeParentDestroy(
+            {true, recorder.pid, recorder.tid, recorder.top, recorder.pane,
+             recorder.parent, &source},
+            operations,
+            [&] { ++wakes; return Success(); },
+            [] { return LRESULT{0}; }));
+        WXI_REQUIRE(source.lifecycle_failed);
+        WXI_REQUIRE(!winexinfo::hook::RuntimeSignalCleanupSafe(source));
+        WXI_REQUIRE_EQ(wakes, 0);
+    }
+}
+
 WXI_TEST(status_pane_placement_cleanup_removes_subclass_first, "status_pane.placement.lifetime") {
     const HWND paneWindow = reinterpret_cast<HWND>(std::uintptr_t{0x400});
     std::vector<std::string> calls;

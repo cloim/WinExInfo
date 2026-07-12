@@ -36,6 +36,7 @@ public:
     [[nodiscard]] Status Signal(const std::function<Status()>& setEvent) noexcept;
     [[nodiscard]] Status SignalEvent(HANDLE event) noexcept;
     [[nodiscard]] bool Consume() noexcept;
+    [[nodiscard]] bool enabled() const noexcept;
 
 private:
     std::atomic<bool> enabled_{false};
@@ -73,7 +74,35 @@ private:
 struct RuntimeSignalSourceState final {
     HWND parent = nullptr;
     bool lifecycle_failed = false;
+    bool cleanup_blocked = false;
 };
+
+struct RuntimeParentDestroyContext final {
+    bool active = false;
+    DWORD process_id = 0;
+    DWORD thread_id = 0;
+    HWND target = nullptr;
+    HWND pane = nullptr;
+    HWND message_window = nullptr;
+    RuntimeSignalSourceState* signal_source = nullptr;
+};
+
+struct RuntimeParentDestroyOperations final {
+    std::function<DWORD(HWND, DWORD*)> get_window_thread_process_id;
+    std::function<Status(HWND, std::wstring*)> get_class_name;
+    std::function<HWND(HWND)> get_parent;
+    std::function<HWND(HWND)> get_root;
+    std::function<Status(HWND, HWND)> set_parent;
+    std::function<Status(HWND, HWND, int, int, int, int, UINT)> set_window_pos;
+};
+
+[[nodiscard]] LRESULT ProcessRuntimeParentDestroy(
+    const RuntimeParentDestroyContext& context,
+    const RuntimeParentDestroyOperations& operations,
+    const std::function<Status()>& signalRefresh,
+    const std::function<LRESULT()>& callDefault);
+[[nodiscard]] bool RuntimeSignalCleanupSafe(
+    const RuntimeSignalSourceState& state) noexcept;
 
 struct RuntimeSignalSubclassOperations final {
     std::function<Status(HWND)> remove;

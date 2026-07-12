@@ -50,7 +50,6 @@ struct RuntimeContext final {
     StatusPane pane{};
     StatusPaneRefreshCoordinator refresh;
     RuntimeSignalSourceState signal_source;
-    bool top_signal_installed = false;
     HookRuntimeRefreshIngress ingress;
     HookRuntimeStateMachine state;
 };
@@ -80,7 +79,36 @@ LRESULT CALLBACK RuntimeParentSubclassProc(
     const DWORD_PTR reference) {
     auto* const context = reinterpret_cast<RuntimeContext*>(reference);
     if (id == kRuntimeParentSubclassId && context != nullptr &&
-        (window == context->target || window == context->signal_source.parent) &&
+        message == WM_DESTROY) {
+        const StatusPanePlacementOperations placement =
+            CreateProductionStatusPanePlacementOperations();
+        return ProcessRuntimeParentDestroy(
+            {
+                context->ingress.enabled(),
+                context->pid,
+                context->tid,
+                context->target,
+                context->pane.hwnd,
+                window,
+                &context->signal_source,
+            },
+            {
+                placement.get_window_thread_process_id,
+                placement.get_class_name,
+                placement.get_parent,
+                [](const HWND candidate) { return GetAncestor(candidate, GA_ROOT); },
+                placement.set_parent,
+                placement.set_window_pos,
+            },
+            [context] {
+                return context->ingress.SignalEvent(context->refresh_event.get());
+            },
+            [window, message, wparam, lparam] {
+                return DefSubclassProc(window, message, wparam, lparam);
+            });
+    }
+    if (id == kRuntimeParentSubclassId && context != nullptr &&
+        window == context->signal_source.parent &&
         (message == WM_SIZE || message == WM_DPICHANGED ||
          message == WM_THEMECHANGED || message == WM_SHOWWINDOW ||
          message == WM_WINDOWPOSCHANGED)) {
@@ -283,6 +311,9 @@ bool HandleStatusPaneRuntimeMessage(
         return false;
     }
     if (message == kStatusPaneRuntimeCleanupMessage) {
+        if (!RuntimeSignalCleanupSafe(context->signal_source)) {
+            return true;
+        }
         if (context->signal_source.parent != nullptr) {
             if (RemoveWindowSubclass(
                     context->signal_source.parent,
@@ -291,15 +322,6 @@ bool HandleStatusPaneRuntimeMessage(
                 return true;
             }
             context->signal_source.parent = nullptr;
-        }
-        if (context->top_signal_installed) {
-            if (RemoveWindowSubclass(
-                    context->target,
-                    RuntimeParentSubclassProc,
-                    kRuntimeParentSubclassId) == FALSE) {
-                return true;
-            }
-            context->top_signal_installed = false;
         }
         static_cast<void>(SetEvent(context->parent_cleanup_ack.get()));
         return true;
@@ -441,6 +463,10 @@ Status HookRuntimeRefreshIngress::SignalEvent(const HANDLE event) noexcept {
 
 bool HookRuntimeRefreshIngress::Consume() noexcept {
     return pending_.exchange(false, std::memory_order_acq_rel);
+}
+
+bool HookRuntimeRefreshIngress::enabled() const noexcept {
+    return enabled_.load(std::memory_order_acquire);
 }
 
 Status StatusPaneRefreshCoordinator::Signal(
@@ -626,6 +652,80 @@ Status UpdateRuntimeSignalParent(
     state->parent = parent;
     state->lifecycle_failed = false;
     return Success();
+}
+
+LRESULT ProcessRuntimeParentDestroy(
+    const RuntimeParentDestroyContext& context,
+    const RuntimeParentDestroyOperations& operations,
+    const std::function<Status()>& signalRefresh,
+    const std::function<LRESULT()>& callDefault) {
+    if (!callDefault) {
+        return 0;
+    }
+    RuntimeSignalSourceState* const source = context.signal_source;
+    if (!context.active || source == nullptr || context.target == nullptr ||
+        context.pane == nullptr || context.message_window == nullptr ||
+        context.message_window == context.target ||
+        context.message_window != source->parent) {
+        return callDefault();
+    }
+    const auto fail = [&] {
+        source->lifecycle_failed = true;
+        source->cleanup_blocked = true;
+        return callDefault();
+    };
+    if (context.process_id == 0 || context.thread_id == 0 ||
+        !operations.get_window_thread_process_id || !operations.get_class_name ||
+        !operations.get_parent || !operations.get_root || !operations.set_parent ||
+        !operations.set_window_pos || !signalRefresh) {
+        return fail();
+    }
+    const auto exactWindow = [&](const HWND window, const std::wstring_view expected) {
+        DWORD process = 0;
+        if (operations.get_window_thread_process_id(window, &process) !=
+                context.thread_id ||
+            process != context.process_id) {
+            return false;
+        }
+        std::wstring className;
+        return operations.get_class_name(window, &className).ok() &&
+            className == expected;
+    };
+    if (!exactWindow(context.pane, kStatusPaneClassName) ||
+        !exactWindow(context.target, L"CabinetWClass") ||
+        !exactWindow(context.message_window, kStatusPaneParentClassName) ||
+        operations.get_root(context.target) != context.target ||
+        operations.get_root(context.message_window) != context.target ||
+        operations.get_parent(context.pane) != context.message_window) {
+        return fail();
+    }
+    Status status = operations.set_parent(context.pane, context.target);
+    if (!status.ok()) {
+        return fail();
+    }
+    status = operations.set_window_pos(
+        context.pane,
+        HWND_TOP,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_HIDEWINDOW);
+    source->parent = nullptr;
+    if (!status.ok()) {
+        return fail();
+    }
+    source->lifecycle_failed = false;
+    status = signalRefresh();
+    if (!status.ok()) {
+        return fail();
+    }
+    return callDefault();
+}
+
+bool RuntimeSignalCleanupSafe(
+    const RuntimeSignalSourceState& state) noexcept {
+    return !state.lifecycle_failed && !state.cleanup_blocked;
 }
 
 bool ShouldNotifyHookRuntimeWindowMessage(
@@ -865,40 +965,10 @@ Status BeginHookRuntimeAttach(
         }
         return ContractFailure();
     }
-    if (SetWindowSubclass(
-            target,
-            RuntimeParentSubclassProc,
-            kRuntimeParentSubclassId,
-            reinterpret_cast<DWORD_PTR>(context.get())) == FALSE) {
-        const DWORD error = GetLastError();
-        status = CleanupRuntimeRollback(
-            RuntimeRollbackPath::WorkerCreation,
-            CreateProductionStatusPaneOperations(
-                g_hook_module, context->cleanup_ack.get()),
-            &context->pane,
-            [moduleReference] { FreeLibrary(moduleReference); });
-        if (!status.ok()) {
-            context.release();
-        } else {
-            g_runtime.store(nullptr, std::memory_order_release);
-        }
-        return {ErrorCode::DLL_INITIALIZATION_FAILED,
-                HRESULT_FROM_WIN32(error), error};
-    }
-    context->top_signal_installed = true;
     const HANDLE worker = CreateThread(
         nullptr, 0, RuntimeWorker, context.get(), 0, nullptr);
     if (worker == nullptr) {
         const DWORD error = GetLastError();
-        if (RemoveWindowSubclass(
-                target,
-                RuntimeParentSubclassProc,
-                kRuntimeParentSubclassId) == FALSE) {
-            context.release();
-            return {ErrorCode::DLL_INITIALIZATION_FAILED,
-                    HRESULT_FROM_WIN32(error), error};
-        }
-        context->top_signal_installed = false;
         status = CleanupRuntimeRollback(
             RuntimeRollbackPath::WorkerCreation,
             CreateProductionStatusPaneOperations(
