@@ -49,7 +49,8 @@ struct RuntimeContext final {
     UniqueHandle parent_cleanup_ack;
     StatusPane pane{};
     StatusPaneRefreshCoordinator refresh;
-    HWND refresh_parent = nullptr;
+    RuntimeSignalSourceState signal_source;
+    bool top_signal_installed = false;
     HookRuntimeStateMachine state;
 };
 
@@ -78,6 +79,7 @@ LRESULT CALLBACK RuntimeParentSubclassProc(
     const DWORD_PTR reference) {
     auto* const context = reinterpret_cast<RuntimeContext*>(reference);
     if (id == kRuntimeParentSubclassId && context != nullptr &&
+        (window == context->target || window == context->signal_source.parent) &&
         (message == WM_SIZE || message == WM_DPICHANGED ||
          message == WM_THEMECHANGED || message == WM_SHOWWINDOW)) {
         static_cast<void>(context->refresh.Signal(
@@ -89,26 +91,28 @@ LRESULT CALLBACK RuntimeParentSubclassProc(
 Status UpdateRuntimeParentSubclass(
     RuntimeContext* const context,
     const HWND parent) {
-    if (context->refresh_parent == parent) {
-        return Success();
-    }
-    if (context->refresh_parent != nullptr &&
-        RemoveWindowSubclass(
-            context->refresh_parent,
-            RuntimeParentSubclassProc,
-            kRuntimeParentSubclassId) == FALSE) {
-        return PlacementFailure(GetLastError());
-    }
-    context->refresh_parent = nullptr;
-    if (SetWindowSubclass(
-            parent,
-            RuntimeParentSubclassProc,
-            kRuntimeParentSubclassId,
-            reinterpret_cast<DWORD_PTR>(context)) == FALSE) {
-        return PlacementFailure(GetLastError());
-    }
-    context->refresh_parent = parent;
-    return Success();
+    return UpdateRuntimeSignalParent(
+        &context->signal_source,
+        parent,
+        {
+            [](const HWND window) {
+                return RemoveWindowSubclass(
+                           window,
+                           RuntimeParentSubclassProc,
+                           kRuntimeParentSubclassId) != FALSE
+                    ? Success()
+                    : PlacementFailure(GetLastError());
+            },
+            [context](const HWND window) {
+                return SetWindowSubclass(
+                           window,
+                           RuntimeParentSubclassProc,
+                           kRuntimeParentSubclassId,
+                           reinterpret_cast<DWORD_PTR>(context)) != FALSE
+                    ? Success()
+                    : PlacementFailure(GetLastError());
+            },
+        });
 }
 
 DWORD WINAPI RefreshWorker(void* const parameter) {
@@ -136,6 +140,9 @@ DWORD WINAPI RefreshWorker(void* const parameter) {
                 [](const HWND pane, const UINT message) {
                     return PostRuntimeMessage(pane, message);
                 }));
+        } else {
+            static_cast<void>(context->refresh.CaptureFailed(
+                [context] { return WakeRefreshWorker(context); }));
         }
     }
     return 0;
@@ -263,14 +270,23 @@ bool HandleStatusPaneRuntimeMessage(
         return false;
     }
     if (message == kStatusPaneRuntimeCleanupMessage) {
-        if (context->refresh_parent != nullptr) {
+        if (context->signal_source.parent != nullptr) {
             if (RemoveWindowSubclass(
-                    context->refresh_parent,
+                    context->signal_source.parent,
                     RuntimeParentSubclassProc,
                     kRuntimeParentSubclassId) == FALSE) {
                 return true;
             }
-            context->refresh_parent = nullptr;
+            context->signal_source.parent = nullptr;
+        }
+        if (context->top_signal_installed) {
+            if (RemoveWindowSubclass(
+                    context->target,
+                    RuntimeParentSubclassProc,
+                    kRuntimeParentSubclassId) == FALSE) {
+                return true;
+            }
+            context->top_signal_installed = false;
         }
         static_cast<void>(SetEvent(context->parent_cleanup_ack.get()));
         return true;
@@ -279,13 +295,13 @@ bool HandleStatusPaneRuntimeMessage(
         return false;
     }
     StatusPanePlacementResult result{};
-    if (!context->refresh.Consume(
-            &result, [context] { return WakeRefreshWorker(context); })) {
+    if (!context->refresh.Consume(&result)) {
         return true;
     }
-    if (ApplyStatusPanePlacementResult(pane, result).ok()) {
-        static_cast<void>(UpdateRuntimeParentSubclass(context, result.parent));
-    }
+    const bool accepted = ApplyStatusPanePlacementResult(pane, result).ok() &&
+        UpdateRuntimeParentSubclass(context, result.parent).ok();
+    static_cast<void>(context->refresh.ApplyCompleted(
+        accepted, [context] { return WakeRefreshWorker(context); }));
     return true;
 }
 
@@ -374,6 +390,7 @@ Status StatusPaneRefreshCoordinator::Signal(
             return PlacementFailure(ERROR_INVALID_STATE);
         }
         dirty_ = true;
+        automatic_retry_used_ = false;
         if (worker_active_ || dispatch_pending_) {
             return Success();
         }
@@ -419,12 +436,10 @@ Status StatusPaneRefreshCoordinator::Publish(
 }
 
 bool StatusPaneRefreshCoordinator::Consume(
-    StatusPanePlacementResult* const result,
-    const std::function<Status()>& wakeWorker) {
-    if (result == nullptr || !wakeWorker) {
+    StatusPanePlacementResult* const result) {
+    if (result == nullptr) {
         return false;
     }
-    bool wake = false;
     {
         const std::scoped_lock lock{mutex_};
         if (stopped_ || !dispatch_pending_ || !result_) {
@@ -433,18 +448,78 @@ bool StatusPaneRefreshCoordinator::Consume(
         *result = *result_;
         result_.reset();
         dispatch_pending_ = false;
+        apply_pending_ = true;
+    }
+    return true;
+}
+
+Status StatusPaneRefreshCoordinator::CaptureFailed(
+    const std::function<Status()>& wakeWorker) {
+    if (!wakeWorker) {
+        return PlacementFailure(ERROR_INVALID_PARAMETER);
+    }
+    bool wake = false;
+    {
+        const std::scoped_lock lock{mutex_};
+        worker_active_ = false;
+        if (stopped_) {
+            return PlacementFailure(ERROR_INVALID_STATE);
+        }
         if (dirty_) {
             dirty_ = false;
             worker_active_ = true;
             wake = true;
         }
     }
-    if (wake && !wakeWorker().ok()) {
+    if (!wake) {
+        return Success();
+    }
+    const Status status = wakeWorker();
+    if (!status.ok()) {
         const std::scoped_lock lock{mutex_};
         worker_active_ = false;
         dirty_ = true;
     }
-    return true;
+    return status;
+}
+
+Status StatusPaneRefreshCoordinator::ApplyCompleted(
+    const bool accepted,
+    const std::function<Status()>& wakeWorker) {
+    if (!wakeWorker) {
+        return PlacementFailure(ERROR_INVALID_PARAMETER);
+    }
+    bool wake = false;
+    {
+        const std::scoped_lock lock{mutex_};
+        if (stopped_ || !apply_pending_) {
+            return PlacementFailure(ERROR_INVALID_STATE);
+        }
+        apply_pending_ = false;
+        if (accepted) {
+            automatic_retry_used_ = false;
+        }
+        if (dirty_) {
+            dirty_ = false;
+            worker_active_ = true;
+            automatic_retry_used_ = false;
+            wake = true;
+        } else if (!accepted && !automatic_retry_used_) {
+            automatic_retry_used_ = true;
+            worker_active_ = true;
+            wake = true;
+        }
+    }
+    if (!wake) {
+        return Success();
+    }
+    const Status status = wakeWorker();
+    if (!status.ok()) {
+        const std::scoped_lock lock{mutex_};
+        worker_active_ = false;
+        dirty_ = true;
+    }
+    return status;
 }
 
 void StatusPaneRefreshCoordinator::Stop() noexcept {
@@ -453,7 +528,37 @@ void StatusPaneRefreshCoordinator::Stop() noexcept {
     worker_active_ = false;
     dirty_ = false;
     dispatch_pending_ = false;
+    apply_pending_ = false;
     result_.reset();
+}
+
+Status UpdateRuntimeSignalParent(
+    RuntimeSignalSourceState* const state,
+    const HWND parent,
+    const RuntimeSignalSubclassOperations& operations) {
+    if (state == nullptr || parent == nullptr || !operations.remove ||
+        !operations.install) {
+        return PlacementFailure(ERROR_INVALID_PARAMETER);
+    }
+    if (state->parent == parent && !state->lifecycle_failed) {
+        return Success();
+    }
+    if (state->parent != nullptr) {
+        const Status removal = operations.remove(state->parent);
+        if (!removal.ok()) {
+            state->lifecycle_failed = true;
+            return removal;
+        }
+        state->parent = nullptr;
+    }
+    const Status install = operations.install(parent);
+    if (!install.ok()) {
+        state->lifecycle_failed = true;
+        return install;
+    }
+    state->parent = parent;
+    state->lifecycle_failed = false;
+    return Success();
 }
 
 std::size_t StatusPaneRefreshCoordinator::pending_results() const noexcept {
@@ -632,10 +737,40 @@ Status BeginHookRuntimeAttach(
         }
         return ContractFailure();
     }
+    if (SetWindowSubclass(
+            target,
+            RuntimeParentSubclassProc,
+            kRuntimeParentSubclassId,
+            reinterpret_cast<DWORD_PTR>(context.get())) == FALSE) {
+        const DWORD error = GetLastError();
+        status = CleanupRuntimeRollback(
+            RuntimeRollbackPath::WorkerCreation,
+            CreateProductionStatusPaneOperations(
+                g_hook_module, context->cleanup_ack.get()),
+            &context->pane,
+            [moduleReference] { FreeLibrary(moduleReference); });
+        if (!status.ok()) {
+            context.release();
+        } else {
+            g_runtime.store(nullptr, std::memory_order_release);
+        }
+        return {ErrorCode::DLL_INITIALIZATION_FAILED,
+                HRESULT_FROM_WIN32(error), error};
+    }
+    context->top_signal_installed = true;
     const HANDLE worker = CreateThread(
         nullptr, 0, RuntimeWorker, context.get(), 0, nullptr);
     if (worker == nullptr) {
         const DWORD error = GetLastError();
+        if (RemoveWindowSubclass(
+                target,
+                RuntimeParentSubclassProc,
+                kRuntimeParentSubclassId) == FALSE) {
+            context.release();
+            return {ErrorCode::DLL_INITIALIZATION_FAILED,
+                    HRESULT_FROM_WIN32(error), error};
+        }
+        context->top_signal_installed = false;
         status = CleanupRuntimeRollback(
             RuntimeRollbackPath::WorkerCreation,
             CreateProductionStatusPaneOperations(

@@ -37,8 +37,10 @@ public:
     [[nodiscard]] Status Publish(
         const StatusPanePlacementResult& result,
         const StatusPanePostMessage& postMessage);
-    [[nodiscard]] bool Consume(
-        StatusPanePlacementResult* result,
+    [[nodiscard]] bool Consume(StatusPanePlacementResult* result);
+    [[nodiscard]] Status CaptureFailed(const std::function<Status()>& wakeWorker);
+    [[nodiscard]] Status ApplyCompleted(
+        bool accepted,
         const std::function<Status()>& wakeWorker);
     void Stop() noexcept;
     [[nodiscard]] std::size_t pending_results() const noexcept;
@@ -50,8 +52,25 @@ private:
     bool worker_active_ = false;
     bool dirty_ = false;
     bool dispatch_pending_ = false;
+    bool apply_pending_ = false;
+    bool automatic_retry_used_ = false;
     std::optional<StatusPanePlacementResult> result_;
 };
+
+struct RuntimeSignalSourceState final {
+    HWND parent = nullptr;
+    bool lifecycle_failed = false;
+};
+
+struct RuntimeSignalSubclassOperations final {
+    std::function<Status(HWND)> remove;
+    std::function<Status(HWND)> install;
+};
+
+[[nodiscard]] Status UpdateRuntimeSignalParent(
+    RuntimeSignalSourceState* state,
+    HWND parent,
+    const RuntimeSignalSubclassOperations& operations);
 
 enum class RuntimeRollbackPath {
     CompareExchange,

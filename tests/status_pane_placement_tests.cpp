@@ -299,7 +299,8 @@ WXI_TEST(status_pane_production_reflow_coalesces_and_owns_payload, "status_pane.
     WXI_REQUIRE_EQ(coordinator.pending_results(), std::size_t{1});
 
     winexinfo::hook::StatusPanePlacementResult consumed{};
-    WXI_REQUIRE(coordinator.Consume(&consumed, wake));
+    WXI_REQUIRE(coordinator.Consume(&consumed));
+    WXI_REQUIRE(coordinator.ApplyCompleted(true, wake).ok());
     WXI_REQUIRE_EQ(consumed.parent, recorder.parent);
     WXI_REQUIRE_EQ(coordinator.pending_results(), std::size_t{0});
     WXI_REQUIRE_EQ(wakes, 2);
@@ -318,7 +319,7 @@ WXI_TEST(status_pane_production_reflow_cleanup_reclaims_undispatched_result, "st
     coordinator.Stop();
     WXI_REQUIRE_EQ(coordinator.pending_results(), std::size_t{0});
     winexinfo::hook::StatusPanePlacementResult ignored{};
-    WXI_REQUIRE(!coordinator.Consume(&ignored, [] { return Success(); }));
+    WXI_REQUIRE(!coordinator.Consume(&ignored));
 }
 
 WXI_TEST(status_pane_production_reflow_post_failure_reclaims_result, "status_pane.placement.post_failure") {
@@ -336,6 +337,109 @@ WXI_TEST(status_pane_production_reflow_post_failure_reclaims_result, "status_pan
                      })
                      .ok());
     WXI_REQUIRE_EQ(coordinator.pending_results(), std::size_t{0});
+}
+
+WXI_TEST(status_pane_failed_capture_completion_rearms_without_busy_loop, "status_pane.placement.failed_capture_completion") {
+    PlacementRecorder recorder;
+    winexinfo::hook::StatusPaneRefreshCoordinator coordinator{recorder.pane};
+    int wakes = 0;
+    const auto wake = [&] {
+        ++wakes;
+        return Success();
+    };
+    WXI_REQUIRE(coordinator.Signal(WM_SIZE, wake).ok());
+    WXI_REQUIRE_EQ(wakes, 1);
+    WXI_REQUIRE(coordinator.CaptureFailed(wake).ok());
+    WXI_REQUIRE_EQ(wakes, 1);
+
+    WXI_REQUIRE(coordinator.Signal(WM_DPICHANGED, wake).ok());
+    WXI_REQUIRE_EQ(wakes, 2);
+    WXI_REQUIRE(coordinator.CaptureFailed(wake).ok());
+    WXI_REQUIRE_EQ(wakes, 2);
+
+    WXI_REQUIRE(coordinator.Signal(WM_THEMECHANGED, wake).ok());
+    WXI_REQUIRE_EQ(wakes, 3);
+    WXI_REQUIRE(coordinator.Publish(
+                    {recorder.pid, recorder.tid, recorder.top, recorder.parent,
+                     RECT{0, 0, 200, 30}, true},
+                    [](HWND, UINT) { return Success(); })
+                    .ok());
+    winexinfo::hook::StatusPanePlacementResult result{};
+    WXI_REQUIRE(coordinator.Consume(&result));
+    WXI_REQUIRE(coordinator.ApplyCompleted(true, wake).ok());
+    WXI_REQUIRE_EQ(result.parent, recorder.parent);
+    WXI_REQUIRE_EQ(wakes, 3);
+}
+
+WXI_TEST(status_pane_rejected_apply_recovery_is_bounded, "status_pane.placement.rejected_apply_recovery") {
+    PlacementRecorder recorder;
+    winexinfo::hook::StatusPaneRefreshCoordinator coordinator{recorder.pane};
+    int wakes = 0;
+    const auto wake = [&] {
+        ++wakes;
+        return Success();
+    };
+    const auto publish = [&] {
+        return coordinator.Publish(
+            {recorder.pid, recorder.tid, recorder.top, recorder.parent,
+             RECT{0, 0, 200, 30}, true},
+            [](HWND, UINT) { return Success(); });
+    };
+    winexinfo::hook::StatusPanePlacementResult result{};
+
+    WXI_REQUIRE(coordinator.Signal(WM_SIZE, wake).ok());
+    WXI_REQUIRE(publish().ok());
+    WXI_REQUIRE(coordinator.Consume(&result));
+    WXI_REQUIRE(coordinator.ApplyCompleted(false, wake).ok());
+    WXI_REQUIRE_EQ(wakes, 2);
+
+    WXI_REQUIRE(publish().ok());
+    WXI_REQUIRE(coordinator.Consume(&result));
+    WXI_REQUIRE(coordinator.ApplyCompleted(false, wake).ok());
+    WXI_REQUIRE_EQ(wakes, 2);
+
+    WXI_REQUIRE(coordinator.Signal(WM_SHOWWINDOW, wake).ok());
+    WXI_REQUIRE_EQ(wakes, 3);
+}
+
+WXI_TEST(status_pane_parent_subclass_install_failure_recovers, "status_pane.placement.parent_subclass_recovery") {
+    const HWND oldParent = reinterpret_cast<HWND>(std::uintptr_t{0x710});
+    const HWND newParent = reinterpret_cast<HWND>(std::uintptr_t{0x720});
+    winexinfo::hook::RuntimeSignalSourceState state{oldParent, false};
+    int removes = 0;
+    int installs = 0;
+    bool failInstall = true;
+    const winexinfo::hook::RuntimeSignalSubclassOperations operations{
+        [&](const HWND window) {
+            WXI_REQUIRE_EQ(window, oldParent);
+            ++removes;
+            return Success();
+        },
+        [&](const HWND window) {
+            WXI_REQUIRE_EQ(window, newParent);
+            ++installs;
+            return failInstall
+                ? winexinfo::Status{winexinfo::ErrorCode::WINDOW_ATTACH_FAILED,
+                      E_FAIL, ERROR_INVALID_STATE}
+                : Success();
+        },
+    };
+    WXI_REQUIRE(!winexinfo::hook::UpdateRuntimeSignalParent(
+                     &state, newParent, operations)
+                     .ok());
+    WXI_REQUIRE_EQ(state.parent, nullptr);
+    WXI_REQUIRE(state.lifecycle_failed);
+    WXI_REQUIRE_EQ(removes, 1);
+    WXI_REQUIRE_EQ(installs, 1);
+
+    failInstall = false;
+    WXI_REQUIRE(winexinfo::hook::UpdateRuntimeSignalParent(
+                    &state, newParent, operations)
+                    .ok());
+    WXI_REQUIRE_EQ(state.parent, newParent);
+    WXI_REQUIRE(!state.lifecycle_failed);
+    WXI_REQUIRE_EQ(removes, 1);
+    WXI_REQUIRE_EQ(installs, 2);
 }
 
 WXI_TEST(status_pane_placement_cleanup_removes_subclass_first, "status_pane.placement.lifetime") {
