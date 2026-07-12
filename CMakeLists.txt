@@ -21,6 +21,7 @@ add_executable(WinExInfoTests
   src/common/utf8.cpp
   src/host/command_line.cpp
   src/hook/dll_main.cpp
+  src/hook/explorer_layout.cpp
   src/hook/hook_entry.cpp
   src/hook/runtime.cpp
   src/hook/status_pane.cpp
@@ -45,6 +46,7 @@ add_executable(WinExInfoTests
   tests/command_line_tests.cpp
   tests/contracts_tests.cpp
   tests/event_filter_tests.cpp
+  tests/explorer_layout_tests.cpp
   tests/host_manifest_tests.cpp
   tests/hook_injector_tests.cpp
   tests/hook_controller_mode.cpp
@@ -109,6 +111,7 @@ add_test(
 add_library(WinExInfoHook SHARED
   src/common/utf8.cpp
   src/hook/dll_main.cpp
+  src/hook/explorer_layout.cpp
   src/hook/hook_entry.cpp
   src/hook/hook_export.cpp
   src/hook/runtime.cpp
@@ -143,6 +146,8 @@ target_link_options(WinExInfoHook PRIVATE /guard:cf)
 target_link_libraries(WinExInfoHook PRIVATE
   advapi32
   comctl32
+  ole32
+  uuid
 )
 
 set_target_properties(WinExInfoHook PROPERTIES
