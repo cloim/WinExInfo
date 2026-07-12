@@ -2,6 +2,7 @@
 
 #include "common/win32_handle.h"
 #include "hook/explorer_layout.h"
+#include "hook/process_runtime.h"
 #include "hook/status_pane.h"
 #include "hook/tab_subclass_set.h"
 #include "ipc/named_pipe.h"
@@ -36,33 +37,39 @@ Status PlacementFailure(const DWORD error) noexcept {
     };
 }
 
-struct RuntimeContext final {
-    HWND target = nullptr;
-    std::uint64_t attach_id = 0;
-    DWORD pid = 0;
-    DWORD tid = 0;
-    HMODULE module_reference = nullptr;
-    UniqueHandle hook_released;
+struct RuntimeWindowResources final {
+    WindowRuntimeKey key{};
     UniqueHandle cleanup_ack;
     UniqueHandle refresh_event;
     UniqueHandle refresh_stop;
     UniqueHandle refresh_worker;
     UniqueHandle parent_cleanup_ack;
-    UniqueHandle tab_update_ack;
     StatusPane pane{};
     StatusPaneRefreshCoordinator refresh;
     RuntimeSignalSourceState signal_source;
     HookRuntimeRefreshIngress ingress;
+    bool worker_started = false;
+    bool ui_cleaned = false;
+};
+
+struct RuntimeContext final {
+    HWND initial_target = nullptr;
+    std::uint64_t attach_id = 0;
+    DWORD pid = 0;
+    DWORD initial_tid = 0;
+    HMODULE module_reference = nullptr;
+    UniqueHandle hook_released;
     HookRuntimeStateMachine state;
-    TabSubclassSet tab_subclasses;
-    std::mutex tab_update_mutex;
-    std::optional<ipc::TabSetUpdate> pending_tab_update;
-    ipc::TabSetResult tab_update_result;
+    ProcessRuntime process;
 };
 
 std::atomic<RuntimeContext*> g_runtime{nullptr};
 HookCallbackGate g_callback_gate;
 inline constexpr UINT_PTR kRuntimeParentSubclassId = 0x57495832;
+
+RuntimeWindowResources* Resources(WindowRuntime* window) noexcept {
+    return window ? static_cast<RuntimeWindowResources*>(window->resources.get()) : nullptr;
+}
 
 Status PostRuntimeMessage(const HWND pane, const UINT message) {
     return PostMessageW(pane, message, 0, 0) != FALSE
@@ -70,8 +77,8 @@ Status PostRuntimeMessage(const HWND pane, const UINT message) {
         : PlacementFailure(GetLastError());
 }
 
-Status WakeRefreshWorker(RuntimeContext* const context) {
-    return context != nullptr && SetEvent(context->refresh_event.get()) != FALSE
+Status WakeRefreshWorker(RuntimeWindowResources* const resources) {
+    return resources && SetEvent(resources->refresh_event.get()) != FALSE
         ? Success()
         : PlacementFailure(GetLastError());
 }
@@ -83,20 +90,20 @@ LRESULT CALLBACK RuntimeParentSubclassProc(
     const LPARAM lparam,
     const UINT_PTR id,
     const DWORD_PTR reference) {
-    auto* const context = reinterpret_cast<RuntimeContext*>(reference);
-    if (id == kRuntimeParentSubclassId && context != nullptr &&
+    auto* const resources = reinterpret_cast<RuntimeWindowResources*>(reference);
+    if (id == kRuntimeParentSubclassId && resources && resources->key.top_level &&
         message == WM_DESTROY) {
         const StatusPanePlacementOperations placement =
             CreateProductionStatusPanePlacementOperations();
         return ProcessRuntimeParentDestroy(
             {
-                context->ingress.enabled(),
-                context->pid,
-                context->tid,
-                context->target,
-                context->pane.hwnd,
+                resources->ingress.enabled(),
+                resources->key.process_id,
+                resources->key.ui_thread_id,
+                resources->key.top_level,
+                resources->pane.hwnd,
                 window,
-                &context->signal_source,
+                &resources->signal_source,
             },
             {
                 placement.get_window_thread_process_id,
@@ -106,28 +113,28 @@ LRESULT CALLBACK RuntimeParentSubclassProc(
                 placement.set_parent,
                 placement.set_window_pos,
             },
-            [context] {
-                return context->ingress.SignalEvent(context->refresh_event.get());
+            [resources] {
+                return resources->ingress.SignalEvent(resources->refresh_event.get());
             },
             [window, message, wparam, lparam] {
                 return DefSubclassProc(window, message, wparam, lparam);
             });
     }
-    if (id == kRuntimeParentSubclassId && context != nullptr &&
-        window == context->signal_source.parent &&
+    if (id == kRuntimeParentSubclassId && resources &&
+        window == resources->signal_source.parent &&
         (message == WM_SIZE || message == WM_DPICHANGED ||
          message == WM_THEMECHANGED || message == WM_SHOWWINDOW ||
          message == WM_WINDOWPOSCHANGED)) {
-        static_cast<void>(context->ingress.SignalEvent(context->refresh_event.get()));
+        static_cast<void>(resources->ingress.SignalEvent(resources->refresh_event.get()));
     }
     return DefSubclassProc(window, message, wparam, lparam);
 }
 
 Status UpdateRuntimeParentSubclass(
-    RuntimeContext* const context,
+    RuntimeWindowResources* const resources,
     const HWND parent) {
     return UpdateRuntimeSignalParent(
-        &context->signal_source,
+        &resources->signal_source,
         parent,
         {
             [](const HWND window) {
@@ -138,12 +145,12 @@ Status UpdateRuntimeParentSubclass(
                     ? Success()
                     : PlacementFailure(GetLastError());
             },
-            [context](const HWND window) {
+            [resources](const HWND window) {
                 return SetWindowSubclass(
                            window,
                            RuntimeParentSubclassProc,
                            kRuntimeParentSubclassId,
-                           reinterpret_cast<DWORD_PTR>(context)) != FALSE
+                           reinterpret_cast<DWORD_PTR>(resources)) != FALSE
                     ? Success()
                     : PlacementFailure(GetLastError());
             },
@@ -151,13 +158,17 @@ Status UpdateRuntimeParentSubclass(
 }
 
 DWORD WINAPI RefreshWorker(void* const parameter) {
-    auto* const context = static_cast<RuntimeContext*>(parameter);
-    const HANDLE waits[]{context->refresh_stop.get(), context->refresh_event.get()};
-    while (WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0 + 1) {
+    auto* const resources = static_cast<RuntimeWindowResources*>(parameter);
+    const HANDLE waits[]{resources->refresh_stop.get(), resources->refresh_event.get()};
+    for (;;) {
+        const DWORD wait = WaitForMultipleObjects(2, waits, FALSE, 5000);
+        if (wait == WAIT_OBJECT_0) return 0;
+        if (wait == WAIT_TIMEOUT) continue;
+        if (wait != WAIT_OBJECT_0 + 1) return 1;
         bool captureRequested = true;
-        if (context->ingress.Consume()) {
+        if (resources->ingress.Consume()) {
             captureRequested = false;
-            static_cast<void>(context->refresh.Signal(
+            static_cast<void>(resources->refresh.Signal(
                 WM_WINDOWPOSCHANGED,
                 [&captureRequested] {
                     captureRequested = true;
@@ -170,30 +181,29 @@ DWORD WINAPI RefreshWorker(void* const parameter) {
         ExplorerLayoutMetrics metrics{};
         HWND parent = nullptr;
         RECT rect{};
-        Status status = CaptureExplorerLayout(context->target, &metrics, &parent);
+        Status status = CaptureExplorerLayout(resources->key.top_level, &metrics, &parent);
         if (status.ok()) {
             status = ComputeStatusPaneRect(metrics, &rect);
         }
         if (status.ok()) {
             const StatusPanePlacementResult result{
-                context->pid,
-                context->tid,
-                context->target,
+                resources->key.process_id,
+                resources->key.ui_thread_id,
+                resources->key.top_level,
                 parent,
                 rect,
                 rect.right > rect.left && rect.bottom > rect.top,
             };
-            static_cast<void>(context->refresh.Publish(
+            static_cast<void>(resources->refresh.Publish(
                 result,
                 [](const HWND pane, const UINT message) {
                     return PostRuntimeMessage(pane, message);
                 }));
         } else {
-            static_cast<void>(context->refresh.CaptureFailed(
-                [context] { return WakeRefreshWorker(context); }));
+            static_cast<void>(resources->refresh.CaptureFailed(
+                [resources] { return WakeRefreshWorker(resources); }));
         }
     }
-    return 0;
 }
 
 Status WriteAttachResult(
@@ -206,8 +216,8 @@ Status WriteAttachResult(
         context.attach_id,
         {
             context.pid,
-            context.tid,
-            reinterpret_cast<std::uint64_t>(context.target),
+            context.initial_tid,
+            reinterpret_cast<std::uint64_t>(context.initial_target),
             result,
             error,
         },
@@ -215,33 +225,131 @@ Status WriteAttachResult(
     return status.ok() ? ipc::WriteFrame(pipe, frame) : status;
 }
 
-Status DispatchTabSetUpdate(
-    RuntimeContext* const context,
-    const ipc::TabSetUpdate& update,
-    ipc::TabSetResult* const result) {
-    if (context == nullptr || result == nullptr) {
-        return PlacementFailure(ERROR_INVALID_PARAMETER);
-    }
-    {
-        const std::scoped_lock lock{context->tab_update_mutex};
-        if (context->pending_tab_update) {
-            return PlacementFailure(ERROR_BUSY);
-        }
-        context->pending_tab_update = update;
-        context->tab_update_result = {};
-    }
-    if (ResetEvent(context->tab_update_ack.get()) == FALSE ||
-        PostMessageW(context->pane.hwnd, kStatusPaneTabSetMessage, 0, 0) == FALSE) {
-        const DWORD error = GetLastError();
-        const std::scoped_lock lock{context->tab_update_mutex};
-        context->pending_tab_update.reset();
-        return PlacementFailure(error);
-    }
-    if (WaitForSingleObject(context->tab_update_ack.get(), 5000) != WAIT_OBJECT_0) {
+Status StopWindowWorker(RuntimeWindowResources* resources) {
+    if (!resources) return PlacementFailure(ERROR_INVALID_PARAMETER);
+    resources->ingress.Disable();
+    resources->refresh.Stop();
+    if (!resources->worker_started) return Success();
+    if (SetEvent(resources->refresh_stop.get()) == FALSE ||
+        WaitForSingleObject(resources->refresh_worker.get(), 5000) != WAIT_OBJECT_0)
         return PlacementFailure(ERROR_TIMEOUT);
+    resources->worker_started = false;
+    resources->refresh_worker.reset();
+    return Success();
+}
+
+Status CreateRuntimeWindow(const WindowRuntimeKey& key,
+                           std::unique_ptr<WindowRuntime>* output) {
+    if (!output || !key.top_level || !key.process_id || !key.ui_thread_id ||
+        GetCurrentProcessId() != key.process_id || GetCurrentThreadId() != key.ui_thread_id)
+        return PlacementFailure(ERROR_INVALID_PARAMETER);
+    DWORD pid = 0;
+    wchar_t name[64]{};
+    const int length = GetClassNameW(key.top_level, name, 64);
+    const std::wstring_view actual{name, length > 0 ? static_cast<std::size_t>(length) : 0};
+    if (GetWindowThreadProcessId(key.top_level, &pid) != key.ui_thread_id ||
+        pid != key.process_id ||
+        (actual != L"CabinetWClass" &&
+         !(key.generation == 0 && actual == L"WinExInfo.GateBTarget.v1")))
+        return PlacementFailure(ERROR_INVALID_WINDOW_HANDLE);
+    auto window = std::make_unique<WindowRuntime>();
+    window->key = key;
+    auto resources = std::make_shared<RuntimeWindowResources>();
+    resources->key = key;
+    window->resources = resources;
+    *output = std::move(window);
+    resources->cleanup_ack.reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    resources->refresh_event.reset(CreateEventW(nullptr, FALSE, FALSE, nullptr));
+    resources->refresh_stop.reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    resources->parent_cleanup_ack.reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    if (!resources->cleanup_ack || !resources->refresh_event ||
+        !resources->refresh_stop || !resources->parent_cleanup_ack)
+        return PlacementFailure(GetLastError());
+    Status status = InstallStatusPane(key.top_level,
+        CreateProductionStatusPaneOperations(g_hook_module, resources->cleanup_ack.get()),
+        &resources->pane);
+    if (status.ok()) resources->refresh.Initialize(resources->pane.hwnd);
+    return status;
+}
+
+Status ActivateRuntimeWindow(WindowRuntime& window) {
+    RuntimeWindowResources* resources = Resources(&window);
+    if (!resources || resources->worker_started || resources->ui_cleaned)
+        return PlacementFailure(ERROR_INVALID_STATE);
+    resources->refresh_worker.reset(CreateThread(nullptr, 0, RefreshWorker, resources, 0, nullptr));
+    if (!resources->refresh_worker) return PlacementFailure(GetLastError());
+    resources->worker_started = true;
+    resources->ingress.Enable();
+    return resources->refresh.Signal(WM_SIZE, [resources] { return WakeRefreshWorker(resources); });
+}
+
+Status ApplyRuntimeWindowUpdate(WindowRuntime& window, const ipc::TabSetUpdate& update,
+                                ipc::TabSetResult* result) {
+    return window.tab_subclasses->Apply(window.key.top_level, update,
+        CreateProductionTabSubclassOperations(*window.tab_subclasses), result);
+}
+
+Status CleanupRuntimeWindowOnUi(WindowRuntime& window) {
+    RuntimeWindowResources* resources = Resources(&window);
+    if (!resources) return PlacementFailure(ERROR_INVALID_STATE);
+    if (resources->ui_cleaned) return Success();
+    Status status = StopWindowWorker(resources);
+    if (!status.ok()) return status;
+    status = window.tab_subclasses->RemoveAll(
+        CreateProductionTabSubclassOperations(*window.tab_subclasses));
+    if (!status.ok() || !window.tab_subclasses->cleanup_safe())
+        return status.ok() ? PlacementFailure(ERROR_INVALID_STATE) : status;
+    if (!RuntimeSignalCleanupSafe(resources->signal_source))
+        return PlacementFailure(ERROR_INVALID_STATE);
+    if (resources->signal_source.parent) {
+        if (RemoveWindowSubclass(resources->signal_source.parent,
+                RuntimeParentSubclassProc, kRuntimeParentSubclassId) == FALSE)
+            return PlacementFailure(GetLastError());
+        resources->signal_source.parent = nullptr;
     }
-    const std::scoped_lock lock{context->tab_update_mutex};
-    *result = context->tab_update_result;
+    status = RemoveStatusPane(CreateProductionStatusPaneOperations(
+        g_hook_module, resources->cleanup_ack.get()), &resources->pane);
+    if (status.ok()) resources->ui_cleaned = true;
+    return status;
+}
+
+Status CleanupRuntimeWindowFromWorker(WindowRuntime& window) {
+    RuntimeWindowResources* resources = Resources(&window);
+    if (!resources) return PlacementFailure(ERROR_INVALID_STATE);
+    if (resources->ui_cleaned) return Success();
+    Status status = StopWindowWorker(resources);
+    if (!status.ok()) return status;
+    if (PostMessageW(resources->pane.hwnd, kStatusPaneRuntimeCleanupMessage, 0, 0) == FALSE ||
+        WaitForSingleObject(resources->parent_cleanup_ack.get(), 5000) != WAIT_OBJECT_0)
+        return PlacementFailure(ERROR_TIMEOUT);
+    status = RequestStatusPaneRemoval(resources->pane.hwnd);
+    if (!status.ok() || WaitForSingleObject(resources->cleanup_ack.get(), 5000) != WAIT_OBJECT_0)
+        return status.ok() ? PlacementFailure(ERROR_TIMEOUT) : status;
+    resources->pane = {};
+    resources->ui_cleaned = true;
+    return Success();
+}
+
+Status ShelterRuntimeWindowOnDestroy(WindowRuntime& window) {
+    RuntimeWindowResources* resources = Resources(&window);
+    if (!resources || resources->ui_cleaned || !resources->pane.hwnd ||
+        GetCurrentProcessId() != window.key.process_id ||
+        GetCurrentThreadId() != window.key.ui_thread_id)
+        return PlacementFailure(ERROR_INVALID_STATE);
+    if (resources->signal_source.parent) {
+        if (RemoveWindowSubclass(resources->signal_source.parent,
+                RuntimeParentSubclassProc, kRuntimeParentSubclassId) == FALSE)
+            return PlacementFailure(GetLastError());
+        resources->signal_source.parent = nullptr;
+    }
+    SetLastError(ERROR_SUCCESS);
+    if (SetParent(resources->pane.hwnd, HWND_MESSAGE) == nullptr &&
+        GetLastError() != ERROR_SUCCESS)
+        return PlacementFailure(GetLastError());
+    if (SetWindowPos(resources->pane.hwnd, HWND_TOP, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_HIDEWINDOW) == FALSE)
+        return PlacementFailure(GetLastError());
+    resources->signal_source.lifecycle_failed = false;
     return Success();
 }
 
@@ -258,15 +366,6 @@ DWORD WINAPI RuntimeWorker(void* const parameter) {
         status = WriteAttachResult(pipe.get(), *context, 0, {});
     }
     if (!status.ok() || !context->state.MarkRunning(true).ok()) {
-        context.release();
-        return 1;
-    }
-
-    context->refresh_worker.reset(CreateThread(
-        nullptr, 0, RefreshWorker, context.get(), 0, nullptr));
-    if (!context->refresh_worker ||
-        !context->refresh.Signal(
-            WM_SIZE, [&context] { return WakeRefreshWorker(context.get()); }).ok()) {
         context.release();
         return 1;
     }
@@ -288,7 +387,7 @@ DWORD WINAPI RuntimeWorker(void* const parameter) {
             break;
         }
         ipc::TabSetResult result{};
-        status = DispatchTabSetUpdate(context.get(), update, &result);
+        status = DispatchProcessTabSetUpdate(context->process, update, &result);
         if (!status.ok()) {
             break;
         }
@@ -302,34 +401,20 @@ DWORD WINAPI RuntimeWorker(void* const parameter) {
         context.release();
         return 1;
     }
-    g_callback_gate.RejectNewWork();
-    context->ingress.Disable();
     if (!detachRequested) {
         pipe.reset();
     }
-
-    context->refresh.Stop();
-    if (SetEvent(context->refresh_stop.get()) == FALSE ||
-        WaitForSingleObject(context->refresh_worker.get(), 5000) != WAIT_OBJECT_0 ||
-        PostMessageW(
-            context->pane.hwnd,
-            kStatusPaneRuntimeCleanupMessage,
-            0,
-            0) == FALSE ||
-        WaitForSingleObject(context->parent_cleanup_ack.get(), 5000) !=
-            WAIT_OBJECT_0) {
+    status = RemoveAllProcessWindows(context->process);
+    if (!status.ok()) {
         context.release();
         return 1;
     }
-
-    status = RequestStatusPaneRemoval(context->pane.hwnd);
-    if (!status.ok() ||
-        WaitForSingleObject(context->cleanup_ack.get(), 5000) != WAIT_OBJECT_0) {
-        context.release();
-        return 1;
-    }
-    context->pane = {};
+    g_callback_gate.RejectNewWork();
     if (!DrainHookCallbacksForUnload(g_callback_gate, 5000).ok()) {
+        context.release();
+        return 1;
+    }
+    if (!ReapRemovedProcessWindows(context->process, 5000).ok()) {
         context.release();
         return 1;
     }
@@ -355,6 +440,10 @@ DWORD WINAPI RuntimeWorker(void* const parameter) {
     pipe.reset();
     static_cast<void>(context->state.MarkStopped());
     const HMODULE module = context->module_reference;
+    if (!FinalizeProcessWindowsAfterDrain(context->process, 5000).ok()) {
+        context.release(); return 1;
+    }
+    SetProcessRuntimeForCallbacks(nullptr);
     g_runtime.store(nullptr, std::memory_order_release);
     context.reset();
     FreeLibraryAndExitThread(module, 0);
@@ -366,66 +455,55 @@ bool HandleStatusPaneRuntimeMessage(
     const HWND pane,
     const UINT message) noexcept {
     RuntimeContext* const context = g_runtime.load(std::memory_order_acquire);
-    if (context == nullptr || context->pane.hwnd != pane) {
+    if (!context) {
         return false;
     }
+    WindowRuntime* window = nullptr;
+    RuntimeWindowResources* resources = nullptr;
+    WindowRuntimeStorageLease storageLease;
+    for (std::size_t index = 0; index < kMaximumRuntimeWindows; ++index) {
+        auto candidateLease = AcquireProcessWindowStorageAt(context->process, index);
+        WindowRuntime* candidate = candidateLease.get();
+        RuntimeWindowResources* candidateResources = Resources(candidate);
+        if (candidateResources && candidateResources->pane.hwnd == pane) {
+            window = candidate; resources = candidateResources;
+            storageLease = std::move(candidateLease); break;
+        }
+    }
+    if (!window || !resources) return false;
     if (message == kStatusPaneRuntimeCleanupMessage) {
-        if (!context->tab_subclasses.RemoveAll(
+        if (!window->tab_subclasses->RemoveAll(
                  CreateProductionTabSubclassOperations(
-                     context->tab_subclasses)).ok() ||
-            !context->tab_subclasses.cleanup_safe()) {
+                     *window->tab_subclasses)).ok() ||
+            !window->tab_subclasses->cleanup_safe()) {
             return true;
         }
-        if (!RuntimeSignalCleanupSafe(context->signal_source)) {
+        if (!RuntimeSignalCleanupSafe(resources->signal_source)) {
             return true;
         }
-        if (context->signal_source.parent != nullptr) {
+        if (resources->signal_source.parent != nullptr) {
             if (RemoveWindowSubclass(
-                    context->signal_source.parent,
+                    resources->signal_source.parent,
                     RuntimeParentSubclassProc,
                     kRuntimeParentSubclassId) == FALSE) {
                 return true;
             }
-            context->signal_source.parent = nullptr;
+            resources->signal_source.parent = nullptr;
         }
-        static_cast<void>(SetEvent(context->parent_cleanup_ack.get()));
-        return true;
-    }
-    if (message == kStatusPaneTabSetMessage) {
-        ipc::TabSetUpdate update{};
-        {
-            const std::scoped_lock lock{context->tab_update_mutex};
-            if (!context->pending_tab_update) {
-                return true;
-            }
-            update = *context->pending_tab_update;
-        }
-        ipc::TabSetResult result{};
-        static_cast<void>(context->tab_subclasses.Apply(
-            context->target,
-            update,
-            CreateProductionTabSubclassOperations(
-                context->tab_subclasses),
-            &result));
-        {
-            const std::scoped_lock lock{context->tab_update_mutex};
-            context->tab_update_result = std::move(result);
-            context->pending_tab_update.reset();
-        }
-        static_cast<void>(SetEvent(context->tab_update_ack.get()));
+        static_cast<void>(SetEvent(resources->parent_cleanup_ack.get()));
         return true;
     }
     if (message != kStatusPaneReflowMessage) {
         return false;
     }
     StatusPanePlacementResult result{};
-    if (!context->refresh.Consume(&result)) {
+    if (!resources->refresh.Consume(&result)) {
         return true;
     }
     const bool accepted = ApplyStatusPanePlacementResult(pane, result).ok() &&
-        UpdateRuntimeParentSubclass(context, result.parent).ok();
-    static_cast<void>(context->refresh.ApplyCompleted(
-        accepted, [context] { return WakeRefreshWorker(context); }));
+        UpdateRuntimeParentSubclass(resources, result.parent).ok();
+    static_cast<void>(resources->refresh.ApplyCompleted(
+        accepted, [resources] { return WakeRefreshWorker(resources); }));
     return true;
 }
 
@@ -853,26 +931,34 @@ void NotifyHookRuntimeWindowMessage(
         if (context == nullptr) {
             return;
         }
-        if (window == nullptr ||
-            (message != WM_SHOWWINDOW && message != WM_WINDOWPOSCHANGED)) {
+        if (!window) {
             return;
         }
-        DWORD process = 0;
-        if (GetWindowThreadProcessId(window, &process) != context->tid ||
-            process != context->pid || GetAncestor(window, GA_ROOT) != context->target ||
-            IsWindowVisible(window) == FALSE) {
+        for (std::size_t index = 0; index < kMaximumRuntimeWindows; ++index) {
+            auto lease = AcquireProcessWindowCallbackAt(context->process, index);
+            WindowRuntime* candidate = lease.get();
+            if (!candidate) continue;
+            if (window == candidate->key.top_level &&
+                (message == WM_DESTROY || message == WM_NCDESTROY)) {
+                lease = {};
+                static_cast<void>(HandleProcessRuntimeTopLevelDestroy(context->process, window));
+                return;
+            }
+            if (message != WM_SHOWWINDOW && message != WM_WINDOWPOSCHANGED) continue;
+            DWORD process = 0;
+            if (GetWindowThreadProcessId(window, &process) != candidate->key.ui_thread_id ||
+                process != candidate->key.process_id ||
+                GetAncestor(window, GA_ROOT) != candidate->key.top_level ||
+                IsWindowVisible(window) == FALSE) continue;
+            wchar_t className[64]{};
+            const int length = GetClassNameW(window, className, 64);
+            if (length <= 0 ||
+                (std::wstring_view{className, static_cast<std::size_t>(length)} != L"ShellTabWindowClass" &&
+                 std::wstring_view{className, static_cast<std::size_t>(length)} != kStatusPaneParentClassName)) continue;
+            RuntimeWindowResources* resources = Resources(candidate);
+            if (resources) static_cast<void>(resources->ingress.SignalEvent(resources->refresh_event.get()));
             return;
         }
-        wchar_t className[64]{};
-        const int length = GetClassNameW(window, className, 64);
-        if (length <= 0 ||
-            (std::wstring_view{className, static_cast<std::size_t>(length)} !=
-                 L"ShellTabWindowClass" &&
-             std::wstring_view{className, static_cast<std::size_t>(length)} !=
-                 kStatusPaneParentClassName)) {
-            return;
-        }
-        static_cast<void>(context->ingress.SignalEvent(context->refresh_event.get()));
     } catch (...) {
         // Hook callbacks must remain no-throw and continue to CallNextHookEx.
     }
@@ -880,9 +966,28 @@ void NotifyHookRuntimeWindowMessage(
 
 Status SignalHookRuntimeRefresh() noexcept {
     RuntimeContext* const context = g_runtime.load(std::memory_order_acquire);
-    return context != nullptr
-        ? context->ingress.SignalEvent(context->refresh_event.get())
-        : PlacementFailure(ERROR_INVALID_STATE);
+    if (!context || context->process.active_window_count() != 1) return PlacementFailure(ERROR_INVALID_STATE);
+    for (std::size_t i = 0; i < kMaximumRuntimeWindows; ++i) {
+        auto lease = AcquireProcessWindowCallbackAt(context->process, i);
+        WindowRuntime* window = lease.get();
+        RuntimeWindowResources* resources = Resources(window);
+        if (lease && resources)
+            return resources->ingress.SignalEvent(resources->refresh_event.get());
+    }
+    return PlacementFailure(ERROR_INVALID_STATE);
+}
+
+Status SignalHookRuntimeRefresh(TabSubclassSet* owner) noexcept {
+    RuntimeContext* const context = g_runtime.load(std::memory_order_acquire);
+    if (!context || !owner) return PlacementFailure(ERROR_INVALID_STATE);
+    for (std::size_t i = 0; i < kMaximumRuntimeWindows; ++i) {
+        auto lease = AcquireProcessWindowCallbackAt(context->process, i);
+        WindowRuntime* window = lease.get();
+        RuntimeWindowResources* resources = Resources(window);
+        if (window && resources && window->tab_subclasses.get() == owner)
+            return resources->ingress.SignalEvent(resources->refresh_event.get());
+    }
+    return PlacementFailure(ERROR_INVALID_STATE);
 }
 
 std::size_t StatusPaneRefreshCoordinator::pending_results() const noexcept {
@@ -923,6 +1028,10 @@ void HookCallbackGate::Leave() noexcept {
 
 void HookCallbackGate::RejectNewWork() noexcept {
     rundown_.fetch_or(kClosed, std::memory_order_acq_rel);
+}
+
+void HookCallbackGate::ResetForReuse() noexcept {
+    rundown_.store(0, std::memory_order_release);
 }
 
 bool HookCallbackGate::WaitForZero(const DWORD timeoutMs) const noexcept {
@@ -1002,16 +1111,16 @@ Status BeginHookRuntimeAttach(
         return ContractFailure();
     }
     auto context = std::make_unique<RuntimeContext>();
-    context->target = target;
+    context->initial_target = target;
     context->attach_id = attachId;
     context->pid = GetCurrentProcessId();
-    context->tid = GetCurrentThreadId();
+    context->initial_tid = GetCurrentThreadId();
     if (!context->state.BeginAttach().ok()) {
         return ContractFailure();
     }
     const std::wstring eventName =
         L"Local\\WinExInfo.HookReleased." + std::to_wstring(context->pid) +
-        L"." + std::to_wstring(context->tid) + L"." +
+        L"." + std::to_wstring(context->initial_tid) + L"." +
         std::to_wstring(attachId);
     context->hook_released.reset(OpenEventW(SYNCHRONIZE, FALSE, eventName.c_str()));
     if (!context->hook_released) {
@@ -1027,62 +1136,73 @@ Status BeginHookRuntimeAttach(
                 HRESULT_FROM_WIN32(GetLastError()), GetLastError()};
     }
     context->module_reference = moduleReference;
-    context->cleanup_ack.reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
-    context->refresh_event.reset(CreateEventW(nullptr, FALSE, FALSE, nullptr));
-    context->refresh_stop.reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
-    context->parent_cleanup_ack.reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
-    context->tab_update_ack.reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
-    if (!context->cleanup_ack || !context->refresh_event ||
-        !context->refresh_stop || !context->parent_cleanup_ack ||
-        !context->tab_update_ack) {
-        FreeLibrary(moduleReference);
-        return {ErrorCode::DLL_INITIALIZATION_FAILED,
-                HRESULT_FROM_WIN32(GetLastError()), GetLastError()};
-    }
-    Status status = InstallStatusPane(
-        target,
-        CreateProductionStatusPaneOperations(
-            g_hook_module, context->cleanup_ack.get()),
-        &context->pane);
-    if (!status.ok()) {
-        FreeLibrary(moduleReference);
-        return status;
-    }
-    context->refresh.Initialize(context->pane.hwnd);
     RuntimeContext* expected = nullptr;
     if (!g_runtime.compare_exchange_strong(
             expected, context.get(), std::memory_order_acq_rel)) {
-        status = CleanupRuntimeRollback(
-            RuntimeRollbackPath::CompareExchange,
-            CreateProductionStatusPaneOperations(
-                g_hook_module, context->cleanup_ack.get()),
-            &context->pane,
-            [moduleReference] { FreeLibrary(moduleReference); });
-        if (!status.ok()) {
-            context.release();
-        }
+        FreeLibrary(moduleReference);
         return ContractFailure();
+    }
+    context->process.process_id = context->pid;
+    context->process.control_message = RegisterWindowMessageW(kProcessRuntimeControlMessageName.data());
+    context->process.operations.get_current_process_id = &GetCurrentProcessId;
+    context->process.operations.get_current_thread_id = &GetCurrentThreadId;
+    context->process.operations.get_window_thread_process_id = &GetWindowThreadProcessId;
+    context->process.operations.send_control = [](HWND window, UINT message, WPARAM wp, LPARAM lp,
+                                                  UINT flags, UINT timeout, DWORD_PTR* result) {
+        if (SendMessageTimeoutW(window, message, wp, lp, flags, timeout, result) == 0) {
+            DWORD error = GetLastError();
+            return PlacementFailure(error ? error : ERROR_TIMEOUT);
+        }
+        return Success();
+    };
+    context->process.operations.create_window = &CreateRuntimeWindow;
+    context->process.operations.apply_update = &ApplyRuntimeWindowUpdate;
+    context->process.operations.activate_window = &ActivateRuntimeWindow;
+    context->process.operations.cleanup_window_on_ui = &CleanupRuntimeWindowOnUi;
+    context->process.operations.cleanup_window_from_worker = &CleanupRuntimeWindowFromWorker;
+    context->process.operations.shelter_window_on_destroy = &ShelterRuntimeWindowOnDestroy;
+    SetProcessRuntimeForCallbacks(&context->process);
+    std::unique_ptr<WindowRuntime> initial;
+    Status status = context->process.control_message
+        ? CreateRuntimeWindow({target, context->pid, context->initial_tid, 0}, &initial)
+        : PlacementFailure(GetLastError());
+    if (status.ok()) status = RegisterInitialProvisionalProcessWindow(context->process, std::move(initial));
+    if (status.ok()) status = ActivateAndPublishInitialProcessWindow(context->process, target);
+    if (!status.ok()) {
+        Status cleanup = Success();
+        if (initial) cleanup = CleanupRuntimeWindowOnUi(*initial);
+        else cleanup = RetireProcessWindowOnCurrentUi(context->process, target);
+        if (!cleanup.ok()) {
+            if (initial) {
+                static_cast<void>(RegisterInitialProvisionalProcessWindow(
+                    context->process, std::move(initial)));
+            }
+            context.release(); return status;
+        }
+        Status drain = ReapRemovedProcessWindows(context->process, 5000);
+        if (drain.ok()) drain = FinalizeProcessWindowsAfterDrain(context->process, 5000);
+        if (!drain.ok()) { context.release(); return status; }
+        SetProcessRuntimeForCallbacks(nullptr);
+        g_runtime.store(nullptr, std::memory_order_release);
+        FreeLibrary(moduleReference);
+        return status;
     }
     const HANDLE worker = CreateThread(
         nullptr, 0, RuntimeWorker, context.get(), 0, nullptr);
     if (worker == nullptr) {
         const DWORD error = GetLastError();
-        status = CleanupRuntimeRollback(
-            RuntimeRollbackPath::WorkerCreation,
-            CreateProductionStatusPaneOperations(
-                g_hook_module, context->cleanup_ack.get()),
-            &context->pane,
-            [moduleReference] { FreeLibrary(moduleReference); });
-        if (!status.ok()) {
-            context.release();
-        } else {
-            g_runtime.store(nullptr, std::memory_order_release);
-        }
+        status = RetireProcessWindowOnCurrentUi(context->process, target);
+        if (!status.ok()) { context.release(); return PlacementFailure(error); }
+        Status drain = ReapRemovedProcessWindows(context->process, 5000);
+        if (drain.ok()) drain = FinalizeProcessWindowsAfterDrain(context->process, 5000);
+        if (!drain.ok()) { context.release(); return PlacementFailure(error); }
+        SetProcessRuntimeForCallbacks(nullptr);
+        g_runtime.store(nullptr, std::memory_order_release);
+        FreeLibrary(moduleReference);
         return {ErrorCode::DLL_INITIALIZATION_FAILED,
                 HRESULT_FROM_WIN32(error), error};
     }
     CloseHandle(worker);
-    context->ingress.Enable();
     context.release();
     return Success();
 }

@@ -18,6 +18,10 @@ LRESULT ProcessHookCall(
     }
     if (code == HC_ACTION && hookLparam != 0) {
         const auto* message = reinterpret_cast<const CWPSTRUCT*>(hookLparam);
+        if (operations.handle_control) {
+            static_cast<void>(operations.handle_control(
+                message->hwnd, message->message, message->wParam, message->lParam));
+        }
         if (attachMessage != 0 && message->hwnd != nullptr &&
             message->message == attachMessage &&
             message->wParam == injection::kAttachMagic &&

@@ -349,7 +349,7 @@ LRESULT CALLBACK TabSubclassProc(
         if (message == WM_NCDESTROY || message == WM_SIZE ||
             message == WM_DPICHANGED || message == WM_THEMECHANGED ||
             message == WM_SHOWWINDOW || message == WM_WINDOWPOSCHANGED) {
-            static_cast<void>(SignalHookRuntimeRefresh());
+            static_cast<void>(SignalHookRuntimeRefresh(owner));
         }
     }
     return DefSubclassProc(window, message, wparam, lparam);
@@ -452,7 +452,7 @@ TabSubclassOperations CreateProductionTabSubclassOperations(
                 ? Success()
                 : Failure(GetLastError());
         },
-        &SignalHookRuntimeRefresh,
+        [&owner] { return SignalHookRuntimeRefresh(&owner); },
     };
 }
 

@@ -13,6 +13,8 @@
 
 namespace winexinfo::hook {
 
+class TabSubclassSet;
+
 enum class RuntimeState {
     Starting,
     Running,
@@ -125,6 +127,7 @@ struct HookRuntimeWindowMessageOperations final {
     const HookRuntimeWindowMessageOperations& operations);
 void NotifyHookRuntimeWindowMessage(HWND window, UINT message) noexcept;
 [[nodiscard]] Status SignalHookRuntimeRefresh() noexcept;
+[[nodiscard]] Status SignalHookRuntimeRefresh(TabSubclassSet* owner) noexcept;
 
 [[nodiscard]] Status UpdateRuntimeSignalParent(
     RuntimeSignalSourceState* state,
@@ -156,6 +159,7 @@ public:
     [[nodiscard]] bool Enter() noexcept;
     void Leave() noexcept;
     void RejectNewWork() noexcept;
+    void ResetForReuse() noexcept;
     [[nodiscard]] bool WaitForZero(DWORD timeoutMs) const noexcept;
     [[nodiscard]] std::uint32_t in_flight() const noexcept;
 
