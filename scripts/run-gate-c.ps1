@@ -164,9 +164,14 @@ public static class GateCHelper {
         if (IsWindow(new IntPtr(value)) && !SetWindowPlacement(new IntPtr(value), ref placement))
             throw new InvalidOperationException("SetWindowPlacement failed");
     }
-    public static void Close(long value) {
+    public static void CloseExact(long value, int expectedPid, int expectedTid, string expectedClass) {
         IntPtr hwnd = new IntPtr(value);
-        if (IsWindow(hwnd) && !PostMessage(hwnd, WM_CLOSE, IntPtr.Zero, IntPtr.Zero))
+        if(!IsWindow(hwnd)||GetAncestor(hwnd,GA_ROOT)!=hwnd) throw new InvalidOperationException("close_target_not_top_level");
+        uint pid;
+        uint tid=GetWindowThreadProcessId(hwnd,out pid);
+        if(pid!=(uint)expectedPid||tid!=(uint)expectedTid||ClassOf(hwnd)!=expectedClass)
+            throw new InvalidOperationException("close_target_identity_mismatch");
+        if (!PostMessage(hwnd, WM_CLOSE, IntPtr.Zero, IntPtr.Zero))
             throw new InvalidOperationException("PostMessage(WM_CLOSE) failed");
     }
     public static bool Exists(long value) { return IsWindow(new IntPtr(value)); }
@@ -413,23 +418,32 @@ function Wait-ControlledShellWindow($Before, [int]$TimeoutMs) {
 }
 
 function Get-SafetyState {
-    $hostProcesses = @(Get-Process -Name WinExInfoHost,WinExInfoTests -ErrorAction SilentlyContinue)
-    $runPresent = Test-Path -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+    $allProcesses = @(Get-Process -ErrorAction Stop)
+    $hostProcesses = @($allProcesses | Where-Object { $_.ProcessName -ceq 'WinExInfoHost' -or $_.ProcessName -ceq 'WinExInfoTests' })
+    $explorerProcesses = @($allProcesses | Where-Object ProcessName -CEQ 'explorer')
+    $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+    $runPresent = Test-Path -LiteralPath $runKey -ErrorAction Stop
     $runValue = $null
-    if ($runPresent) { $runValue = (Get-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name WinExInfo -ErrorAction SilentlyContinue).WinExInfo }
-    $serviceCount = @(Get-Service -Name WinExInfo -ErrorAction SilentlyContinue).Count
-    $taskCount = @(Get-ScheduledTask -TaskName WinExInfo -ErrorAction SilentlyContinue).Count
+    if ($runPresent) {
+        $runProperties = Get-ItemProperty -LiteralPath $runKey -ErrorAction Stop
+        $runProperty = $runProperties.PSObject.Properties['WinExInfo']
+        if ($null -ne $runProperty) { $runValue = $runProperty.Value }
+    }
+    $serviceCount = @(Get-Service -ErrorAction Stop | Where-Object Name -CEQ 'WinExInfo').Count
+    $taskCount = @(Get-ScheduledTask -ErrorAction Stop | Where-Object TaskName -CEQ 'WinExInfo').Count
     $tcpCount = 0
     if ($hostProcesses.Count -gt 0) {
         $ids = @($hostProcesses.Id)
-        $tcpCount = @(Get-NetTCPConnection -ErrorAction SilentlyContinue | Where-Object { $ids -contains $_.OwningProcess }).Count
+        $tcpCount = @(Get-NetTCPConnection -ErrorAction Stop | Where-Object { $ids -contains $_.OwningProcess }).Count
     }
-    [pscustomobject]@{ ExplorerWindows=@(Get-StableShellWindows).Count; ExplorerPids=@(Get-Process explorer -ErrorAction SilentlyContinue).Count; RunCount=[int]($null -ne $runValue); ServiceCount=$serviceCount; TaskCount=$taskCount; WinExInfoProcessCount=$hostProcesses.Count; TcpCount=$tcpCount }
+    [pscustomobject]@{ ExplorerWindows=@(Get-StableShellWindows).Count; ExplorerPids=$explorerProcesses.Count; RunCount=[int]($null -ne $runValue); ServiceCount=$serviceCount; TaskCount=$taskCount; WinExInfoProcessCount=$hostProcesses.Count; TcpCount=$tcpCount }
 }
 
 function Get-ExactModuleCount([int]$ProcessId) {
-    $process = Get-Process -Id $ProcessId -ErrorAction Stop
-    $modules = @($process.Modules)
+    $process = @(Get-Process -ErrorAction Stop | Where-Object Id -EQ $ProcessId)
+    if ($process.Count -eq 0) { return 0 }
+    if ($process.Count -ne 1) { throw "Controlled process cardinality was $($process.Count)" }
+    $modules = @($process[0].Modules)
     return @($modules | Where-Object { $_.FileName -ceq $hookDll }).Count
 }
 
@@ -578,7 +592,7 @@ finally {
         try { Assert-ControlledShellWindow $controlled; $closeAuthorized=$true } catch { $cleanupDiagnostics += "close_revalidation=$($_.Exception.Message)" }
     }
     if ($closeAuthorized) {
-        try { [GateCHelper]::Close($controlled.Hwnd) } catch { $cleanupDiagnostics += "close=$($_.Exception.Message)" }
+        try { [GateCHelper]::CloseExact($controlled.Hwnd, $controlled.Pid, $controlled.Tid, 'CabinetWClass') } catch { $cleanupDiagnostics += "close=$($_.Exception.Message)" }
         try { [void](Wait-Until -TimeoutMs 5000 -Failure 'Controlled Explorer window did not close within 5000ms.' -Condition { -not [GateCHelper]::Exists($controlled.Hwnd) }) } catch { $cleanupDiagnostics += "close_wait=$($_.Exception.Message)" }
     }
     try { Remove-Item -LiteralPath $stdoutPath,$stderrPath -ErrorAction Stop } catch { if ((Test-Path -LiteralPath $stdoutPath) -or (Test-Path -LiteralPath $stderrPath)) { $cleanupDiagnostics += "temp_remove=$($_.Exception.Message)" } }

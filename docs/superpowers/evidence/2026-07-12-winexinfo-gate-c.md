@@ -4,6 +4,11 @@ Gate C: FAIL
 
 Captured on 2026-07-12 KST against the approved Windows 11 Explorer target.
 
+Product under test: product head `3612965`. The harness evolved in separate
+evidence commits; the latest live result below used the strict harness state
+committed at `fa30256`. The additional fail-closed safety hardening documented
+next was made afterward and has not been used for a live rerun.
+
 ## Decision
 
 The strict harness review invalidated the prior PASS as insufficient evidence.
@@ -100,6 +105,17 @@ samples while retaining an exact discovered candidate for cleanup; it still
 propagates all COM/native identity errors and ambiguous deltas. This change
 was not followed by another live run under the mandatory Release-failure stop
 condition.
+
+After that stopped run, remaining review-only harness hardening changed safety
+queries to full `-ErrorAction Stop` process/service/task enumerations with
+exact filtering, registry property inspection that distinguishes expected
+absence from operational failure, and TCP enumeration with Stop semantics
+when WinExInfo PIDs exist. Native close now atomically revalidates top-level
+HWND/PID/TID/class immediately before `WM_CLOSE`, after the exact Shell URL
+assertion. Module counting returns zero only when a full process enumeration
+shows the controlled PID has naturally exited; module access errors propagate.
+No live command has been run with these post-`fa30256` harness changes pending
+review approval.
 
 Final read-only safety state after the separately revalidated controlled close:
 
