@@ -101,6 +101,10 @@ set_target_properties(WinExInfoTests PROPERTIES
 )
 
 add_test(NAME WinExInfo.Unit COMMAND WinExInfoTests --unit)
+add_test(
+  NAME WinExInfo.CommandLineGateC
+  COMMAND WinExInfoTests --unit --filter command_line.gate_c
+)
 
 add_library(WinExInfoHook SHARED
   src/common/utf8.cpp

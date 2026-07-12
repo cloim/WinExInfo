@@ -34,7 +34,9 @@ int wmain(const int argc, const wchar_t* const argv[]) {
     const winexinfo::Status parsed = winexinfo::ParseCommandLine(argumentViews, &command);
     if (!parsed.ok()) {
         std::cerr << "INVALID_ARGUMENT: WinExInfoHost.exe --probe snapshot | "
-                     "--probe observe --duration-ms <1000..60000>\n";
+                     "--probe observe --duration-ms <1000..60000> | "
+                     "--gate-c-place --hwnd 0x<16 uppercase hex> "
+                     "--duration-ms <5000..30000>\n";
         return static_cast<int>(winexinfo::HostExitCode::InvalidCli);
     }
 
