@@ -19,6 +19,8 @@ winexinfo::Status Success() {
 struct PlacementRecorder final {
     HWND pane = reinterpret_cast<HWND>(std::uintptr_t{0x100});
     HWND parent = reinterpret_cast<HWND>(std::uintptr_t{0x200});
+    HWND tab = reinterpret_cast<HWND>(std::uintptr_t{0x300});
+    HWND top = reinterpret_cast<HWND>(std::uintptr_t{0x400});
     DWORD pid = 41;
     DWORD tid = 73;
     UINT dpi = 96;
@@ -34,16 +36,33 @@ struct PlacementRecorder final {
             [&] { return pid; },
             [&] { return tid; },
             [&](const HWND window, DWORD* const process) {
-                WXI_REQUIRE(window == pane || window == parent);
+                WXI_REQUIRE(window == pane || window == parent || window == tab ||
+                            window == top);
                 *process = pid;
                 return tid;
             },
             [&](const HWND window, std::wstring* const name) {
                 *name = window == pane
                     ? std::wstring{winexinfo::hook::kStatusPaneClassName}
-                    : std::wstring{winexinfo::hook::kStatusPaneParentClassName};
+                    : window == parent
+                    ? std::wstring{winexinfo::hook::kStatusPaneParentClassName}
+                    : window == tab ? L"ShellTabWindowClass" : L"CabinetWClass";
                 return Success();
             },
+            [&](const HWND window) {
+                if (window == parent) {
+                    return tab;
+                }
+                if (window == tab) {
+                    return top;
+                }
+                return HWND{nullptr};
+            },
+            [&](const HWND window) {
+                return window == top ? tab : HWND{nullptr};
+            },
+            [&](const HWND) { return HWND{nullptr}; },
+            [&](const HWND) { return true; },
             [&](const HWND window, const int index, LONG_PTR* const value) {
                 WXI_REQUIRE_EQ(window, pane);
                 *value = index == GWL_STYLE ? style : ex_style;
@@ -167,6 +186,7 @@ WXI_TEST(status_pane_placement_rejects_stale_worker_result, "status_pane.placeme
     const winexinfo::hook::StatusPanePlacementResult result{
         recorder.pid,
         recorder.tid,
+        recorder.top,
         recorder.parent,
         RECT{0, 0, 200, 30},
         true,
@@ -180,6 +200,7 @@ WXI_TEST(status_pane_placement_rejects_stale_worker_result, "status_pane.placeme
     const auto stale = winexinfo::hook::StatusPanePlacementResult{
         recorder.pid,
         recorder.tid + 1,
+        recorder.top,
         recorder.parent,
         RECT{0, 0, 200, 30},
         true,
@@ -190,23 +211,131 @@ WXI_TEST(status_pane_placement_rejects_stale_worker_result, "status_pane.placeme
     WXI_REQUIRE(recorder.calls.empty());
 }
 
-WXI_TEST(status_pane_placement_reflow_posts_once_until_consumed, "status_pane.placement.reflow") {
-    const HWND pane = reinterpret_cast<HWND>(std::uintptr_t{0x300});
-    winexinfo::hook::StatusPaneReflowState state{};
+WXI_TEST(status_pane_placement_rejects_inactive_or_stale_parent, "status_pane.placement.active_parent") {
+    PlacementRecorder recorder;
+    const winexinfo::hook::StatusPanePlacementResult result{
+        recorder.pid,
+        recorder.tid,
+        recorder.top,
+        recorder.parent,
+        RECT{0, 0, 200, 30},
+        true,
+    };
+
+    auto hidden = recorder.Operations();
+    hidden.is_window_visible = [&](const HWND window) {
+        return window != recorder.parent;
+    };
+    WXI_REQUIRE(!winexinfo::hook::ApplyStatusPanePlacementResultWithOperations(
+                     recorder.pane, result, hidden)
+                     .ok());
+    WXI_REQUIRE(recorder.calls.empty());
+
+    auto hiddenTab = recorder.Operations();
+    hiddenTab.is_window_visible = [&](const HWND window) {
+        return window != recorder.tab;
+    };
+    WXI_REQUIRE(!winexinfo::hook::ApplyStatusPanePlacementResultWithOperations(
+                     recorder.pane, result, hiddenTab)
+                     .ok());
+    WXI_REQUIRE(recorder.calls.empty());
+
+    auto reparented = recorder.Operations();
+    reparented.get_parent = [&](const HWND window) {
+        return window == recorder.parent ? recorder.top : HWND{nullptr};
+    };
+    WXI_REQUIRE(!winexinfo::hook::ApplyStatusPanePlacementResultWithOperations(
+                     recorder.pane, result, reparented)
+                     .ok());
+    WXI_REQUIRE(recorder.calls.empty());
+
+    const HWND otherTab = reinterpret_cast<HWND>(std::uintptr_t{0x500});
+    auto staleTab = recorder.Operations();
+    staleTab.get_first_child = [&](const HWND window) {
+        return window == recorder.top ? otherTab : HWND{nullptr};
+    };
+    staleTab.get_window_thread_process_id = [&](const HWND, DWORD* const process) {
+        *process = recorder.pid;
+        return recorder.tid;
+    };
+    staleTab.get_class_name = [&](const HWND window, std::wstring* const name) {
+        *name = window == recorder.pane
+            ? std::wstring{winexinfo::hook::kStatusPaneClassName}
+            : window == recorder.parent
+            ? std::wstring{winexinfo::hook::kStatusPaneParentClassName}
+            : window == recorder.top ? L"CabinetWClass" : L"ShellTabWindowClass";
+        return Success();
+    };
+    WXI_REQUIRE(!winexinfo::hook::ApplyStatusPanePlacementResultWithOperations(
+                     recorder.pane, result, staleTab)
+                     .ok());
+    WXI_REQUIRE(recorder.calls.empty());
+}
+
+WXI_TEST(status_pane_production_reflow_coalesces_and_owns_payload, "status_pane.placement.production_reflow") {
+    PlacementRecorder recorder;
+    winexinfo::hook::StatusPaneRefreshCoordinator coordinator{recorder.pane};
+    int wakes = 0;
     int posts = 0;
-    const auto post = [&](const HWND window, const UINT message) {
-        WXI_REQUIRE_EQ(window, pane);
+    const auto wake = [&] {
+        ++wakes;
+        return Success();
+    };
+    for (const UINT message : {WM_SIZE, WM_DPICHANGED, WM_THEMECHANGED, WM_SHOWWINDOW}) {
+        WXI_REQUIRE(coordinator.Signal(message, wake).ok());
+    }
+    WXI_REQUIRE_EQ(wakes, 1);
+
+    const winexinfo::hook::StatusPanePlacementResult result{
+        recorder.pid, recorder.tid, recorder.top, recorder.parent,
+        RECT{0, 0, 200, 30}, true};
+    WXI_REQUIRE(coordinator.Publish(result, [&](const HWND pane, const UINT message) {
+        WXI_REQUIRE_EQ(pane, recorder.pane);
         WXI_REQUIRE_EQ(message, winexinfo::hook::kStatusPaneReflowMessage);
         ++posts;
         return Success();
-    };
-    WXI_REQUIRE(winexinfo::hook::QueueStatusPaneReflow(pane, &state, post).ok());
-    WXI_REQUIRE(winexinfo::hook::QueueStatusPaneReflow(pane, &state, post).ok());
+    }).ok());
     WXI_REQUIRE_EQ(posts, 1);
-    WXI_REQUIRE(winexinfo::hook::ConsumeStatusPaneReflow(&state));
-    WXI_REQUIRE(!winexinfo::hook::ConsumeStatusPaneReflow(&state));
-    WXI_REQUIRE(winexinfo::hook::QueueStatusPaneReflow(pane, &state, post).ok());
-    WXI_REQUIRE_EQ(posts, 2);
+    WXI_REQUIRE_EQ(coordinator.pending_results(), std::size_t{1});
+
+    winexinfo::hook::StatusPanePlacementResult consumed{};
+    WXI_REQUIRE(coordinator.Consume(&consumed, wake));
+    WXI_REQUIRE_EQ(consumed.parent, recorder.parent);
+    WXI_REQUIRE_EQ(coordinator.pending_results(), std::size_t{0});
+    WXI_REQUIRE_EQ(wakes, 2);
+}
+
+WXI_TEST(status_pane_production_reflow_cleanup_reclaims_undispatched_result, "status_pane.placement.remove_before_dispatch") {
+    PlacementRecorder recorder;
+    winexinfo::hook::StatusPaneRefreshCoordinator coordinator{recorder.pane};
+    WXI_REQUIRE(coordinator.Signal(WM_SIZE, [] { return Success(); }).ok());
+    WXI_REQUIRE(coordinator.Publish(
+                    {recorder.pid, recorder.tid, recorder.top, recorder.parent,
+                     RECT{0, 0, 200, 30}, true},
+                    [](HWND, UINT) { return Success(); })
+                    .ok());
+    WXI_REQUIRE_EQ(coordinator.pending_results(), std::size_t{1});
+    coordinator.Stop();
+    WXI_REQUIRE_EQ(coordinator.pending_results(), std::size_t{0});
+    winexinfo::hook::StatusPanePlacementResult ignored{};
+    WXI_REQUIRE(!coordinator.Consume(&ignored, [] { return Success(); }));
+}
+
+WXI_TEST(status_pane_production_reflow_post_failure_reclaims_result, "status_pane.placement.post_failure") {
+    PlacementRecorder recorder;
+    winexinfo::hook::StatusPaneRefreshCoordinator coordinator{recorder.pane};
+    WXI_REQUIRE(coordinator.Signal(WM_SIZE, [] { return Success(); }).ok());
+    WXI_REQUIRE(!coordinator.Publish(
+                     {recorder.pid, recorder.tid, recorder.top, recorder.parent,
+                      RECT{0, 0, 200, 30}, true},
+                     [](HWND, UINT) {
+                         return winexinfo::Status{
+                             winexinfo::ErrorCode::WINDOW_ATTACH_FAILED,
+                             E_FAIL,
+                             ERROR_INVALID_WINDOW_HANDLE};
+                     })
+                     .ok());
+    WXI_REQUIRE_EQ(coordinator.pending_results(), std::size_t{0});
 }
 
 WXI_TEST(status_pane_placement_cleanup_removes_subclass_first, "status_pane.placement.lifetime") {

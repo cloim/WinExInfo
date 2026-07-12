@@ -5,7 +5,6 @@
 #include <CommCtrl.h>
 
 #include <string>
-#include <memory>
 
 namespace winexinfo::hook {
 namespace {
@@ -84,6 +83,10 @@ StatusPanePlacementOperations ProductionPlacementOperations() {
         &GetCurrentThreadId,
         &GetWindowThreadProcessId,
         &GetClassNameStatus,
+        &GetParent,
+        [](const HWND window) { return GetWindow(window, GW_CHILD); },
+        [](const HWND window) { return GetWindow(window, GW_HWNDNEXT); },
+        [](const HWND window) { return IsWindowVisible(window) != FALSE; },
         &GetWindowLongPtrStatus,
         &SetWindowLongPtrStatus,
         &SetParentStatus,
@@ -110,12 +113,10 @@ LRESULT CALLBACK StatusPaneSubclassProc(
     const LPARAM lparam,
     const UINT_PTR id,
     const DWORD_PTR reference) {
-    if (message == kStatusPaneReflowMessage && id == kStatusPaneSubclassId) {
-        std::unique_ptr<StatusPanePlacementResult> placement{
-            reinterpret_cast<StatusPanePlacementResult*>(lparam)};
-        if (placement) {
-            static_cast<void>(ApplyStatusPanePlacementResult(window, *placement));
-        }
+    if ((message == kStatusPaneReflowMessage ||
+         message == kStatusPaneRuntimeCleanupMessage) &&
+        id == kStatusPaneSubclassId &&
+        HandleStatusPaneRuntimeMessage(window, message)) {
         return 0;
     }
     if (message == kStatusPaneRemoveMessage && id == kStatusPaneSubclassId) {
@@ -279,6 +280,8 @@ Status ApplyStatusPanePlacementWithOperations(
         rect.bottom < rect.top || !operations.get_current_process_id ||
         !operations.get_current_thread_id ||
         !operations.get_window_thread_process_id || !operations.get_class_name ||
+        !operations.get_parent || !operations.get_first_child ||
+        !operations.get_next_sibling || !operations.is_window_visible ||
         !operations.get_window_long_ptr || !operations.set_window_long_ptr ||
         !operations.set_parent || !operations.get_dpi_for_window ||
         !operations.set_window_pos) {
@@ -364,29 +367,8 @@ Status ApplyStatusPanePlacement(
         pane, expectedParent, rect, visible, ProductionPlacementOperations());
 }
 
-Status QueueStatusPaneReflow(
-    const HWND pane,
-    StatusPaneReflowState* const state,
-    const StatusPanePostMessage& postMessage) {
-    if (pane == nullptr || state == nullptr || !postMessage) {
-        return Failure(ERROR_INVALID_PARAMETER);
-    }
-    if (state->pending) {
-        return Success();
-    }
-    const Status status = postMessage(pane, kStatusPaneReflowMessage);
-    if (status.ok()) {
-        state->pending = true;
-    }
-    return status;
-}
-
-bool ConsumeStatusPaneReflow(StatusPaneReflowState* const state) noexcept {
-    if (state == nullptr || !state->pending) {
-        return false;
-    }
-    state->pending = false;
-    return true;
+StatusPanePlacementOperations CreateProductionStatusPanePlacementOperations() {
+    return ProductionPlacementOperations();
 }
 
 }  // namespace winexinfo::hook

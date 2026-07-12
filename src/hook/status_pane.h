@@ -16,6 +16,7 @@ inline constexpr std::wstring_view kStatusPaneText = L"WinExInfo Gate B";
 inline constexpr UINT_PTR kStatusPaneSubclassId = 0x57495831;
 inline constexpr UINT kStatusPaneRemoveMessage = WM_APP + 0x571;
 inline constexpr UINT kStatusPaneReflowMessage = WM_APP + 0x572;
+inline constexpr UINT kStatusPaneRuntimeCleanupMessage = WM_APP + 0x573;
 inline constexpr std::wstring_view kStatusPaneParentClassName =
     L"DUIViewWndClassName";
 
@@ -38,15 +39,15 @@ struct StatusPanePlacementOperations final {
     std::function<DWORD()> get_current_thread_id;
     std::function<DWORD(HWND, DWORD*)> get_window_thread_process_id;
     std::function<Status(HWND, std::wstring*)> get_class_name;
+    std::function<HWND(HWND)> get_parent;
+    std::function<HWND(HWND)> get_first_child;
+    std::function<HWND(HWND)> get_next_sibling;
+    std::function<bool(HWND)> is_window_visible;
     std::function<Status(HWND, int, LONG_PTR*)> get_window_long_ptr;
     std::function<Status(HWND, int, LONG_PTR)> set_window_long_ptr;
     std::function<Status(HWND, HWND)> set_parent;
     std::function<UINT(HWND)> get_dpi_for_window;
     std::function<Status(HWND, HWND, int, int, int, int, UINT)> set_window_pos;
-};
-
-struct StatusPaneReflowState final {
-    bool pending = false;
 };
 
 using StatusPanePostMessage = std::function<Status(HWND, UINT)>;
@@ -73,10 +74,6 @@ using StatusPanePostMessage = std::function<Status(HWND, UINT)>;
     const RECT& rect,
     bool visible,
     const StatusPanePlacementOperations& operations) noexcept;
-[[nodiscard]] Status QueueStatusPaneReflow(
-    HWND pane,
-    StatusPaneReflowState* state,
-    const StatusPanePostMessage& postMessage);
-[[nodiscard]] bool ConsumeStatusPaneReflow(StatusPaneReflowState* state) noexcept;
-
+[[nodiscard]] StatusPanePlacementOperations
+CreateProductionStatusPanePlacementOperations();
 }  // namespace winexinfo::hook

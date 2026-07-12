@@ -7,6 +7,7 @@
 #include "ipc/protocol.h"
 
 #include <Windows.h>
+#include <CommCtrl.h>
 
 #include <atomic>
 #include <memory>
@@ -42,12 +43,103 @@ struct RuntimeContext final {
     HMODULE module_reference = nullptr;
     UniqueHandle hook_released;
     UniqueHandle cleanup_ack;
+    UniqueHandle refresh_event;
+    UniqueHandle refresh_stop;
+    UniqueHandle refresh_worker;
+    UniqueHandle parent_cleanup_ack;
     StatusPane pane{};
+    StatusPaneRefreshCoordinator refresh;
+    HWND refresh_parent = nullptr;
     HookRuntimeStateMachine state;
 };
 
 std::atomic<RuntimeContext*> g_runtime{nullptr};
 HookCallbackGate g_callback_gate;
+inline constexpr UINT_PTR kRuntimeParentSubclassId = 0x57495832;
+
+Status PostRuntimeMessage(const HWND pane, const UINT message) {
+    return PostMessageW(pane, message, 0, 0) != FALSE
+        ? Success()
+        : PlacementFailure(GetLastError());
+}
+
+Status WakeRefreshWorker(RuntimeContext* const context) {
+    return context != nullptr && SetEvent(context->refresh_event.get()) != FALSE
+        ? Success()
+        : PlacementFailure(GetLastError());
+}
+
+LRESULT CALLBACK RuntimeParentSubclassProc(
+    const HWND window,
+    const UINT message,
+    const WPARAM wparam,
+    const LPARAM lparam,
+    const UINT_PTR id,
+    const DWORD_PTR reference) {
+    auto* const context = reinterpret_cast<RuntimeContext*>(reference);
+    if (id == kRuntimeParentSubclassId && context != nullptr &&
+        (message == WM_SIZE || message == WM_DPICHANGED ||
+         message == WM_THEMECHANGED || message == WM_SHOWWINDOW)) {
+        static_cast<void>(context->refresh.Signal(
+            message, [context] { return WakeRefreshWorker(context); }));
+    }
+    return DefSubclassProc(window, message, wparam, lparam);
+}
+
+Status UpdateRuntimeParentSubclass(
+    RuntimeContext* const context,
+    const HWND parent) {
+    if (context->refresh_parent == parent) {
+        return Success();
+    }
+    if (context->refresh_parent != nullptr &&
+        RemoveWindowSubclass(
+            context->refresh_parent,
+            RuntimeParentSubclassProc,
+            kRuntimeParentSubclassId) == FALSE) {
+        return PlacementFailure(GetLastError());
+    }
+    context->refresh_parent = nullptr;
+    if (SetWindowSubclass(
+            parent,
+            RuntimeParentSubclassProc,
+            kRuntimeParentSubclassId,
+            reinterpret_cast<DWORD_PTR>(context)) == FALSE) {
+        return PlacementFailure(GetLastError());
+    }
+    context->refresh_parent = parent;
+    return Success();
+}
+
+DWORD WINAPI RefreshWorker(void* const parameter) {
+    auto* const context = static_cast<RuntimeContext*>(parameter);
+    const HANDLE waits[]{context->refresh_stop.get(), context->refresh_event.get()};
+    while (WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0 + 1) {
+        ExplorerLayoutMetrics metrics{};
+        HWND parent = nullptr;
+        RECT rect{};
+        Status status = CaptureExplorerLayout(context->target, &metrics, &parent);
+        if (status.ok()) {
+            status = ComputeStatusPaneRect(metrics, &rect);
+        }
+        if (status.ok()) {
+            const StatusPanePlacementResult result{
+                context->pid,
+                context->tid,
+                context->target,
+                parent,
+                rect,
+                rect.right > rect.left && rect.bottom > rect.top,
+            };
+            static_cast<void>(context->refresh.Publish(
+                result,
+                [](const HWND pane, const UINT message) {
+                    return PostRuntimeMessage(pane, message);
+                }));
+        }
+    }
+    return 0;
+}
 
 Status WriteAttachResult(
     const HANDLE pipe,
@@ -87,32 +179,11 @@ DWORD WINAPI RuntimeWorker(void* const parameter) {
         return 1;
     }
 
-    ExplorerLayoutMetrics metrics{};
-    HWND paneParent = nullptr;
-    RECT paneRect{};
-    status = CaptureExplorerLayout(context->target, &metrics, &paneParent);
-    if (status.ok()) {
-        status = ComputeStatusPaneRect(metrics, &paneRect);
-    }
-    if (status.ok()) {
-        auto placement = std::make_unique<StatusPanePlacementResult>(
-            StatusPanePlacementResult{
-                context->pid,
-                context->tid,
-                paneParent,
-                paneRect,
-                paneRect.right > paneRect.left && paneRect.bottom > paneRect.top,
-            });
-        if (PostMessageW(
-                context->pane.hwnd,
-                kStatusPaneReflowMessage,
-                0,
-                reinterpret_cast<LPARAM>(placement.get())) == FALSE) {
-            context.release();
-            return 1;
-        }
-        static_cast<void>(placement.release());
-    } else {
+    context->refresh_worker.reset(CreateThread(
+        nullptr, 0, RefreshWorker, context.get(), 0, nullptr));
+    if (!context->refresh_worker ||
+        !context->refresh.Signal(
+            WM_SIZE, [&context] { return WakeRefreshWorker(context.get()); }).ok()) {
         context.release();
         return 1;
     }
@@ -128,6 +199,20 @@ DWORD WINAPI RuntimeWorker(void* const parameter) {
     g_callback_gate.RejectNewWork();
     if (!detachRequested) {
         pipe.reset();
+    }
+
+    context->refresh.Stop();
+    if (SetEvent(context->refresh_stop.get()) == FALSE ||
+        WaitForSingleObject(context->refresh_worker.get(), 5000) != WAIT_OBJECT_0 ||
+        PostMessageW(
+            context->pane.hwnd,
+            kStatusPaneRuntimeCleanupMessage,
+            0,
+            0) == FALSE ||
+        WaitForSingleObject(context->parent_cleanup_ack.get(), 5000) !=
+            WAIT_OBJECT_0) {
+        context.release();
+        return 1;
     }
 
     status = RequestStatusPaneRemoval(context->pane.hwnd);
@@ -170,6 +255,40 @@ DWORD WINAPI RuntimeWorker(void* const parameter) {
 
 }  // namespace
 
+bool HandleStatusPaneRuntimeMessage(
+    const HWND pane,
+    const UINT message) noexcept {
+    RuntimeContext* const context = g_runtime.load(std::memory_order_acquire);
+    if (context == nullptr || context->pane.hwnd != pane) {
+        return false;
+    }
+    if (message == kStatusPaneRuntimeCleanupMessage) {
+        if (context->refresh_parent != nullptr) {
+            if (RemoveWindowSubclass(
+                    context->refresh_parent,
+                    RuntimeParentSubclassProc,
+                    kRuntimeParentSubclassId) == FALSE) {
+                return true;
+            }
+            context->refresh_parent = nullptr;
+        }
+        static_cast<void>(SetEvent(context->parent_cleanup_ack.get()));
+        return true;
+    }
+    if (message != kStatusPaneReflowMessage) {
+        return false;
+    }
+    StatusPanePlacementResult result{};
+    if (!context->refresh.Consume(
+            &result, [context] { return WakeRefreshWorker(context); })) {
+        return true;
+    }
+    if (ApplyStatusPanePlacementResult(pane, result).ok()) {
+        static_cast<void>(UpdateRuntimeParentSubclass(context, result.parent));
+    }
+    return true;
+}
+
 Status ApplyStatusPanePlacementResultWithOperations(
     const HWND pane,
     const StatusPanePlacementResult& result,
@@ -182,6 +301,46 @@ Status ApplyStatusPanePlacementResultWithOperations(
         operations.get_current_thread_id() != result.thread_id) {
         return PlacementFailure(ERROR_INVALID_WINDOW_HANDLE);
     }
+
+    const auto exactClass = [&](const HWND window, const std::wstring_view expected) {
+        DWORD process = 0;
+        if (window == nullptr ||
+            operations.get_window_thread_process_id(window, &process) != result.thread_id ||
+            process != result.process_id) {
+            return false;
+        }
+        std::wstring actual;
+        return operations.get_class_name(window, &actual).ok() && actual == expected;
+    };
+    if (!exactClass(result.top_level, L"CabinetWClass") ||
+        !operations.is_window_visible(result.top_level) ||
+        !exactClass(result.parent, kStatusPaneParentClassName) ||
+        !operations.is_window_visible(result.parent)) {
+        return PlacementFailure(ERROR_INVALID_WINDOW_HANDLE);
+    }
+
+    HWND activeTab = nullptr;
+    for (HWND child = operations.get_first_child(result.top_level);
+         child != nullptr;
+         child = operations.get_next_sibling(child)) {
+        std::wstring childClass;
+        if (operations.get_class_name(child, &childClass).ok() &&
+            childClass == L"ShellTabWindowClass" &&
+            operations.is_window_visible(child)) {
+            activeTab = child;
+            break;
+        }
+    }
+    if (!exactClass(activeTab, L"ShellTabWindowClass")) {
+        return PlacementFailure(ERROR_INVALID_WINDOW_HANDLE);
+    }
+    HWND ancestor = result.parent;
+    while (ancestor != nullptr && operations.get_parent(ancestor) != result.top_level) {
+        ancestor = operations.get_parent(ancestor);
+    }
+    if (ancestor != activeTab) {
+        return PlacementFailure(ERROR_INVALID_WINDOW_HANDLE);
+    }
     return ApplyStatusPanePlacementWithOperations(
         pane, result.parent, result.rect, result.visible, operations);
 }
@@ -189,11 +348,133 @@ Status ApplyStatusPanePlacementResultWithOperations(
 Status ApplyStatusPanePlacementResult(
     const HWND pane,
     const StatusPanePlacementResult& result) noexcept {
-    if (GetCurrentProcessId() != result.process_id ||
-        GetCurrentThreadId() != result.thread_id) {
-        return PlacementFailure(ERROR_INVALID_WINDOW_HANDLE);
+    return ApplyStatusPanePlacementResultWithOperations(
+        pane, result, CreateProductionStatusPanePlacementOperations());
+}
+
+StatusPaneRefreshCoordinator::StatusPaneRefreshCoordinator(const HWND pane) noexcept
+    : pane_(pane) {}
+
+void StatusPaneRefreshCoordinator::Initialize(const HWND pane) noexcept {
+    const std::scoped_lock lock{mutex_};
+    pane_ = pane;
+    stopped_ = false;
+}
+
+Status StatusPaneRefreshCoordinator::Signal(
+    const UINT message,
+    const std::function<Status()>& wakeWorker) {
+    if ((message != WM_SIZE && message != WM_DPICHANGED &&
+         message != WM_THEMECHANGED && message != WM_SHOWWINDOW) || !wakeWorker) {
+        return PlacementFailure(ERROR_INVALID_PARAMETER);
     }
-    return ApplyStatusPanePlacement(pane, result.parent, result.rect, result.visible);
+    {
+        const std::scoped_lock lock{mutex_};
+        if (stopped_ || pane_ == nullptr) {
+            return PlacementFailure(ERROR_INVALID_STATE);
+        }
+        dirty_ = true;
+        if (worker_active_ || dispatch_pending_) {
+            return Success();
+        }
+        worker_active_ = true;
+        dirty_ = false;
+    }
+    const Status status = wakeWorker();
+    if (!status.ok()) {
+        const std::scoped_lock lock{mutex_};
+        worker_active_ = false;
+        dirty_ = true;
+    }
+    return status;
+}
+
+Status StatusPaneRefreshCoordinator::Publish(
+    const StatusPanePlacementResult& result,
+    const StatusPanePostMessage& postMessage) {
+    if (!postMessage) {
+        return PlacementFailure(ERROR_INVALID_PARAMETER);
+    }
+    HWND pane = nullptr;
+    {
+        const std::scoped_lock lock{mutex_};
+        worker_active_ = false;
+        if (stopped_ || pane_ == nullptr) {
+            return PlacementFailure(ERROR_INVALID_STATE);
+        }
+        result_ = result;
+        if (dispatch_pending_) {
+            return Success();
+        }
+        dispatch_pending_ = true;
+        pane = pane_;
+    }
+    const Status status = postMessage(pane, kStatusPaneReflowMessage);
+    if (!status.ok()) {
+        const std::scoped_lock lock{mutex_};
+        dispatch_pending_ = false;
+        result_.reset();
+    }
+    return status;
+}
+
+bool StatusPaneRefreshCoordinator::Consume(
+    StatusPanePlacementResult* const result,
+    const std::function<Status()>& wakeWorker) {
+    if (result == nullptr || !wakeWorker) {
+        return false;
+    }
+    bool wake = false;
+    {
+        const std::scoped_lock lock{mutex_};
+        if (stopped_ || !dispatch_pending_ || !result_) {
+            return false;
+        }
+        *result = *result_;
+        result_.reset();
+        dispatch_pending_ = false;
+        if (dirty_) {
+            dirty_ = false;
+            worker_active_ = true;
+            wake = true;
+        }
+    }
+    if (wake && !wakeWorker().ok()) {
+        const std::scoped_lock lock{mutex_};
+        worker_active_ = false;
+        dirty_ = true;
+    }
+    return true;
+}
+
+void StatusPaneRefreshCoordinator::Stop() noexcept {
+    const std::scoped_lock lock{mutex_};
+    stopped_ = true;
+    worker_active_ = false;
+    dirty_ = false;
+    dispatch_pending_ = false;
+    result_.reset();
+}
+
+std::size_t StatusPaneRefreshCoordinator::pending_results() const noexcept {
+    const std::scoped_lock lock{mutex_};
+    return result_ ? 1u : 0u;
+}
+
+Status CleanupRuntimeRollback(
+    const RuntimeRollbackPath,
+    const StatusPaneOperations& operations,
+    StatusPane* const pane,
+    const std::function<void()>& releaseModule) {
+    if (!releaseModule) {
+        return PlacementFailure(ERROR_INVALID_PARAMETER);
+    }
+    const Status cleanup = RemoveStatusPane(operations, pane);
+    if (!cleanup.ok()) {
+        return cleanup;
+    }
+    releaseModule();
+    return Success();
 }
 
 bool HookCallbackGate::Enter() noexcept {
@@ -318,7 +599,11 @@ Status BeginHookRuntimeAttach(
     }
     context->module_reference = moduleReference;
     context->cleanup_ack.reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
-    if (!context->cleanup_ack) {
+    context->refresh_event.reset(CreateEventW(nullptr, FALSE, FALSE, nullptr));
+    context->refresh_stop.reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    context->parent_cleanup_ack.reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    if (!context->cleanup_ack || !context->refresh_event ||
+        !context->refresh_stop || !context->parent_cleanup_ack) {
         FreeLibrary(moduleReference);
         return {ErrorCode::DLL_INITIALIZATION_FAILED,
                 HRESULT_FROM_WIN32(GetLastError()), GetLastError()};
@@ -332,27 +617,38 @@ Status BeginHookRuntimeAttach(
         FreeLibrary(moduleReference);
         return status;
     }
+    context->refresh.Initialize(context->pane.hwnd);
     RuntimeContext* expected = nullptr;
     if (!g_runtime.compare_exchange_strong(
             expected, context.get(), std::memory_order_acq_rel)) {
-        static_cast<void>(RemoveStatusPane(
+        status = CleanupRuntimeRollback(
+            RuntimeRollbackPath::CompareExchange,
             CreateProductionStatusPaneOperations(
                 g_hook_module, context->cleanup_ack.get()),
-            &context->pane));
-        FreeLibrary(moduleReference);
+            &context->pane,
+            [moduleReference] { FreeLibrary(moduleReference); });
+        if (!status.ok()) {
+            context.release();
+        }
         return ContractFailure();
     }
     const HANDLE worker = CreateThread(
         nullptr, 0, RuntimeWorker, context.get(), 0, nullptr);
     if (worker == nullptr) {
-        g_runtime.store(nullptr, std::memory_order_release);
-        static_cast<void>(RemoveStatusPane(
+        const DWORD error = GetLastError();
+        status = CleanupRuntimeRollback(
+            RuntimeRollbackPath::WorkerCreation,
             CreateProductionStatusPaneOperations(
                 g_hook_module, context->cleanup_ack.get()),
-            &context->pane));
-        FreeLibrary(moduleReference);
+            &context->pane,
+            [moduleReference] { FreeLibrary(moduleReference); });
+        if (!status.ok()) {
+            context.release();
+        } else {
+            g_runtime.store(nullptr, std::memory_order_release);
+        }
         return {ErrorCode::DLL_INITIALIZATION_FAILED,
-                HRESULT_FROM_WIN32(GetLastError()), GetLastError()};
+                HRESULT_FROM_WIN32(error), error};
     }
     CloseHandle(worker);
     context.release();

@@ -218,6 +218,57 @@ WXI_TEST(hook_runtime_status_pane_uses_exact_subclass_identity, "hook_runtime.st
     WXI_REQUIRE_EQ(pane.hwnd, nullptr);
 }
 
+WXI_TEST(hook_runtime_rollback_retains_module_when_pane_cleanup_fails, "hook_runtime.rollback_retention") {
+    const HWND child = reinterpret_cast<HWND>(std::uintptr_t{0x610});
+    for (const auto path : {
+             winexinfo::hook::RuntimeRollbackPath::CompareExchange,
+             winexinfo::hook::RuntimeRollbackPath::WorkerCreation}) {
+        winexinfo::hook::StatusPane pane{child, true};
+        int releases = 0;
+        const winexinfo::hook::StatusPaneOperations operations{
+            [](std::wstring_view) { return Success(); },
+            [](HWND, std::wstring_view, std::wstring_view, HWND*) {
+                return Success();
+            },
+            [](HWND, UINT_PTR) { return Success(); },
+            [](HWND, UINT_PTR) {
+                return winexinfo::Status{
+                    winexinfo::ErrorCode::WINDOW_ATTACH_FAILED,
+                    E_FAIL,
+                    ERROR_INVALID_STATE};
+            },
+            [](HWND) { return Success(); },
+        };
+        WXI_REQUIRE(!winexinfo::hook::CleanupRuntimeRollback(
+                         path, operations, &pane, [&] { ++releases; })
+                         .ok());
+        WXI_REQUIRE_EQ(releases, 0);
+        WXI_REQUIRE_EQ(pane.hwnd, child);
+        WXI_REQUIRE(pane.subclass_installed);
+    }
+}
+
+WXI_TEST(hook_runtime_rollback_releases_module_after_exact_cleanup, "hook_runtime.rollback_cleanup") {
+    winexinfo::hook::StatusPane pane{
+        reinterpret_cast<HWND>(std::uintptr_t{0x620}), true};
+    int releases = 0;
+    const winexinfo::hook::StatusPaneOperations operations{
+        [](std::wstring_view) { return Success(); },
+        [](HWND, std::wstring_view, std::wstring_view, HWND*) { return Success(); },
+        [](HWND, UINT_PTR) { return Success(); },
+        [](HWND, UINT_PTR) { return Success(); },
+        [](HWND) { return Success(); },
+    };
+    WXI_REQUIRE(winexinfo::hook::CleanupRuntimeRollback(
+                    winexinfo::hook::RuntimeRollbackPath::WorkerCreation,
+                    operations,
+                    &pane,
+                    [&] { ++releases; })
+                    .ok());
+    WXI_REQUIRE_EQ(releases, 1);
+    WXI_REQUIRE_EQ(pane.hwnd, nullptr);
+}
+
 WXI_TEST(hook_runtime_cli_is_exact, "hook_runtime.cli") {
     winexinfo::tests::HookTestCommand command{};
     WXI_REQUIRE(ParseHookCommand(
