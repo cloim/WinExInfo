@@ -2,7 +2,10 @@
 param(
     [Parameter()]
     [ValidateSet('Debug', 'Release')]
-    [string]$Configuration = 'Release'
+    [string]$Configuration = 'Release',
+
+    [Parameter(DontShow)]
+    [switch]$ExportHelpers
 )
 
 $ErrorActionPreference = 'Stop'
@@ -476,6 +479,8 @@ function Assert-Equal([long]$Actual, [long]$Expected, [string]$Contract) {
 function Assert-RectEqual($Actual, $Expected, [string]$Contract) {
     if ($Actual.ToString() -cne $Expected.ToString()) { throw "$Contract actual=$Actual expected=$Expected" }
 }
+
+if ($ExportHelpers) { return }
 
 $before = Get-SafetyState
 $beforeWindows = @(Get-StableShellWindows)
