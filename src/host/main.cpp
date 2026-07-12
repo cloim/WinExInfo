@@ -1,6 +1,7 @@
 #include "common/utf8.h"
 #include "host/command_line.h"
 #include "host/com_apartment.h"
+#include "host/explorer_controller.h"
 #include "probe/probe_runner.h"
 #include "probe/report_writer.h"
 
@@ -8,6 +9,7 @@
 #include <objbase.h>
 
 #include <iostream>
+#include <filesystem>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -38,6 +40,22 @@ int wmain(const int argc, const wchar_t* const argv[]) {
                      "--gate-c-place --hwnd 0x<16 uppercase hex> "
                      "--duration-ms <5000..30000>\n";
         return static_cast<int>(winexinfo::HostExitCode::InvalidCli);
+    }
+
+    if (command.command == winexinfo::HostCommand::GateCPlace) {
+        wchar_t executable[32768]{};
+        const DWORD length = GetModuleFileNameW(nullptr, executable, 32768);
+        if (length == 0 || length == 32768) {
+            return static_cast<int>(winexinfo::HostExitCode::Win32ComFailure);
+        }
+        const std::wstring hookDllPath =
+            (std::filesystem::path{std::wstring{executable, length}}.parent_path() /
+             L"WinExInfoHook.dll").wstring();
+        return static_cast<int>(winexinfo::RunGateCPlacement(
+            reinterpret_cast<HWND>(
+                static_cast<std::uintptr_t>(command.target_hwnd)),
+            command.duration_ms,
+            hookDllPath));
     }
 
     const HRESULT initialized =
