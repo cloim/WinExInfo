@@ -1,6 +1,7 @@
 #include "test_framework.h"
 
 #include "host/command_line.h"
+#include "probe/probe_runner.h"
 #include "probe/report_writer.h"
 
 #include <cstdint>
@@ -146,6 +147,43 @@ WXI_TEST(report_orders_keys, "report.orders_keys") {
             "beta=4\n"
             "theta=3\n"
             "error_code=EXPLORER_UI_CONTRACT_MISMATCH\n"});
+}
+
+WXI_TEST(
+    report_observe_infrastructure_failure_uses_fixed_schema,
+    "report.observe_infrastructure_failure_schema") {
+    const winexinfo::Status failure{
+        winexinfo::ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH,
+        RPC_E_CHANGED_MODE,
+        ERROR_SUCCESS,
+    };
+    const winexinfo::ProbeRunResult result =
+        winexinfo::CreateObserveInfrastructureFailure(
+            45000,
+            failure,
+            "host.com_initialize");
+    WXI_REQUIRE_EQ(
+        result.exit_code,
+        winexinfo::HostExitCode::Win32ComFailure);
+    WXI_REQUIRE_EQ(
+        result.report.error_code,
+        winexinfo::ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH);
+    std::string output;
+    WXI_REQUIRE(winexinfo::WriteProbeReport(result.report, &output).ok());
+    WXI_REQUIRE(output.find("mode=observe\n") != std::string::npos);
+    WXI_REQUIRE(output.find("result=fail\n") != std::string::npos);
+    WXI_REQUIRE(
+        output.find("observe.runtime.stage=host.com_initialize\n") !=
+        std::string::npos);
+    WXI_REQUIRE(
+        output.find(
+            "observe.runtime.hresult=" +
+            std::to_string(static_cast<long>(RPC_E_CHANGED_MODE)) + "\n") !=
+        std::string::npos);
+    WXI_REQUIRE(
+        output.find("error_code=ACTIVE_VIEW_CONTRACT_MISMATCH\n") !=
+        std::string::npos);
+    WXI_REQUIRE_EQ(output.find("observe_report_"), std::string::npos);
 }
 
 }  // namespace

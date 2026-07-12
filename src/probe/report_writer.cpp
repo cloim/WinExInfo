@@ -438,6 +438,12 @@ Status AppendEventObservationReportFields(
         {"observe.runtime.hresult", std::to_string(snapshot.runtime_status.hresult)},
         {"observe.runtime.win32", std::to_string(snapshot.runtime_status.win32)},
     };
+    if (!snapshot.runtime_stage.empty()) {
+        runtime.fields.push_back({
+            "observe.runtime.stage",
+            snapshot.runtime_stage,
+        });
+    }
     additions.push_back(std::move(runtime));
 
     for (std::size_t index = 0; index < snapshot.events.size(); ++index) {
@@ -577,9 +583,8 @@ Status AppendEventObservationReportFields(
               event.transition == ObservedEventTransition::Remapped ||
               event.transition == ObservedEventTransition::Mismatch)) ||
             (event.kind == ObservedEventKind::WindowRevoked &&
-             (event.transition == ObservedEventTransition::Revoked ||
-              event.transition == ObservedEventTransition::Remapped ||
-              event.transition == ObservedEventTransition::Mismatch)) ||
+              (event.transition == ObservedEventTransition::Revoked ||
+               event.transition == ObservedEventTransition::Mismatch)) ||
             ((event.kind == ObservedEventKind::NavigateComplete2 ||
               event.kind == ObservedEventKind::TabSelected ||
               event.kind == ObservedEventKind::TabStructureChanged) &&

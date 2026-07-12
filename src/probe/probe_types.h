@@ -127,6 +127,7 @@ struct EventObservationSnapshot final {
     Status runtime_status;
     Status cleanup_status;
     std::vector<ObservedEventRecord> events;
+    std::string runtime_stage;
 };
 
 }  // namespace winexinfo

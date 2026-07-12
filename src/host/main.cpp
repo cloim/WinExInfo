@@ -32,36 +32,54 @@ int wmain(const int argc, const wchar_t* const argv[]) {
 
     winexinfo::ParsedCommand command{};
     const winexinfo::Status parsed = winexinfo::ParseCommandLine(argumentViews, &command);
-    if (!parsed.ok() || command.command != winexinfo::HostCommand::ProbeSnapshot) {
-        std::cerr << "INVALID_ARGUMENT: WinExInfoHost.exe --probe snapshot\n";
+    if (!parsed.ok()) {
+        std::cerr << "INVALID_ARGUMENT: WinExInfoHost.exe --probe snapshot | "
+                     "--probe observe --duration-ms <1000..60000>\n";
         return static_cast<int>(winexinfo::HostExitCode::InvalidCli);
     }
 
     const HRESULT initialized =
         CoInitializeEx(nullptr, winexinfo::kShellComApartmentFlags);
     if (FAILED(initialized)) {
-        const winexinfo::ProbeReport report{
-            winexinfo::ProbeMode::Snapshot,
-            false,
-            {{
-                {
-                    {"com_initialize_hresult", std::to_string(initialized)},
-                },
-            }},
-            winexinfo::ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH,
-        };
+        const winexinfo::ProbeRunResult failureResult =
+            command.command == winexinfo::HostCommand::ProbeObserve
+            ? winexinfo::CreateObserveInfrastructureFailure(
+                  command.duration_ms,
+                  {
+                      winexinfo::ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH,
+                      initialized,
+                      ERROR_SUCCESS,
+                  },
+                  "host.com_initialize")
+            : winexinfo::ProbeRunResult{
+                  {
+                      winexinfo::ProbeMode::Snapshot,
+                      false,
+                      {{
+                          {
+                              {"com_initialize_hresult",
+                               std::to_string(initialized)},
+                          },
+                      }},
+                      winexinfo::ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH,
+                  },
+                  winexinfo::HostExitCode::Win32ComFailure,
+              };
         std::string serialized;
         const winexinfo::Status written =
-            winexinfo::WriteProbeReport(report, &serialized);
+            winexinfo::WriteProbeReport(failureResult.report, &serialized);
         if (!written.ok()) {
             std::cerr << "ACTIVE_VIEW_CONTRACT_MISMATCH: report serialization failed\n";
             return static_cast<int>(winexinfo::HostExitCode::Win32ComFailure);
         }
         std::cout << serialized;
-        return static_cast<int>(winexinfo::HostExitCode::Win32ComFailure);
+        return static_cast<int>(failureResult.exit_code);
     }
 
-    winexinfo::ProbeRunResult result = winexinfo::RunSnapshotProbe();
+    winexinfo::ProbeRunResult result =
+        command.command == winexinfo::HostCommand::ProbeObserve
+        ? winexinfo::RunObserveProbe(command.duration_ms)
+        : winexinfo::RunSnapshotProbe();
     std::string serialized;
     const winexinfo::Status written =
         winexinfo::WriteProbeReport(result.report, &serialized);

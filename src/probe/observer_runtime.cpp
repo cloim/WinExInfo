@@ -293,8 +293,6 @@ Status ClassifyObserverShellSetTransition(
         kind == ObserverShellTransitionKind::Registered ||
         kind == ObserverShellTransitionKind::Revoked;
     if (!validKind || output == nullptr ||
-        (kind == ObserverShellTransitionKind::Registered &&
-         resolvedAddedIdentity == 0) ||
         (kind != ObserverShellTransitionKind::Registered &&
          resolvedAddedIdentity != 0)) {
         return ContractFailure(E_INVALIDARG, ERROR_INVALID_PARAMETER);
@@ -358,12 +356,113 @@ Status ClassifyObserverShellSetTransition(
         !candidate.removed.has_value();
     const bool exactRegistered = candidate.added.has_value() &&
         !candidate.removed.has_value() &&
-        candidate.added->canonical_identity == resolvedAddedIdentity;
+        (resolvedAddedIdentity == 0 ||
+         candidate.added->canonical_identity == resolvedAddedIdentity);
     const bool exactRevoked = !candidate.added.has_value() &&
         candidate.removed.has_value();
     if ((kind == ObserverShellTransitionKind::Stable && !exactStable) ||
         (kind == ObserverShellTransitionKind::Registered && !exactRegistered) ||
         (kind == ObserverShellTransitionKind::Revoked && !exactRevoked)) {
+        return ContractFailure();
+    }
+    *output = candidate;
+    return Success();
+}
+
+Status CorrelateObserverShellLifecycle(
+    const ObservedEventKind kind,
+    const std::span<const ObserverShellEntryMetadata> previous,
+    const std::span<const ObserverShellEntryMetadata> current,
+    const std::uintptr_t resolvedAddedIdentity,
+    const std::map<HWND, std::uint64_t>& activeGenerations,
+    const std::map<HWND, std::uint64_t>& latestGenerations,
+    ObserverShellLifecycleCorrelation* const output) {
+    if (output == nullptr ||
+        (kind != ObservedEventKind::WindowRegistered &&
+         kind != ObservedEventKind::WindowRevoked)) {
+        return ContractFailure(E_INVALIDARG, ERROR_INVALID_PARAMETER);
+    }
+    for (const auto& [topLevel, generation] : latestGenerations) {
+        if (topLevel == nullptr || generation == 0) {
+            return ContractFailure();
+        }
+    }
+    for (const auto& [topLevel, generation] : activeGenerations) {
+        const auto latest = latestGenerations.find(topLevel);
+        if (topLevel == nullptr || generation == 0 ||
+            latest == latestGenerations.end() ||
+            latest->second != generation) {
+            return ContractFailure();
+        }
+    }
+
+    ObserverShellSetTransition transition{};
+    ObserverShellEntryMetadata entry{};
+    if (kind == ObservedEventKind::WindowRegistered) {
+        const Status classified = ClassifyObserverShellSetTransition(
+            ObserverShellTransitionKind::Registered,
+            previous,
+            current,
+            resolvedAddedIdentity,
+            &transition);
+        if (!classified.ok()) {
+            return classified;
+        }
+        entry = *transition.added;
+    } else {
+        const Status classified = ClassifyObserverShellSetTransition(
+            ObserverShellTransitionKind::Revoked,
+            previous,
+            current,
+            0,
+            &transition);
+        if (!classified.ok()) {
+            return classified;
+        }
+        entry = *transition.removed;
+    }
+    ObserverShellLifecycleCorrelation candidate{
+        entry.target_matched,
+        false,
+        entry,
+        0,
+        0,
+    };
+    if (!entry.target_matched) {
+        *output = candidate;
+        return Success();
+    }
+
+    const auto active = activeGenerations.find(entry.top_level);
+    if (kind == ObservedEventKind::WindowRevoked) {
+        if (active == activeGenerations.end()) {
+            return ContractFailure();
+        }
+        candidate.generation = active->second;
+    } else if (active != activeGenerations.end()) {
+        candidate.generation = active->second;
+    } else {
+        candidate.new_top_level = true;
+        const auto latest = latestGenerations.find(entry.top_level);
+        if (latest != latestGenerations.end()) {
+            if (latest->second == std::numeric_limits<std::uint64_t>::max()) {
+                return ContractFailure();
+            }
+            candidate.generation = latest->second + 1;
+        } else {
+            candidate.generation = 1;
+        }
+    }
+    candidate.top_level_entry_count = static_cast<std::size_t>(
+        std::count_if(
+            current.begin(),
+            current.end(),
+            [&](const ObserverShellEntryMetadata& candidateEntry) {
+                return candidateEntry.target_matched &&
+                    candidateEntry.top_level == entry.top_level;
+            }));
+    if (kind == ObservedEventKind::WindowRegistered &&
+        candidate.top_level_entry_count == 0) {
         return ContractFailure();
     }
     *output = candidate;
@@ -634,7 +733,7 @@ Status StartObserverShellSubscriptions(
             for (const ObserverShellEntryMetadata& entry : first) {
                 hasTarget = hasTarget || entry.target_matched;
             }
-            if (!validation.ok() || first.empty() || !hasTarget) {
+            if (!validation.ok() || (!first.empty() && !hasTarget)) {
                 candidate.setup = ContractOperationFailure();
             }
             (void)captureEmergency();
@@ -1006,6 +1105,7 @@ Status ObserverCallbackQueue::CompleteFailure(
     slot->failure = terminalFailure;
     slot->state = ObserverCallbackSlotState::Failure;
     --in_flight_;
+    has_callback_failure_ = true;
     RecordEmergencyLocked(terminalFailure, ticket.sequence);
     const Status signalStatus = SignalWakeLocked(ticket.sequence);
     return validFailure ? signalStatus : terminalFailure.status;
@@ -1148,6 +1248,11 @@ std::size_t ObserverCallbackQueue::late_event_count() const noexcept {
 std::size_t ObserverCallbackQueue::ignored_event_count() const noexcept {
     std::scoped_lock lock{mutex_};
     return ignored_event_count_;
+}
+
+bool ObserverCallbackQueue::has_callback_failure() const noexcept {
+    std::scoped_lock lock{mutex_};
+    return has_callback_failure_;
 }
 
 HANDLE ObserverCallbackQueue::wake_event() const noexcept {
@@ -2069,11 +2174,13 @@ ObserverOperationResult FindRegisteredShellDispatch(
     VariantInit(&location);
     location.vt = VT_I4;
     location.lVal = lifecycleCookie;
+    VARIANT root{};
+    VariantInit(&root);
     long legacyHwnd = 0;
     IDispatch* rawDispatch = nullptr;
     const HRESULT hresult = operations.find_window(
         &location,
-        nullptr,
+        &root,
         SWC_EXPLORER,
         &legacyHwnd,
         SWFO_COOKIEPASSED | SWFO_NEEDDISPATCH,
@@ -2436,9 +2543,6 @@ Status StartObserverShellStaResources(
                 }
                 graph->target_top_levels.push_back(window.hwnd);
             }
-            if (windows.empty()) {
-                recordFailure(ContractOperationFailure());
-            }
         } catch (const std::bad_alloc&) {
             recordFailure(TransportOperationFailure(E_OUTOFMEMORY));
         }
@@ -2498,6 +2602,11 @@ Status StartObserverShellStaResources(
         if (metadata == nullptr || !metadata->empty()) {
             return ContractOperationFailure(
                 E_INVALIDARG, ERROR_INVALID_PARAMETER);
+        }
+        if (graph->target_top_levels.empty()) {
+            graph->browser_set = {};
+            graph->captured_browsers.clear();
+            return OperationSuccess();
         }
         ObserverShellStaCapture capture{};
         ObserverOperationResult result = operations.capture(
@@ -2578,6 +2687,12 @@ Status StartObserverShellStaResources(
             browser->browser,
             {},
         };
+        try {
+            graph->browser_resources.reserve(
+                graph->browser_resources.size() + 1);
+        } catch (const std::bad_alloc&) {
+            return TransportOperationFailure(E_OUTOFMEMORY);
+        }
         result = operations.advise(
             resource.browser.Get(),
             DIID_DWebBrowserEvents2,
@@ -2594,12 +2709,7 @@ Status StartObserverShellStaResources(
         if (!result.ok()) {
             return result;
         }
-        try {
-            graph->browser_resources.push_back(std::move(resource));
-        } catch (const std::bad_alloc&) {
-            static_cast<void>(operations.unadvise(&resource.connection));
-            return TransportOperationFailure(E_OUTOFMEMORY);
-        }
+        graph->browser_resources.push_back(std::move(resource));
         *id = graph->next_registration_id++;
         return OperationSuccess();
     };

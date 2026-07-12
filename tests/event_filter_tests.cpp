@@ -542,6 +542,35 @@ WXI_TEST(event_filter_validates_structure_change_matrix, "event_filter.structure
     RequireMismatch(winexinfo::ClassifyUiaEvent(evidence, &accepted, &kind));
 }
 
+WXI_TEST(
+    event_filter_accepts_exact_structure_subscription_scope_provenance,
+    "event_filter.structure_subscription_scope_provenance") {
+    bool accepted = false;
+    winexinfo::ObservedEventKind kind =
+        winexinfo::ObservedEventKind::WindowRegistered;
+    winexinfo::UiaEventEvidence evidence =
+        StructureEvidence(StructureChangeType_ChildAdded);
+    evidence.sender_relation =
+        winexinfo::UiaSenderRelation::RegisteredSubtree;
+    WXI_REQUIRE(winexinfo::ClassifyUiaEvent(
+                    evidence, &accepted, &kind)
+                    .ok());
+    WXI_REQUIRE(accepted);
+    WXI_REQUIRE_EQ(kind, winexinfo::ObservedEventKind::TabStructureChanged);
+
+    evidence = StructureEvidence(StructureChangeType_ChildRemoved);
+    evidence.sender_relation =
+        winexinfo::UiaSenderRelation::RegisteredSubtree;
+    WXI_REQUIRE(winexinfo::ClassifyUiaEvent(
+                    evidence, &accepted, &kind)
+                    .ok());
+    WXI_REQUIRE(accepted);
+
+    evidence.registered_scope = TreeScope_Children;
+    RequireMismatch(winexinfo::ClassifyUiaEvent(
+        evidence, &accepted, &kind));
+}
+
 WXI_TEST(event_filter_requires_exact_uia_registration_contract, "event_filter.uia_registration_contract") {
     WXI_REQUIRE(winexinfo::ValidateUiaHandlerContract(
                     ExactHandlerContract(winexinfo::UiaHandlerKind::Selection))
@@ -825,6 +854,35 @@ WXI_TEST(event_filter_records_pending_revoke_and_drops_stale_generation, "event_
     RequireDropped(afterRevoke, accepted);
 }
 
+WXI_TEST(
+    event_filter_allows_empty_initial_baseline_before_first_registration,
+    "event_filter.empty_initial_baseline") {
+    winexinfo::EventCorrelationReducer reducer;
+    WXI_REQUIRE(reducer.FinalizeInitialBaseline().ok());
+    RequireMismatch(reducer.FinalizeInitialBaseline());
+    const winexinfo::ObservedEventTrigger registered{
+        winexinfo::ObservedEventKind::WindowRegistered,
+        Handle(0x100),
+        1,
+        true,
+        Handle(0x101),
+        false,
+        true,
+        41,
+        winexinfo::ObservedStructureChangeType::None,
+    };
+    const winexinfo::LogicalActiveViewState pending{
+        nullptr,
+        0,
+        false,
+        {},
+        {winexinfo::ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH, S_FALSE, 0},
+    };
+    winexinfo::ObservedEventRecord record{};
+    WXI_REQUIRE(reducer.RecordRegistered(registered, 1, pending, &record).ok());
+    WXI_REQUIRE_EQ(record.transition, winexinfo::ObservedEventTransition::Pending);
+}
+
 WXI_TEST(event_filter_preserves_top_level_across_tab_entry_revoke, "event_filter.multi_tab_entry_lifecycle") {
     winexinfo::EventCorrelationReducer reducer;
     const winexinfo::LogicalActiveViewState initial{
@@ -862,12 +920,16 @@ WXI_TEST(event_filter_preserves_top_level_across_tab_entry_revoke, "event_filter
         {winexinfo::ErrorCode::OK, S_OK, 0},
     };
     RequireMismatch(reducer.RecordRevoked(revoked, 0, terminalState, &record));
-    RequireMismatch(reducer.RecordRevoked(revoked, 2, next, &record));
-    WXI_REQUIRE(reducer.RecordRevoked(revoked, 1, next, &record).ok());
-    WXI_REQUIRE_EQ(record.transition, winexinfo::ObservedEventTransition::Remapped);
+    RequireMismatch(reducer.RecordRevoked(revoked, 2, terminalState, &record));
+    RequireMismatch(reducer.RecordRevoked(revoked, 1, next, &record));
+    WXI_REQUIRE(reducer.RecordRevoked(revoked, 1, terminalState, &record).ok());
+    WXI_REQUIRE_EQ(record.transition, winexinfo::ObservedEventTransition::Revoked);
+    WXI_REQUIRE_EQ(record.current_active_view, nullptr);
+    WXI_REQUIRE_EQ(record.active_view_count, std::size_t{0});
     winexinfo::LogicalActiveViewState current{};
     WXI_REQUIRE(reducer.GetWindowState(Handle(0x100), 4, &current).ok());
-    WXI_REQUIRE_EQ(current.active_view, Handle(0x400));
+    WXI_REQUIRE_EQ(current.active_view, nullptr);
+    WXI_REQUIRE_EQ(current.active_view_count, std::size_t{0});
 
     winexinfo::ObservedEventTrigger closeWindow = registered;
     closeWindow.kind = winexinfo::ObservedEventKind::WindowRevoked;
@@ -954,6 +1016,8 @@ WXI_TEST(event_filter_binds_initial_entry_cookie_from_exact_difference, "event_f
     };
     const winexinfo::LogicalActiveViewState remaining{
         Handle(0x400), 1, true, L"C:\\next", {winexinfo::ErrorCode::OK, S_OK, 0}};
+    const winexinfo::LogicalActiveViewState terminal{
+        nullptr, 0, false, {}, {winexinfo::ErrorCode::OK, S_OK, 0}};
     winexinfo::ObservedEventRecord record{};
     record.sequence = 88;
     std::uint64_t removed = 99;
@@ -984,24 +1048,31 @@ WXI_TEST(event_filter_binds_initial_entry_cookie_from_exact_difference, "event_f
     WXI_REQUIRE_EQ(removed, std::uint64_t{99});
     WXI_REQUIRE_EQ(record.sequence, std::uint64_t{88});
 
+    RequireMismatch(reducer.ReconcileInitialEntryRevoke(
+        70,
+        both,
+        onlySecond,
+        firstRevoked,
+        1,
+        remaining,
+        &record,
+        &removed));
     WXI_REQUIRE(reducer.ReconcileInitialEntryRevoke(
                     70,
                     both,
                     onlySecond,
                     firstRevoked,
                     1,
-                    remaining,
+                    terminal,
                     &record,
                     &removed)
                     .ok());
     WXI_REQUIRE_EQ(removed, std::uint64_t{1});
-    WXI_REQUIRE_EQ(record.transition, winexinfo::ObservedEventTransition::Remapped);
+    WXI_REQUIRE_EQ(record.transition, winexinfo::ObservedEventTransition::Revoked);
 
     winexinfo::ObservedEventTrigger secondRevoked = firstRevoked;
     secondRevoked.source_shell_tab = Handle(0x220);
     secondRevoked.shell_cookie = 71;
-    const winexinfo::LogicalActiveViewState terminal{
-        nullptr, 0, false, {}, {winexinfo::ErrorCode::OK, S_OK, 0}};
     WXI_REQUIRE(reducer.ReconcileInitialEntryRevoke(
                     71,
                     onlySecond,
@@ -1837,7 +1908,9 @@ WXI_TEST(event_filter_report_validates_transition_matrix, "event_filter.report_t
     snapshot.events[0].shell_cookie_present = true;
     snapshot.events[0].shell_cookie = 41;
     snapshot.kind_counts = {0, 1, 0, 0, 0};
-    requireAccepted(snapshot);
+    report.sections.clear();
+    RequireMismatch(winexinfo::AppendEventObservationReportFields(
+        snapshot, &report));
     requireAccepted(makeMismatch(snapshot));
 
     snapshot = ExactObservation();
