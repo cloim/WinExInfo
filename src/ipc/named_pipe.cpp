@@ -119,6 +119,21 @@ Status BuildCurrentUserPipeName(std::wstring* const output) {
     return Success();
 }
 
+Status BuildCurrentUserPipeNameForProcess(
+    const DWORD processId,
+    std::wstring* const output) {
+    if (processId == 0 || output == nullptr) return InvalidArgument();
+    std::wstring base;
+    Status status = BuildCurrentUserPipeName(&base);
+    if (!status.ok()) return status;
+    try {
+        *output = std::move(base) + L"." + std::to_wstring(processId);
+        return Success();
+    } catch (const std::bad_alloc&) {
+        return {ErrorCode::IPC_PROTOCOL_ERROR, E_OUTOFMEMORY, ERROR_SUCCESS};
+    }
+}
+
 Status CreateControllerPipeServer(
     const std::wstring_view pipeName,
     UniqueHandle* const output) {
@@ -159,7 +174,7 @@ Status CreateControllerPipeServer(
     std::wstring name{pipeName};
     const HANDLE pipe = CreateNamedPipeW(
         name.c_str(),
-        PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+        PIPE_ACCESS_DUPLEX,
         kControllerPipeMode,
         1,
         static_cast<DWORD>(kMaximumFrameSize),
@@ -352,7 +367,9 @@ Status ReadFrame(UniqueHandle* const pipe, DecodedFrame* const output) {
     const bool validHeader =
         std::equal(header.begin(), header.begin() + 4, std::array{'W', 'X', 'I', '1'}.begin()) &&
         header[4] == 1 && header[5] == 0 && header[7] == 0 &&
-        (header[6] == 3 || header[6] == 4 || header[6] == 5) &&
+        (header[6] == 3 || header[6] == 4 || header[6] == 5 ||
+         header[6] == 6 || header[6] == 7 || header[6] == 8 ||
+         header[6] == 9 || header[6] == 10 || header[6] == 11) &&
         payloadLength <= kMaximumFrameSize - kFrameHeaderSize;
     if (!validHeader) {
         pipe->reset();

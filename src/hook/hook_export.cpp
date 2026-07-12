@@ -1,4 +1,5 @@
 #include "hook/hook_entry.h"
+#include "hook/process_runtime.h"
 #include "hook/runtime.h"
 
 #include "injection/thread_hook_injector.h"
@@ -44,8 +45,14 @@ extern "C" LRESULT CALLBACK WinExInfoCallWndProc(
                       S_FALSE,
                       ERROR_INVALID_STATE};
         },
+        [](const HWND window, const UINT message) {
+            winexinfo::hook::NotifyHookRuntimeWindowMessage(window, message);
+        },
         [](const int nextCode, const WPARAM nextWparam, const LPARAM nextLparam) {
             return CallNextHookEx(nullptr, nextCode, nextWparam, nextLparam);
+        },
+        [](HWND window, UINT message, WPARAM wp, LPARAM lp) {
+            return winexinfo::hook::HandleProcessRuntimeControlMessage(window, message, wp, lp);
         },
     };
     return winexinfo::hook::ProcessHookCall(

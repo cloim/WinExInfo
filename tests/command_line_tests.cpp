@@ -50,6 +50,119 @@ WXI_TEST(command_line_observe_exact, "command_line.observe_exact") {
     WXI_REQUIRE_EQ(parsed.duration_ms, std::uint32_t{12345});
 }
 
+WXI_TEST(command_line_background_exact, "command_line.background_exact") {
+    constexpr std::string_view arguments[] = {"--background"};
+    winexinfo::ParsedCommand parsed{};
+
+    const winexinfo::Status status = winexinfo::ParseCommandLine(arguments, &parsed);
+
+    WXI_REQUIRE(status.ok());
+    WXI_REQUIRE_EQ(parsed.command, winexinfo::HostCommand::Background);
+    WXI_REQUIRE_EQ(parsed.duration_ms, std::uint32_t{0});
+    WXI_REQUIRE_EQ(parsed.target_hwnd, std::uint64_t{0});
+}
+
+WXI_TEST(command_line_gate_c_exact, "command_line.gate_c") {
+    constexpr std::string_view arguments[] = {
+        "--gate-c-place",
+        "--hwnd",
+        "0x000000001234ABCD",
+        "--duration-ms",
+        "15000",
+    };
+    winexinfo::ParsedCommand command{};
+
+    WXI_REQUIRE(winexinfo::ParseCommandLine(arguments, &command).ok());
+    WXI_REQUIRE_EQ(command.command, winexinfo::HostCommand::GateCPlace);
+    WXI_REQUIRE_EQ(command.target_hwnd, std::uint64_t{0x1234ABCD});
+    WXI_REQUIRE_EQ(command.duration_ms, std::uint32_t{15000});
+}
+
+WXI_TEST(command_line_gate_c_rejects_non_exact, "command_line.gate_c_invalid") {
+    RequireInvalid({
+        "--gate-c-place",
+        "--hwnd",
+        "0x000000001234abcd",
+        "--duration-ms",
+        "15000",
+    });
+    RequireInvalid({
+        "--gate-c-place",
+        "--hwnd",
+        "000000001234ABCD",
+        "--duration-ms",
+        "15000",
+    });
+    RequireInvalid({
+        "--gate-c-place",
+        "--hwnd",
+        "0x00000001234ABCD",
+        "--duration-ms",
+        "15000",
+    });
+    RequireInvalid({
+        "--gate-c-place",
+        "--hwnd",
+        "0x0000000001234ABCD",
+        "--duration-ms",
+        "15000",
+    });
+    RequireInvalid({
+        "--gate-c-place",
+        "--hwnd",
+        "0x0000000000000000",
+        "--duration-ms",
+        "15000",
+    });
+    RequireInvalid({
+        "--gate-c-place",
+        "--duration-ms",
+        "15000",
+        "--hwnd",
+        "0x000000001234ABCD",
+    });
+    RequireInvalid({
+        "--gate-c-place",
+        "--hwnd",
+        "0x000000001234ABCD",
+        "--duration-ms",
+        "15000",
+        "extra",
+    });
+    RequireInvalid({
+        "--gate-c-place",
+        "--hwnd",
+        "0x000000001234ABCD",
+        "--duration-ms",
+        "4999",
+    });
+    RequireInvalid({
+        "--gate-c-place",
+        "--hwnd",
+        "0x000000001234ABCD",
+        "--duration-ms",
+        "30001",
+    });
+    RequireInvalid({
+        "--gate-c-place",
+        "--hwnd",
+        "0x000000001234ABCD",
+        "--duration-ms",
+        "15000",
+        "--probe",
+        "snapshot",
+    });
+    RequireInvalid({
+        "--probe",
+        "snapshot",
+        "--gate-c-place",
+        "--hwnd",
+        "0x000000001234ABCD",
+        "--duration-ms",
+        "15000",
+    });
+}
+
 WXI_TEST(command_line_rejects_unknown, "command_line.rejects_unknown") {
     RequireInvalid({});
     RequireInvalid({"--probe"});

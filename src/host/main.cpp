@@ -1,6 +1,8 @@
 #include "common/utf8.h"
 #include "host/command_line.h"
+#include "host/background_coordinator.h"
 #include "host/com_apartment.h"
+#include "host/explorer_controller.h"
 #include "probe/probe_runner.h"
 #include "probe/report_writer.h"
 
@@ -8,6 +10,7 @@
 #include <objbase.h>
 
 #include <iostream>
+#include <filesystem>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -34,13 +37,35 @@ int wmain(const int argc, const wchar_t* const argv[]) {
     const winexinfo::Status parsed = winexinfo::ParseCommandLine(argumentViews, &command);
     if (!parsed.ok()) {
         std::cerr << "INVALID_ARGUMENT: WinExInfoHost.exe --probe snapshot | "
-                     "--probe observe --duration-ms <1000..60000>\n";
+                     "--probe observe --duration-ms <1000..60000> | "
+                     "--gate-c-place --hwnd 0x<16 uppercase hex> "
+                     "--duration-ms <5000..30000> | --background\n";
         return static_cast<int>(winexinfo::HostExitCode::InvalidCli);
+    }
+
+    if (command.command == winexinfo::HostCommand::GateCPlace) {
+        wchar_t executable[32768]{};
+        const DWORD length = GetModuleFileNameW(nullptr, executable, 32768);
+        if (length == 0 || length == 32768) {
+            return static_cast<int>(winexinfo::HostExitCode::Win32ComFailure);
+        }
+        const std::wstring hookDllPath =
+            (std::filesystem::path{std::wstring{executable, length}}.parent_path() /
+             L"WinExInfoHook.dll").wstring();
+        return static_cast<int>(winexinfo::RunGateCPlacement(
+            reinterpret_cast<HWND>(
+                static_cast<std::uintptr_t>(command.target_hwnd)),
+            command.duration_ms,
+            hookDllPath));
     }
 
     const HRESULT initialized =
         CoInitializeEx(nullptr, winexinfo::kShellComApartmentFlags);
     if (FAILED(initialized)) {
+        if (command.command == winexinfo::HostCommand::Background) {
+            std::cerr << "BACKGROUND_START_FAILED stage=com hresult="
+                      << initialized << '\n';
+        }
         const winexinfo::ProbeRunResult failureResult =
             command.command == winexinfo::HostCommand::ProbeObserve
             ? winexinfo::CreateObserveInfrastructureFailure(
@@ -74,6 +99,22 @@ int wmain(const int argc, const wchar_t* const argv[]) {
         }
         std::cout << serialized;
         return static_cast<int>(failureResult.exit_code);
+    }
+
+    if (command.command == winexinfo::HostCommand::Background) {
+        wchar_t executable[32768]{};
+        const DWORD length = GetModuleFileNameW(nullptr, executable, 32768);
+        if (length == 0 || length == 32768) {
+            CoUninitialize();
+            return static_cast<int>(winexinfo::HostExitCode::Win32ComFailure);
+        }
+        const std::wstring hookDllPath =
+            (std::filesystem::path{std::wstring{executable, length}}.parent_path() /
+             L"WinExInfoHook.dll").wstring();
+        const winexinfo::HostExitCode result =
+            winexinfo::RunProductionBackgroundCoordinator(hookDllPath);
+        CoUninitialize();
+        return static_cast<int>(result);
     }
 
     winexinfo::ProbeRunResult result =

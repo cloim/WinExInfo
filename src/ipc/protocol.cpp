@@ -147,6 +147,38 @@ Status ValidateResultRule(const std::uint32_t result, const std::string& error) 
     return Success();
 }
 
+Status ValidateTabSetUpdate(const TabSetUpdate& update) noexcept {
+    if (update.top_level_hwnd == 0 || update.top_level_generation == 0 ||
+        update.tabs.empty() || update.tabs.size() > kMaximumTabDescriptors) {
+        return ProtocolError();
+    }
+    for (std::size_t index = 0; index < update.tabs.size(); ++index) {
+        const TabDescriptor& tab = update.tabs[index];
+        if (tab.tab_hwnd == 0 || tab.tab_generation == 0 ||
+            tab.ui_thread_id == 0) {
+            return ProtocolError();
+        }
+        for (std::size_t prior = 0; prior < index; ++prior) {
+            if (update.tabs[prior].tab_hwnd == tab.tab_hwnd ||
+                update.tabs[prior].tab_generation == tab.tab_generation) {
+                return ProtocolError();
+            }
+        }
+    }
+    return Success();
+}
+
+Status ValidatePaneTextUpdate(const PaneTextUpdate& update) {
+    if (update.top_level_hwnd == 0 || update.top_level_generation == 0 ||
+        update.tab_hwnd == 0 || update.tab_generation == 0 ||
+        update.display_text.empty() != update.tooltip_text.empty()) {
+        return ProtocolError();
+    }
+    const Status display = ValidateString(update.display_text);
+    const Status tooltip = ValidateString(update.tooltip_text);
+    return display.ok() && tooltip.ok() ? Success() : ProtocolError();
+}
+
 Status EncodeFrame(
     const MessageType type,
     const std::uint64_t requestId,
@@ -212,17 +244,187 @@ Status EncodeDetachResult(
     const DetachResult& result,
     std::vector<std::uint8_t>* const output) {
     const Status valid = ValidateResultRule(result.result, result.error_code);
+    const bool cleanupZero = result.cleanup.pane_count == 0 &&
+        result.cleanup.tab_subclass_count == 0 &&
+        result.cleanup.parent_subclass_count == 0 &&
+        result.cleanup.refresh_worker_count == 0 &&
+        result.cleanup.callback_count == 0;
+    if (!valid.ok() || (result.result == 0 && !cleanupZero)) {
+        return valid.ok() ? ProtocolError() : valid;
+    }
+    try {
+        std::vector<std::uint8_t> payload;
+        payload.reserve(32 + result.error_code.size());
+        AppendU32(&payload, result.explorer_pid);
+        AppendU32(&payload, result.result);
+        const Status appended = AppendString(&payload, result.error_code);
+        if (appended.ok()) {
+            AppendU32(&payload, result.cleanup.pane_count);
+            AppendU32(&payload, result.cleanup.tab_subclass_count);
+            AppendU32(&payload, result.cleanup.parent_subclass_count);
+            AppendU32(&payload, result.cleanup.refresh_worker_count);
+            AppendU32(&payload, result.cleanup.callback_count);
+        }
+        return appended.ok()
+            ? EncodeFrame(MessageType::DetachResult, requestId, std::move(payload), output)
+            : appended;
+    } catch (const std::bad_alloc&) {
+        return {ErrorCode::IPC_PROTOCOL_ERROR, E_OUTOFMEMORY, ERROR_SUCCESS};
+    }
+}
+
+Status EncodeTabSetUpdate(
+    const std::uint64_t requestId,
+    const TabSetUpdate& update,
+    std::vector<std::uint8_t>* const output) {
+    const Status valid = ValidateTabSetUpdate(update);
     if (!valid.ok()) {
         return valid;
     }
     try {
         std::vector<std::uint8_t> payload;
-        payload.reserve(12 + result.error_code.size());
-        AppendU32(&payload, result.explorer_pid);
+        payload.reserve(20 + update.tabs.size() * 20);
+        AppendU64(&payload, update.top_level_hwnd);
+        AppendU64(&payload, update.top_level_generation);
+        AppendU32(&payload, static_cast<std::uint32_t>(update.tabs.size()));
+        for (const TabDescriptor& tab : update.tabs) {
+            AppendU64(&payload, tab.tab_hwnd);
+            AppendU64(&payload, tab.tab_generation);
+            AppendU32(&payload, tab.ui_thread_id);
+        }
+        return EncodeFrame(
+            MessageType::TabSetUpdate, requestId, std::move(payload), output);
+    } catch (const std::bad_alloc&) {
+        return {ErrorCode::IPC_PROTOCOL_ERROR, E_OUTOFMEMORY, ERROR_SUCCESS};
+    }
+}
+
+Status EncodeTabSetResult(
+    const std::uint64_t requestId,
+    const TabSetResult& result,
+    std::vector<std::uint8_t>* const output) {
+    const Status valid = ValidateResultRule(result.result, result.error_code);
+    if (!valid.ok() || result.top_level_generation == 0) {
+        return ProtocolError();
+    }
+    try {
+        std::vector<std::uint8_t> payload;
+        payload.reserve(16 + result.error_code.size());
+        AppendU64(&payload, result.top_level_generation);
         AppendU32(&payload, result.result);
         const Status appended = AppendString(&payload, result.error_code);
         return appended.ok()
-            ? EncodeFrame(MessageType::DetachResult, requestId, std::move(payload), output)
+            ? EncodeFrame(
+                  MessageType::TabSetResult,
+                  requestId,
+                  std::move(payload),
+                  output)
+            : appended;
+    } catch (const std::bad_alloc&) {
+        return {ErrorCode::IPC_PROTOCOL_ERROR, E_OUTOFMEMORY, ERROR_SUCCESS};
+    }
+}
+
+Status EncodePaneTextUpdate(
+    const std::uint64_t requestId,
+    const PaneTextUpdate& update,
+    std::vector<std::uint8_t>* const output) {
+    const Status valid = ValidatePaneTextUpdate(update);
+    if (!valid.ok()) {
+        return valid;
+    }
+    try {
+        std::vector<std::uint8_t> payload;
+        payload.reserve(
+            40 + update.display_text.size() + update.tooltip_text.size());
+        AppendU64(&payload, update.top_level_hwnd);
+        AppendU64(&payload, update.top_level_generation);
+        AppendU64(&payload, update.tab_hwnd);
+        AppendU64(&payload, update.tab_generation);
+        const Status display = AppendString(&payload, update.display_text);
+        const Status tooltip = AppendString(&payload, update.tooltip_text);
+        return display.ok() && tooltip.ok()
+            ? EncodeFrame(
+                  MessageType::PaneTextUpdate,
+                  requestId,
+                  std::move(payload),
+                  output)
+            : ProtocolError();
+    } catch (const std::bad_alloc&) {
+        return {ErrorCode::IPC_PROTOCOL_ERROR, E_OUTOFMEMORY, ERROR_SUCCESS};
+    }
+}
+
+Status EncodePaneTextResult(
+    const std::uint64_t requestId,
+    const PaneTextResult& result,
+    std::vector<std::uint8_t>* const output) {
+    const Status valid = ValidateResultRule(result.result, result.error_code);
+    if (!valid.ok() || result.top_level_generation == 0 ||
+        result.tab_generation == 0) {
+        return ProtocolError();
+    }
+    try {
+        std::vector<std::uint8_t> payload;
+        payload.reserve(24 + result.error_code.size());
+        AppendU64(&payload, result.top_level_generation);
+        AppendU64(&payload, result.tab_generation);
+        AppendU32(&payload, result.result);
+        const Status appended = AppendString(&payload, result.error_code);
+        return appended.ok()
+            ? EncodeFrame(
+                  MessageType::PaneTextResult,
+                  requestId,
+                  std::move(payload),
+                  output)
+            : appended;
+    } catch (const std::bad_alloc&) {
+        return {ErrorCode::IPC_PROTOCOL_ERROR, E_OUTOFMEMORY, ERROR_SUCCESS};
+    }
+}
+
+Status EncodeWindowRemoveRequest(
+    const std::uint64_t requestId,
+    const WindowRemoveRequest& request,
+    std::vector<std::uint8_t>* const output) {
+    if (request.top_level_hwnd == 0 || request.top_level_generation == 0) {
+        return ProtocolError();
+    }
+    try {
+        std::vector<std::uint8_t> payload;
+        payload.reserve(16);
+        AppendU64(&payload, request.top_level_hwnd);
+        AppendU64(&payload, request.top_level_generation);
+        return EncodeFrame(
+            MessageType::WindowRemoveRequest,
+            requestId,
+            std::move(payload),
+            output);
+    } catch (const std::bad_alloc&) {
+        return {ErrorCode::IPC_PROTOCOL_ERROR, E_OUTOFMEMORY, ERROR_SUCCESS};
+    }
+}
+
+Status EncodeWindowRemoveResult(
+    const std::uint64_t requestId,
+    const WindowRemoveResult& result,
+    std::vector<std::uint8_t>* const output) {
+    const Status valid = ValidateResultRule(result.result, result.error_code);
+    if (!valid.ok() || result.top_level_generation == 0) {
+        return ProtocolError();
+    }
+    try {
+        std::vector<std::uint8_t> payload;
+        payload.reserve(16 + result.error_code.size());
+        AppendU64(&payload, result.top_level_generation);
+        AppendU32(&payload, result.result);
+        const Status appended = AppendString(&payload, result.error_code);
+        return appended.ok()
+            ? EncodeFrame(
+                  MessageType::WindowRemoveResult,
+                  requestId,
+                  std::move(payload),
+                  output)
             : appended;
     } catch (const std::bad_alloc&) {
         return {ErrorCode::IPC_PROTOCOL_ERROR, E_OUTOFMEMORY, ERROR_SUCCESS};
@@ -253,7 +455,13 @@ Status DecodeFrame(
         bytes.size() != kFrameHeaderSize + payloadLength ||
         (rawType != static_cast<std::uint16_t>(MessageType::DetachRequest) &&
          rawType != static_cast<std::uint16_t>(MessageType::AttachResult) &&
-         rawType != static_cast<std::uint16_t>(MessageType::DetachResult))) {
+         rawType != static_cast<std::uint16_t>(MessageType::DetachResult) &&
+         rawType != static_cast<std::uint16_t>(MessageType::TabSetUpdate) &&
+         rawType != static_cast<std::uint16_t>(MessageType::TabSetResult) &&
+         rawType != static_cast<std::uint16_t>(MessageType::PaneTextUpdate) &&
+         rawType != static_cast<std::uint16_t>(MessageType::PaneTextResult) &&
+         rawType != static_cast<std::uint16_t>(MessageType::WindowRemoveRequest) &&
+         rawType != static_cast<std::uint16_t>(MessageType::WindowRemoveResult))) {
         return ProtocolError();
     }
     try {
@@ -318,7 +526,208 @@ Status DecodeDetachResult(
     }
     const Status read = ReadString(frame.payload, &offset, &candidate.error_code);
     const Status valid = ValidateResultRule(candidate.result, candidate.error_code);
-    if (!read.ok() || !valid.ok() || offset != frame.payload.size()) {
+    const bool countsRead = read.ok() &&
+        ReadU32(frame.payload, &offset, &candidate.cleanup.pane_count) &&
+        ReadU32(frame.payload, &offset, &candidate.cleanup.tab_subclass_count) &&
+        ReadU32(frame.payload, &offset, &candidate.cleanup.parent_subclass_count) &&
+        ReadU32(frame.payload, &offset, &candidate.cleanup.refresh_worker_count) &&
+        ReadU32(frame.payload, &offset, &candidate.cleanup.callback_count);
+    const bool cleanupZero = candidate.cleanup.pane_count == 0 &&
+        candidate.cleanup.tab_subclass_count == 0 &&
+        candidate.cleanup.parent_subclass_count == 0 &&
+        candidate.cleanup.refresh_worker_count == 0 &&
+        candidate.cleanup.callback_count == 0;
+    if (!countsRead || !valid.ok() ||
+        (candidate.result == 0 && !cleanupZero) ||
+        offset != frame.payload.size()) {
+        return ProtocolError();
+    }
+    *output = std::move(candidate);
+    return Success();
+}
+
+Status DecodeTabSetUpdate(
+    const DecodedFrame& frame,
+    TabSetUpdate* const output) {
+    if (output == nullptr) {
+        return InvalidArgument();
+    }
+    if (frame.message_type != MessageType::TabSetUpdate) {
+        return ProtocolError();
+    }
+    try {
+        std::size_t offset = 0;
+        std::uint32_t count = 0;
+        TabSetUpdate candidate{};
+        if (!ReadU64(frame.payload, &offset, &candidate.top_level_hwnd) ||
+            !ReadU64(frame.payload, &offset, &candidate.top_level_generation) ||
+            !ReadU32(frame.payload, &offset, &count) || count == 0 ||
+            count > kMaximumTabDescriptors ||
+            frame.payload.size() - offset != static_cast<std::size_t>(count) * 20) {
+            return ProtocolError();
+        }
+        candidate.tabs.reserve(count);
+        for (std::uint32_t index = 0; index < count; ++index) {
+            TabDescriptor tab{};
+            if (!ReadU64(frame.payload, &offset, &tab.tab_hwnd) ||
+                !ReadU64(frame.payload, &offset, &tab.tab_generation) ||
+                !ReadU32(frame.payload, &offset, &tab.ui_thread_id)) {
+                return ProtocolError();
+            }
+            candidate.tabs.push_back(tab);
+        }
+        const Status valid = ValidateTabSetUpdate(candidate);
+        if (!valid.ok() || offset != frame.payload.size()) {
+            return ProtocolError();
+        }
+        *output = std::move(candidate);
+        return Success();
+    } catch (const std::bad_alloc&) {
+        return {ErrorCode::IPC_PROTOCOL_ERROR, E_OUTOFMEMORY, ERROR_SUCCESS};
+    }
+}
+
+Status DecodeTabSetResult(
+    const DecodedFrame& frame,
+    const std::uint64_t expectedRequestId,
+    const std::uint64_t expectedTopLevelGeneration,
+    TabSetResult* const output) {
+    if (output == nullptr) {
+        return InvalidArgument();
+    }
+    if (frame.message_type != MessageType::TabSetResult ||
+        expectedRequestId == 0 || expectedTopLevelGeneration == 0 ||
+        frame.request_id != expectedRequestId) {
+        return ProtocolError();
+    }
+    std::size_t offset = 0;
+    TabSetResult candidate{};
+    if (!ReadU64(frame.payload, &offset, &candidate.top_level_generation) ||
+        !ReadU32(frame.payload, &offset, &candidate.result)) {
+        return ProtocolError();
+    }
+    const Status read = ReadString(frame.payload, &offset, &candidate.error_code);
+    const Status valid = ValidateResultRule(candidate.result, candidate.error_code);
+    if (!read.ok() || !valid.ok() ||
+        candidate.top_level_generation != expectedTopLevelGeneration ||
+        offset != frame.payload.size()) {
+        return ProtocolError();
+    }
+    *output = std::move(candidate);
+    return Success();
+}
+
+Status DecodePaneTextUpdate(
+    const DecodedFrame& frame,
+    PaneTextUpdate* const output) {
+    if (output == nullptr) {
+        return InvalidArgument();
+    }
+    if (frame.message_type != MessageType::PaneTextUpdate) {
+        return ProtocolError();
+    }
+    std::size_t offset = 0;
+    PaneTextUpdate candidate{};
+    if (!ReadU64(frame.payload, &offset, &candidate.top_level_hwnd) ||
+        !ReadU64(frame.payload, &offset, &candidate.top_level_generation) ||
+        !ReadU64(frame.payload, &offset, &candidate.tab_hwnd) ||
+        !ReadU64(frame.payload, &offset, &candidate.tab_generation)) {
+        return ProtocolError();
+    }
+    const Status display = ReadString(
+        frame.payload, &offset, &candidate.display_text);
+    if (!display.ok()) {
+        return ProtocolError();
+    }
+    const Status tooltip = ReadString(
+        frame.payload, &offset, &candidate.tooltip_text);
+    const Status valid = ValidatePaneTextUpdate(candidate);
+    if (!tooltip.ok() || !valid.ok() || offset != frame.payload.size()) {
+        return ProtocolError();
+    }
+    *output = std::move(candidate);
+    return Success();
+}
+
+Status DecodePaneTextResult(
+    const DecodedFrame& frame,
+    const std::uint64_t expectedRequestId,
+    const std::uint64_t expectedTopLevelGeneration,
+    const std::uint64_t expectedTabGeneration,
+    PaneTextResult* const output) {
+    if (output == nullptr) {
+        return InvalidArgument();
+    }
+    if (frame.message_type != MessageType::PaneTextResult ||
+        expectedRequestId == 0 || expectedTopLevelGeneration == 0 ||
+        expectedTabGeneration == 0 || frame.request_id != expectedRequestId) {
+        return ProtocolError();
+    }
+    std::size_t offset = 0;
+    PaneTextResult candidate{};
+    if (!ReadU64(frame.payload, &offset, &candidate.top_level_generation) ||
+        !ReadU64(frame.payload, &offset, &candidate.tab_generation) ||
+        !ReadU32(frame.payload, &offset, &candidate.result)) {
+        return ProtocolError();
+    }
+    const Status read = ReadString(frame.payload, &offset, &candidate.error_code);
+    const Status valid = ValidateResultRule(candidate.result, candidate.error_code);
+    if (!read.ok() || !valid.ok() ||
+        candidate.top_level_generation != expectedTopLevelGeneration ||
+        candidate.tab_generation != expectedTabGeneration ||
+        offset != frame.payload.size()) {
+        return ProtocolError();
+    }
+    *output = std::move(candidate);
+    return Success();
+}
+
+Status DecodeWindowRemoveRequest(
+    const DecodedFrame& frame,
+    WindowRemoveRequest* const output) {
+    if (output == nullptr) {
+        return InvalidArgument();
+    }
+    if (frame.message_type != MessageType::WindowRemoveRequest ||
+        frame.payload.size() != 16) {
+        return ProtocolError();
+    }
+    std::size_t offset = 0;
+    WindowRemoveRequest candidate{};
+    if (!ReadU64(frame.payload, &offset, &candidate.top_level_hwnd) ||
+        !ReadU64(frame.payload, &offset, &candidate.top_level_generation) ||
+        candidate.top_level_hwnd == 0 || candidate.top_level_generation == 0 ||
+        offset != frame.payload.size()) {
+        return ProtocolError();
+    }
+    *output = candidate;
+    return Success();
+}
+
+Status DecodeWindowRemoveResult(
+    const DecodedFrame& frame,
+    const std::uint64_t expectedRequestId,
+    const std::uint64_t expectedTopLevelGeneration,
+    WindowRemoveResult* const output) {
+    if (output == nullptr) {
+        return InvalidArgument();
+    }
+    if (frame.message_type != MessageType::WindowRemoveResult ||
+        expectedRequestId == 0 || expectedTopLevelGeneration == 0 ||
+        frame.request_id != expectedRequestId) {
+        return ProtocolError();
+    }
+    std::size_t offset = 0;
+    WindowRemoveResult candidate{};
+    if (!ReadU64(frame.payload, &offset, &candidate.top_level_generation) ||
+        !ReadU32(frame.payload, &offset, &candidate.result)) {
+        return ProtocolError();
+    }
+    const Status read = ReadString(frame.payload, &offset, &candidate.error_code);
+    const Status valid = ValidateResultRule(candidate.result, candidate.error_code);
+    if (!read.ok() || !valid.ok() ||
+        candidate.top_level_generation != expectedTopLevelGeneration ||
+        offset != frame.payload.size()) {
         return ProtocolError();
     }
     *output = std::move(candidate);
@@ -335,6 +744,19 @@ Status AcceptDetachId(
         return ProtocolError();
     }
     *lastAcceptedId = requestId;
+    return Success();
+}
+
+Status AcceptTopLevelGeneration(
+    const std::uint64_t candidate,
+    std::uint64_t* const lastAcceptedGeneration) noexcept {
+    if (lastAcceptedGeneration == nullptr) {
+        return InvalidArgument();
+    }
+    if (candidate == 0 || candidate <= *lastAcceptedGeneration) {
+        return ProtocolError();
+    }
+    *lastAcceptedGeneration = candidate;
     return Success();
 }
 

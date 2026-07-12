@@ -20,10 +20,16 @@ enable_testing()
 add_executable(WinExInfoTests
   src/common/utf8.cpp
   src/host/command_line.cpp
+  src/host/background_coordinator.cpp
+  src/host/explorer_controller.cpp
+  src/host/explorer_session.cpp
   src/hook/dll_main.cpp
+  src/hook/explorer_layout.cpp
   src/hook/hook_entry.cpp
+  src/hook/process_runtime.cpp
   src/hook/runtime.cpp
   src/hook/status_pane.cpp
+  src/hook/tab_subclass_set.cpp
   src/injection/hook_platform.cpp
   src/injection/thread_hook_injector.cpp
   src/ipc/named_pipe.cpp
@@ -41,10 +47,14 @@ add_executable(WinExInfoTests
   src/probe/uia_observer_worker.cpp
   src/probe/win32_probe.cpp
   tests/active_view_tests.cpp
+  tests/background_coordinator_tests.cpp
   tests/com_apartment_tests.cpp
   tests/command_line_tests.cpp
   tests/contracts_tests.cpp
   tests/event_filter_tests.cpp
+  tests/explorer_controller_tests.cpp
+  tests/explorer_layout_tests.cpp
+  tests/explorer_session_tests.cpp
   tests/host_manifest_tests.cpp
   tests/hook_injector_tests.cpp
   tests/hook_controller_mode.cpp
@@ -52,9 +62,13 @@ add_executable(WinExInfoTests
   tests/hook_target_mode.cpp
   tests/hook_test_modes.cpp
   tests/ipc_protocol_tests.cpp
+  tests/ipc_production_tests.cpp
   tests/observer_runtime_tests.cpp
   tests/observer_runtime_contract_tests.cpp
   tests/observer_shell_reconcile_tests.cpp
+  tests/process_runtime_tests.cpp
+  tests/status_pane_placement_tests.cpp
+  tests/tab_subclass_tests.cpp
   tests/target_validation_tests.cpp
   tests/tab_identity_tests.cpp
   tests/test_framework.cpp
@@ -101,14 +115,21 @@ set_target_properties(WinExInfoTests PROPERTIES
 )
 
 add_test(NAME WinExInfo.Unit COMMAND WinExInfoTests --unit)
+add_test(
+  NAME WinExInfo.CommandLineGateC
+  COMMAND WinExInfoTests --unit --filter command_line.gate_c
+)
 
 add_library(WinExInfoHook SHARED
   src/common/utf8.cpp
   src/hook/dll_main.cpp
+  src/hook/explorer_layout.cpp
   src/hook/hook_entry.cpp
   src/hook/hook_export.cpp
+  src/hook/process_runtime.cpp
   src/hook/runtime.cpp
   src/hook/status_pane.cpp
+  src/hook/tab_subclass_set.cpp
   src/injection/thread_hook_injector.cpp
   src/ipc/named_pipe.cpp
   src/ipc/protocol.cpp
@@ -139,6 +160,8 @@ target_link_options(WinExInfoHook PRIVATE /guard:cf)
 target_link_libraries(WinExInfoHook PRIVATE
   advapi32
   comctl32
+  ole32
+  uuid
 )
 
 set_target_properties(WinExInfoHook PROPERTIES
@@ -149,6 +172,9 @@ set_target_properties(WinExInfoHook PROPERTIES
 add_executable(WinExInfoHost
   src/common/utf8.cpp
   src/host/command_line.cpp
+  src/host/background_coordinator.cpp
+  src/host/explorer_controller.cpp
+  src/host/explorer_session.cpp
   src/host/main.cpp
   src/host/WinExInfoHost.manifest
   src/injection/hook_platform.cpp

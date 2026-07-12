@@ -121,6 +121,11 @@ git commit -m "feat: manage exact Explorer tab subclasses"
 
 ### Task 3: Background Coordinator and Process Sessions
 
+> **Prerequisite addendum:** Before this task, complete and review all tasks in
+> `2026-07-12-winexinfo-multi-window-runtime-addendum.md`. The Gate C runtime
+> owns one top-level/pane today, while this task requires one pipe/session per
+> PID with several top-level windows. A mock-only coordinator is not acceptable.
+
 **Files:**
 - Create: `src/host/background_coordinator.h`
 - Create: `src/host/background_coordinator.cpp`

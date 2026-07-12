@@ -11,6 +11,8 @@ namespace winexinfo {
 enum class HostCommand {
     ProbeSnapshot,
     ProbeObserve,
+    GateCPlace,
+    Background,
 };
 
 enum class HostExitCode : int {
@@ -21,8 +23,9 @@ enum class HostExitCode : int {
 };
 
 struct ParsedCommand final {
-    HostCommand command;
-    std::uint32_t duration_ms;
+    HostCommand command{};
+    std::uint32_t duration_ms = 0;
+    std::uint64_t target_hwnd = 0;
 };
 
 [[nodiscard]] Status ParseCommandLine(
