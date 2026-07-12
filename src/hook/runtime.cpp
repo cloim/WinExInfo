@@ -1,6 +1,7 @@
 #include "hook/runtime.h"
 
 #include "common/win32_handle.h"
+#include "hook/explorer_layout.h"
 #include "hook/status_pane.h"
 #include "ipc/named_pipe.h"
 #include "ipc/protocol.h"
@@ -23,6 +24,14 @@ Status Success() noexcept {
 
 Status ContractFailure() noexcept {
     return {ErrorCode::DLL_INITIALIZATION_FAILED, S_FALSE, ERROR_INVALID_STATE};
+}
+
+Status PlacementFailure(const DWORD error) noexcept {
+    return {
+        ErrorCode::WINDOW_ATTACH_FAILED,
+        HRESULT_FROM_WIN32(error),
+        error,
+    };
 }
 
 struct RuntimeContext final {
@@ -74,6 +83,36 @@ DWORD WINAPI RuntimeWorker(void* const parameter) {
     if (!status.ok() ||
         WaitForSingleObject(context->hook_released.get(), 5000) != WAIT_OBJECT_0 ||
         !context->state.MarkRunning(true).ok()) {
+        context.release();
+        return 1;
+    }
+
+    ExplorerLayoutMetrics metrics{};
+    HWND paneParent = nullptr;
+    RECT paneRect{};
+    status = CaptureExplorerLayout(context->target, &metrics, &paneParent);
+    if (status.ok()) {
+        status = ComputeStatusPaneRect(metrics, &paneRect);
+    }
+    if (status.ok()) {
+        auto placement = std::make_unique<StatusPanePlacementResult>(
+            StatusPanePlacementResult{
+                context->pid,
+                context->tid,
+                paneParent,
+                paneRect,
+                paneRect.right > paneRect.left && paneRect.bottom > paneRect.top,
+            });
+        if (PostMessageW(
+                context->pane.hwnd,
+                kStatusPaneReflowMessage,
+                0,
+                reinterpret_cast<LPARAM>(placement.get())) == FALSE) {
+            context.release();
+            return 1;
+        }
+        static_cast<void>(placement.release());
+    } else {
         context.release();
         return 1;
     }
@@ -130,6 +169,32 @@ DWORD WINAPI RuntimeWorker(void* const parameter) {
 }
 
 }  // namespace
+
+Status ApplyStatusPanePlacementResultWithOperations(
+    const HWND pane,
+    const StatusPanePlacementResult& result,
+    const StatusPanePlacementOperations& operations) noexcept {
+    if (!operations.get_current_process_id || !operations.get_current_thread_id ||
+        result.process_id == 0 || result.thread_id == 0) {
+        return PlacementFailure(ERROR_INVALID_PARAMETER);
+    }
+    if (operations.get_current_process_id() != result.process_id ||
+        operations.get_current_thread_id() != result.thread_id) {
+        return PlacementFailure(ERROR_INVALID_WINDOW_HANDLE);
+    }
+    return ApplyStatusPanePlacementWithOperations(
+        pane, result.parent, result.rect, result.visible, operations);
+}
+
+Status ApplyStatusPanePlacementResult(
+    const HWND pane,
+    const StatusPanePlacementResult& result) noexcept {
+    if (GetCurrentProcessId() != result.process_id ||
+        GetCurrentThreadId() != result.thread_id) {
+        return PlacementFailure(ERROR_INVALID_WINDOW_HANDLE);
+    }
+    return ApplyStatusPanePlacement(pane, result.parent, result.rect, result.visible);
+}
 
 bool HookCallbackGate::Enter() noexcept {
     std::uint64_t state = rundown_.load(std::memory_order_acquire);

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common/status.h"
+#include "hook/status_pane.h"
 
 #include <Windows.h>
 
@@ -15,6 +16,22 @@ enum class RuntimeState {
     Stopping,
     Stopped,
 };
+
+struct StatusPanePlacementResult final {
+    DWORD process_id = 0;
+    DWORD thread_id = 0;
+    HWND parent = nullptr;
+    RECT rect{};
+    bool visible = false;
+};
+
+[[nodiscard]] Status ApplyStatusPanePlacementResult(
+    HWND pane,
+    const StatusPanePlacementResult& result) noexcept;
+[[nodiscard]] Status ApplyStatusPanePlacementResultWithOperations(
+    HWND pane,
+    const StatusPanePlacementResult& result,
+    const StatusPanePlacementOperations& operations) noexcept;
 
 class HookCallbackGate final {
 public:

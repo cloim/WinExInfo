@@ -57,6 +57,7 @@ add_executable(WinExInfoTests
   tests/observer_runtime_tests.cpp
   tests/observer_runtime_contract_tests.cpp
   tests/observer_shell_reconcile_tests.cpp
+  tests/status_pane_placement_tests.cpp
   tests/target_validation_tests.cpp
   tests/tab_identity_tests.cpp
   tests/test_framework.cpp
