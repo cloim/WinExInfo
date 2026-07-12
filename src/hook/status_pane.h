@@ -17,6 +17,7 @@ inline constexpr UINT_PTR kStatusPaneSubclassId = 0x57495831;
 inline constexpr UINT kStatusPaneRemoveMessage = WM_APP + 0x571;
 inline constexpr UINT kStatusPaneReflowMessage = WM_APP + 0x572;
 inline constexpr UINT kStatusPaneRuntimeCleanupMessage = WM_APP + 0x573;
+inline constexpr UINT kStatusPaneTabSetMessage = WM_APP + 0x574;
 inline constexpr std::wstring_view kStatusPaneParentClassName =
     L"DUIViewWndClassName";
 

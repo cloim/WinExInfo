@@ -124,6 +124,7 @@ struct HookRuntimeWindowMessageOperations final {
     DWORD expectedThread,
     const HookRuntimeWindowMessageOperations& operations);
 void NotifyHookRuntimeWindowMessage(HWND window, UINT message) noexcept;
+[[nodiscard]] Status SignalHookRuntimeRefresh() noexcept;
 
 [[nodiscard]] Status UpdateRuntimeSignalParent(
     RuntimeSignalSourceState* state,

@@ -114,7 +114,8 @@ LRESULT CALLBACK StatusPaneSubclassProc(
     const UINT_PTR id,
     const DWORD_PTR reference) {
     if ((message == kStatusPaneReflowMessage ||
-         message == kStatusPaneRuntimeCleanupMessage) &&
+         message == kStatusPaneRuntimeCleanupMessage ||
+         message == kStatusPaneTabSetMessage) &&
         id == kStatusPaneSubclassId &&
         HandleStatusPaneRuntimeMessage(window, message)) {
         return 0;

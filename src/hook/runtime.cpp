@@ -3,6 +3,7 @@
 #include "common/win32_handle.h"
 #include "hook/explorer_layout.h"
 #include "hook/status_pane.h"
+#include "hook/tab_subclass_set.h"
 #include "ipc/named_pipe.h"
 #include "ipc/protocol.h"
 
@@ -47,11 +48,15 @@ struct RuntimeContext final {
     UniqueHandle refresh_stop;
     UniqueHandle refresh_worker;
     UniqueHandle parent_cleanup_ack;
+    UniqueHandle tab_update_ack;
     StatusPane pane{};
     StatusPaneRefreshCoordinator refresh;
     RuntimeSignalSourceState signal_source;
     HookRuntimeRefreshIngress ingress;
     HookRuntimeStateMachine state;
+    std::mutex tab_update_mutex;
+    std::optional<ipc::TabSetUpdate> pending_tab_update;
+    ipc::TabSetResult tab_update_result;
 };
 
 std::atomic<RuntimeContext*> g_runtime{nullptr};
@@ -209,6 +214,36 @@ Status WriteAttachResult(
     return status.ok() ? ipc::WriteFrame(pipe, frame) : status;
 }
 
+Status DispatchTabSetUpdate(
+    RuntimeContext* const context,
+    const ipc::TabSetUpdate& update,
+    ipc::TabSetResult* const result) {
+    if (context == nullptr || result == nullptr) {
+        return PlacementFailure(ERROR_INVALID_PARAMETER);
+    }
+    {
+        const std::scoped_lock lock{context->tab_update_mutex};
+        if (context->pending_tab_update) {
+            return PlacementFailure(ERROR_BUSY);
+        }
+        context->pending_tab_update = update;
+        context->tab_update_result = {};
+    }
+    if (ResetEvent(context->tab_update_ack.get()) == FALSE ||
+        PostMessageW(context->pane.hwnd, kStatusPaneTabSetMessage, 0, 0) == FALSE) {
+        const DWORD error = GetLastError();
+        const std::scoped_lock lock{context->tab_update_mutex};
+        context->pending_tab_update.reset();
+        return PlacementFailure(error);
+    }
+    if (WaitForSingleObject(context->tab_update_ack.get(), 5000) != WAIT_OBJECT_0) {
+        return PlacementFailure(ERROR_TIMEOUT);
+    }
+    const std::scoped_lock lock{context->tab_update_mutex};
+    *result = context->tab_update_result;
+    return Success();
+}
+
 DWORD WINAPI RuntimeWorker(void* const parameter) {
     std::unique_ptr<RuntimeContext> context{
         static_cast<RuntimeContext*>(parameter)};
@@ -236,9 +271,32 @@ DWORD WINAPI RuntimeWorker(void* const parameter) {
     }
 
     ipc::DecodedFrame request{};
-    status = ipc::ReadFrame(&pipe, &request);
-    const bool detachRequested = status.ok() &&
-        ipc::DecodeDetachRequest(request).ok();
+    bool detachRequested = false;
+    while (status.ok()) {
+        status = ipc::ReadFrame(&pipe, &request);
+        if (!status.ok()) {
+            break;
+        }
+        if (ipc::DecodeDetachRequest(request).ok()) {
+            detachRequested = true;
+            break;
+        }
+        ipc::TabSetUpdate update{};
+        status = ipc::DecodeTabSetUpdate(request, &update);
+        if (!status.ok()) {
+            break;
+        }
+        ipc::TabSetResult result{};
+        status = DispatchTabSetUpdate(context.get(), update, &result);
+        if (!status.ok()) {
+            break;
+        }
+        std::vector<std::uint8_t> response;
+        status = ipc::EncodeTabSetResult(request.request_id, result, &response);
+        if (status.ok()) {
+            status = ipc::WriteFrame(pipe.get(), response);
+        }
+    }
     if (!context->state.BeginStop().ok()) {
         context.release();
         return 1;
@@ -311,6 +369,9 @@ bool HandleStatusPaneRuntimeMessage(
         return false;
     }
     if (message == kStatusPaneRuntimeCleanupMessage) {
+        if (!RemoveAllTabSubclasses(CreateProductionTabSubclassOperations()).ok()) {
+            return true;
+        }
         if (!RuntimeSignalCleanupSafe(context->signal_source)) {
             return true;
         }
@@ -324,6 +385,29 @@ bool HandleStatusPaneRuntimeMessage(
             context->signal_source.parent = nullptr;
         }
         static_cast<void>(SetEvent(context->parent_cleanup_ack.get()));
+        return true;
+    }
+    if (message == kStatusPaneTabSetMessage) {
+        ipc::TabSetUpdate update{};
+        {
+            const std::scoped_lock lock{context->tab_update_mutex};
+            if (!context->pending_tab_update) {
+                return true;
+            }
+            update = *context->pending_tab_update;
+        }
+        ipc::TabSetResult result{};
+        static_cast<void>(ApplyTabSetUpdate(
+            context->target,
+            update,
+            CreateProductionTabSubclassOperations(),
+            &result));
+        {
+            const std::scoped_lock lock{context->tab_update_mutex};
+            context->tab_update_result = std::move(result);
+            context->pending_tab_update.reset();
+        }
+        static_cast<void>(SetEvent(context->tab_update_ack.get()));
         return true;
     }
     if (message != kStatusPaneReflowMessage) {
@@ -789,6 +873,13 @@ void NotifyHookRuntimeWindowMessage(
     }
 }
 
+Status SignalHookRuntimeRefresh() noexcept {
+    RuntimeContext* const context = g_runtime.load(std::memory_order_acquire);
+    return context != nullptr
+        ? context->ingress.SignalEvent(context->refresh_event.get())
+        : PlacementFailure(ERROR_INVALID_STATE);
+}
+
 std::size_t StatusPaneRefreshCoordinator::pending_results() const noexcept {
     const std::scoped_lock lock{mutex_};
     return result_ ? 1u : 0u;
@@ -935,8 +1026,10 @@ Status BeginHookRuntimeAttach(
     context->refresh_event.reset(CreateEventW(nullptr, FALSE, FALSE, nullptr));
     context->refresh_stop.reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
     context->parent_cleanup_ack.reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    context->tab_update_ack.reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
     if (!context->cleanup_ack || !context->refresh_event ||
-        !context->refresh_stop || !context->parent_cleanup_ack) {
+        !context->refresh_stop || !context->parent_cleanup_ack ||
+        !context->tab_update_ack) {
         FreeLibrary(moduleReference);
         return {ErrorCode::DLL_INITIALIZATION_FAILED,
                 HRESULT_FROM_WIN32(GetLastError()), GetLastError()};

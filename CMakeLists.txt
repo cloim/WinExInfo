@@ -26,6 +26,7 @@ add_executable(WinExInfoTests
   src/hook/hook_entry.cpp
   src/hook/runtime.cpp
   src/hook/status_pane.cpp
+  src/hook/tab_subclass_set.cpp
   src/injection/hook_platform.cpp
   src/injection/thread_hook_injector.cpp
   src/ipc/named_pipe.cpp
@@ -61,6 +62,7 @@ add_executable(WinExInfoTests
   tests/observer_runtime_contract_tests.cpp
   tests/observer_shell_reconcile_tests.cpp
   tests/status_pane_placement_tests.cpp
+  tests/tab_subclass_tests.cpp
   tests/target_validation_tests.cpp
   tests/tab_identity_tests.cpp
   tests/test_framework.cpp
@@ -120,6 +122,7 @@ add_library(WinExInfoHook SHARED
   src/hook/hook_export.cpp
   src/hook/runtime.cpp
   src/hook/status_pane.cpp
+  src/hook/tab_subclass_set.cpp
   src/injection/thread_hook_injector.cpp
   src/ipc/named_pipe.cpp
   src/ipc/protocol.cpp

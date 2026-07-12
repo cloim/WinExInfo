@@ -1,0 +1,391 @@
+#include "hook/tab_subclass_set.h"
+
+#include "hook/runtime.h"
+
+#include <CommCtrl.h>
+
+#include <algorithm>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace winexinfo::hook {
+namespace {
+
+struct InstalledTab final {
+    HWND window = nullptr;
+    std::uint64_t generation = 0;
+
+    bool operator==(const InstalledTab&) const = default;
+};
+
+struct TabSubclassState final {
+    HWND top_level = nullptr;
+    std::uint64_t top_level_generation = 0;
+    std::vector<InstalledTab> authoritative;
+    std::vector<InstalledTab> installed;
+    std::vector<InstalledTab> known_generations;
+};
+
+TabSubclassState g_tabs;
+
+Status Success() noexcept {
+    return {ErrorCode::OK, S_OK, ERROR_SUCCESS};
+}
+
+Status Failure(const DWORD error = ERROR_INVALID_STATE) noexcept {
+    return {
+        ErrorCode::WINDOW_ATTACH_FAILED,
+        HRESULT_FROM_WIN32(error),
+        error,
+    };
+}
+
+void SetResult(
+    ipc::TabSetResult* const result,
+    const std::uint64_t generation,
+    const Status status) {
+    if (result == nullptr) {
+        return;
+    }
+    if (status.ok()) {
+        *result = {generation, 0, {}};
+        return;
+    }
+    *result = {
+        generation,
+        static_cast<std::uint32_t>(status.code),
+        std::string{ToString(status.code)},
+    };
+}
+
+bool HasOperations(const TabSubclassOperations& operations) {
+    return operations.get_current_thread_id &&
+        operations.get_window_thread_process_id && operations.get_class_name &&
+        operations.get_parent && operations.get_first_child &&
+        operations.get_next_sibling && operations.install_subclass &&
+        operations.remove_subclass && operations.post_refresh;
+}
+
+bool ExactWindow(
+    const HWND window,
+    const DWORD expectedThread,
+    const std::wstring_view expectedClass,
+    const TabSubclassOperations& operations) {
+    DWORD process = 0;
+    if (window == nullptr ||
+        operations.get_window_thread_process_id(window, &process) != expectedThread ||
+        process == 0) {
+        return false;
+    }
+    std::wstring className;
+    return operations.get_class_name(window, &className).ok() &&
+        className == expectedClass;
+}
+
+const InstalledTab* Find(
+    const std::vector<InstalledTab>& tabs,
+    const HWND window) {
+    const auto found = std::find_if(
+        tabs.begin(), tabs.end(),
+        [window](const InstalledTab& tab) { return tab.window == window; });
+    return found == tabs.end() ? nullptr : &*found;
+}
+
+Status ValidateUpdate(
+    const HWND topLevel,
+    const ipc::TabSetUpdate& update,
+    const TabSubclassOperations& operations,
+    std::vector<InstalledTab>* const desired) {
+    if (topLevel == nullptr || desired == nullptr || !HasOperations(operations) ||
+        update.top_level_hwnd != reinterpret_cast<std::uint64_t>(topLevel) ||
+        update.top_level_generation == 0 || update.tabs.empty() ||
+        update.tabs.size() > ipc::kMaximumTabDescriptors) {
+        return Failure(ERROR_INVALID_PARAMETER);
+    }
+    const DWORD thread = operations.get_current_thread_id();
+    if (thread == 0 || !ExactWindow(topLevel, thread, L"CabinetWClass", operations)) {
+        return Failure(ERROR_INVALID_WINDOW_HANDLE);
+    }
+
+    std::vector<HWND> liveTabs;
+    for (HWND child = operations.get_first_child(topLevel);
+         child != nullptr;
+         child = operations.get_next_sibling(child)) {
+        std::wstring childClass;
+        if (!operations.get_class_name(child, &childClass).ok()) {
+            return Failure(ERROR_INVALID_WINDOW_HANDLE);
+        }
+        if (childClass == L"ShellTabWindowClass") {
+            if (operations.get_parent(child) != topLevel ||
+                !ExactWindow(child, thread, L"ShellTabWindowClass", operations)) {
+                return Failure(ERROR_INVALID_WINDOW_HANDLE);
+            }
+            liveTabs.push_back(child);
+            if (liveTabs.size() > ipc::kMaximumTabDescriptors) {
+                return Failure(ERROR_INVALID_DATA);
+            }
+        }
+    }
+    if (liveTabs.size() != update.tabs.size()) {
+        return Failure(ERROR_INVALID_WINDOW_HANDLE);
+    }
+    desired->clear();
+    desired->reserve(update.tabs.size());
+    for (std::size_t index = 0; index < update.tabs.size(); ++index) {
+        const ipc::TabDescriptor& descriptor = update.tabs[index];
+        const HWND tab = reinterpret_cast<HWND>(descriptor.tab_hwnd);
+        if (tab == nullptr || descriptor.tab_generation == 0 ||
+            descriptor.ui_thread_id != thread || liveTabs[index] != tab ||
+            operations.get_parent(tab) != topLevel ||
+            !ExactWindow(tab, thread, L"ShellTabWindowClass", operations) ||
+            Find(*desired, tab) != nullptr ||
+            std::any_of(
+                desired->begin(), desired->end(),
+                [&](const InstalledTab& prior) {
+                    return prior.generation == descriptor.tab_generation;
+                })) {
+            return Failure(ERROR_INVALID_WINDOW_HANDLE);
+        }
+        desired->push_back({tab, descriptor.tab_generation});
+    }
+    return Success();
+}
+
+Status ValidateGenerations(
+    const HWND topLevel,
+    const ipc::TabSetUpdate& update,
+    const std::vector<InstalledTab>& desired) {
+    if (g_tabs.top_level == nullptr) {
+        return Success();
+    }
+    if (g_tabs.top_level != topLevel ||
+        update.top_level_generation < g_tabs.top_level_generation) {
+        return Failure(ERROR_INVALID_STATE);
+    }
+    if (update.top_level_generation == g_tabs.top_level_generation) {
+        return desired == g_tabs.authoritative
+            ? Success()
+            : Failure(ERROR_INVALID_STATE);
+    }
+    for (const InstalledTab& tab : desired) {
+        const InstalledTab* const prior = Find(g_tabs.known_generations, tab.window);
+        if (prior != nullptr && tab.generation < prior->generation) {
+            return Failure(ERROR_INVALID_STATE);
+        }
+    }
+    return Success();
+}
+
+enum class MutationKind { Added, Removed };
+struct Mutation final {
+    MutationKind kind;
+    InstalledTab tab;
+};
+
+Status Rollback(
+    const std::vector<Mutation>& mutations,
+    const TabSubclassOperations& operations) {
+    Status firstFailure = Success();
+    for (auto mutation = mutations.rbegin(); mutation != mutations.rend(); ++mutation) {
+        const Status status = mutation->kind == MutationKind::Added
+            ? operations.remove_subclass(mutation->tab.window, kTabSubclassId)
+            : operations.install_subclass(
+                  mutation->tab.window, kTabSubclassId, mutation->tab.generation);
+        if (!status.ok() && firstFailure.ok()) {
+            firstFailure = status;
+        }
+    }
+    return firstFailure;
+}
+
+Status Reconcile(
+    const std::vector<InstalledTab>& desired,
+    const TabSubclassOperations& operations) {
+    std::vector<Mutation> mutations;
+    const auto fail = [&](const Status original) {
+        const Status rollback = Rollback(mutations, operations);
+        return rollback.ok() ? original : rollback;
+    };
+
+    // Reused HWND values must lose the old generation before the new reference is set.
+    for (const InstalledTab& tab : desired) {
+        const InstalledTab* const prior = Find(g_tabs.installed, tab.window);
+        if (prior == nullptr || prior->generation == tab.generation) {
+            continue;
+        }
+        const InstalledTab old = *prior;
+        Status status = operations.remove_subclass(old.window, kTabSubclassId);
+        if (!status.ok()) {
+            return fail(status);
+        }
+        mutations.push_back({MutationKind::Removed, old});
+        status = operations.install_subclass(
+            tab.window, kTabSubclassId, tab.generation);
+        if (!status.ok()) {
+            return fail(status);
+        }
+        mutations.push_back({MutationKind::Added, tab});
+    }
+
+    // Install new HWNDs in authoritative z-order before retiring old HWNDs.
+    for (const InstalledTab& tab : desired) {
+        if (Find(g_tabs.installed, tab.window) != nullptr) {
+            continue;
+        }
+        const Status status = operations.install_subclass(
+            tab.window, kTabSubclassId, tab.generation);
+        if (!status.ok()) {
+            return fail(status);
+        }
+        mutations.push_back({MutationKind::Added, tab});
+    }
+    for (auto tab = g_tabs.installed.rbegin(); tab != g_tabs.installed.rend(); ++tab) {
+        if (Find(desired, tab->window) != nullptr) {
+            continue;
+        }
+        const Status status = operations.remove_subclass(tab->window, kTabSubclassId);
+        if (!status.ok()) {
+            return fail(status);
+        }
+        mutations.push_back({MutationKind::Removed, *tab});
+    }
+
+    if (mutations.empty()) {
+        return Success();
+    }
+    const Status refresh = operations.post_refresh();
+    if (!refresh.ok()) {
+        return fail(refresh);
+    }
+    return Success();
+}
+
+Status GetClassNameStatus(const HWND window, std::wstring* const output) {
+    if (output == nullptr) {
+        return Failure(ERROR_INVALID_PARAMETER);
+    }
+    wchar_t name[256]{};
+    const int length = GetClassNameW(window, name, 256);
+    if (length <= 0) {
+        return Failure(GetLastError());
+    }
+    output->assign(name, static_cast<std::size_t>(length));
+    return Success();
+}
+
+LRESULT CALLBACK TabSubclassProc(
+    const HWND window,
+    const UINT message,
+    const WPARAM wparam,
+    const LPARAM lparam,
+    const UINT_PTR id,
+    const DWORD_PTR) {
+    if (id == kTabSubclassId) {
+        NotifyTabSubclassMessage(window, message);
+        if (message == WM_NCDESTROY || message == WM_SIZE ||
+            message == WM_DPICHANGED || message == WM_THEMECHANGED ||
+            message == WM_SHOWWINDOW || message == WM_WINDOWPOSCHANGED) {
+            static_cast<void>(SignalHookRuntimeRefresh());
+        }
+    }
+    return DefSubclassProc(window, message, wparam, lparam);
+}
+
+}  // namespace
+
+Status ApplyTabSetUpdate(
+    const HWND topLevel,
+    const ipc::TabSetUpdate& update,
+    const TabSubclassOperations& operations,
+    ipc::TabSetResult* const result) {
+    if (result == nullptr) {
+        return Failure(ERROR_INVALID_PARAMETER);
+    }
+    SetResult(result, update.top_level_generation, Failure());
+    std::vector<InstalledTab> desired;
+    Status status = ValidateUpdate(topLevel, update, operations, &desired);
+    if (status.ok()) {
+        status = ValidateGenerations(topLevel, update, desired);
+    }
+    if (status.ok()) {
+        status = Reconcile(desired, operations);
+    }
+    if (status.ok()) {
+        g_tabs.top_level = topLevel;
+        g_tabs.top_level_generation = update.top_level_generation;
+        g_tabs.authoritative = desired;
+        g_tabs.installed = desired;
+        for (const InstalledTab& tab : desired) {
+            const auto known = std::find_if(
+                g_tabs.known_generations.begin(),
+                g_tabs.known_generations.end(),
+                [&](const InstalledTab& candidate) {
+                    return candidate.window == tab.window;
+                });
+            if (known == g_tabs.known_generations.end()) {
+                g_tabs.known_generations.push_back(tab);
+            } else if (tab.generation > known->generation) {
+                known->generation = tab.generation;
+            }
+        }
+    }
+    SetResult(result, update.top_level_generation, status);
+    return status;
+}
+
+Status RemoveAllTabSubclasses(const TabSubclassOperations& operations) {
+    if (!operations.remove_subclass) {
+        return Failure(ERROR_INVALID_PARAMETER);
+    }
+    while (!g_tabs.installed.empty()) {
+        const InstalledTab tab = g_tabs.installed.back();
+        const Status status = operations.remove_subclass(tab.window, kTabSubclassId);
+        if (!status.ok()) {
+            return status;
+        }
+        g_tabs.installed.pop_back();
+    }
+    g_tabs = {};
+    return Success();
+}
+
+TabSubclassOperations CreateProductionTabSubclassOperations() {
+    return {
+        &GetCurrentThreadId,
+        &GetWindowThreadProcessId,
+        &GetClassNameStatus,
+        &GetParent,
+        [](const HWND window) { return GetWindow(window, GW_CHILD); },
+        [](const HWND window) { return GetWindow(window, GW_HWNDNEXT); },
+        [](const HWND window, const UINT_PTR id, const std::uint64_t generation) {
+            return SetWindowSubclass(
+                       window,
+                       TabSubclassProc,
+                       id,
+                       static_cast<DWORD_PTR>(generation)) != FALSE
+                ? Success()
+                : Failure(GetLastError());
+        },
+        [](const HWND window, const UINT_PTR id) {
+            return RemoveWindowSubclass(window, TabSubclassProc, id) != FALSE
+                ? Success()
+                : Failure(GetLastError());
+        },
+        &SignalHookRuntimeRefresh,
+    };
+}
+
+void NotifyTabSubclassMessage(const HWND window, const UINT message) noexcept {
+    if (window == nullptr || message != WM_NCDESTROY) {
+        return;
+    }
+    const auto found = std::find_if(
+        g_tabs.installed.begin(), g_tabs.installed.end(),
+        [window](const InstalledTab& tab) { return tab.window == window; });
+    if (found != g_tabs.installed.end()) {
+        g_tabs.installed.erase(found);
+    }
+}
+
+}  // namespace winexinfo::hook
