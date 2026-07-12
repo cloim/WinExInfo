@@ -21,6 +21,10 @@ struct SessionWindowSnapshot final {
     HWND top_level = nullptr;
     std::uint64_t top_level_generation = 0;
     std::vector<ipc::TabDescriptor> tabs;
+    HWND active_tab = nullptr;
+    std::uint64_t active_tab_generation = 0;
+    std::string display_text;
+    std::string tooltip_text;
 
     bool operator==(const SessionWindowSnapshot&) const = default;
 };
@@ -76,6 +80,7 @@ private:
 
     [[nodiscard]] Status NextRequestId(std::uint64_t* output) noexcept;
     [[nodiscard]] Status SendUpdate(const SessionWindowSnapshot& snapshot);
+    [[nodiscard]] Status SendPaneText(const SessionWindowSnapshot& snapshot);
     [[nodiscard]] Status SendRemoval(const WindowState& window);
     void RecordDiagnostic(std::string key, std::string line) noexcept;
 

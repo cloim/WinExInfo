@@ -42,6 +42,9 @@ public:
     [[nodiscard]] Status RemoveAll(const TabSubclassOperations& operations);
     [[nodiscard]] bool cleanup_safe() const noexcept;
     [[nodiscard]] std::size_t active_count() const noexcept;
+    [[nodiscard]] bool Matches(
+        HWND topLevel, std::uint64_t topGeneration,
+        HWND tab, std::uint64_t tabGeneration) const noexcept;
     void Notify(HWND window, UINT message) noexcept;
 
 private:

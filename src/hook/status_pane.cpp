@@ -4,6 +4,7 @@
 
 #include <CommCtrl.h>
 
+#include <algorithm>
 #include <string>
 
 namespace winexinfo::hook {
@@ -95,6 +96,42 @@ StatusPanePlacementOperations ProductionPlacementOperations() {
     };
 }
 
+HFONT FindExplorerStatusFont(const HWND pane) noexcept {
+    struct Search final { HFONT font = nullptr; } search;
+    const HWND root = GetAncestor(pane, GA_ROOT);
+    if (root != nullptr) {
+        EnumChildWindows(
+            root,
+            [](const HWND child, const LPARAM parameter) -> BOOL {
+                wchar_t className[64]{};
+                const int length = GetClassNameW(child, className, 64);
+                if (length > 0 &&
+                    std::wstring_view{className, static_cast<std::size_t>(length)} ==
+                        L"msctls_statusbar32") {
+                    auto* const state = reinterpret_cast<Search*>(parameter);
+                    state->font = reinterpret_cast<HFONT>(
+                        SendMessageW(child, WM_GETFONT, 0, 0));
+                    if (state->font != nullptr) return FALSE;
+                }
+                return TRUE;
+            },
+            reinterpret_cast<LPARAM>(&search));
+    }
+    return search.font != nullptr
+        ? search.font
+        : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+}
+
+void ApplyExplorerStatusFont(const HWND pane) noexcept {
+    const HWND label = reinterpret_cast<HWND>(
+        GetWindowLongPtrW(pane, GWLP_USERDATA));
+    if (label != nullptr) {
+        SendMessageW(
+            label, WM_SETFONT,
+            reinterpret_cast<WPARAM>(FindExplorerStatusFont(pane)), TRUE);
+    }
+}
+
 LRESULT CALLBACK StatusPaneWindowProc(
     const HWND window,
     const UINT message,
@@ -102,6 +139,51 @@ LRESULT CALLBACK StatusPaneWindowProc(
     const LPARAM lparam) {
     if (message == WM_MOUSEACTIVATE) {
         return MA_NOACTIVATE;
+    }
+    if (message == WM_CREATE) {
+        const HWND label = CreateWindowExW(
+            0, L"STATIC", L"",
+            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE | SS_ENDELLIPSIS,
+            8, 0, 1, 1, window, nullptr, nullptr, nullptr);
+        if (label == nullptr) return -1;
+        SetWindowLongPtrW(
+            window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(label));
+        ApplyExplorerStatusFont(window);
+        return 0;
+    }
+    if (message == WM_SETTEXT) {
+        const LRESULT result = DefWindowProcW(window, message, wparam, lparam);
+        const HWND label = reinterpret_cast<HWND>(
+            GetWindowLongPtrW(window, GWLP_USERDATA));
+        if (label != nullptr) {
+            SetWindowTextW(label, reinterpret_cast<LPCWSTR>(lparam));
+        }
+        return result;
+    }
+    if (message == WM_SIZE) {
+        const HWND label = reinterpret_cast<HWND>(
+            GetWindowLongPtrW(window, GWLP_USERDATA));
+        RECT rect{};
+        GetClientRect(window, &rect);
+        if (label != nullptr) {
+            MoveWindow(
+                label, 8, 0, (std::max)(0L, rect.right - rect.left - 16),
+                (std::max)(0L, rect.bottom - rect.top), TRUE);
+        }
+        return 0;
+    }
+    if (message == WM_CTLCOLORSTATIC) {
+        const HDC dc = reinterpret_cast<HDC>(wparam);
+        SetTextColor(dc, GetSysColor(COLOR_WINDOWTEXT));
+        SetBkColor(dc, GetSysColor(COLOR_WINDOW));
+        return reinterpret_cast<LRESULT>(GetSysColorBrush(COLOR_WINDOW));
+    }
+    if (message == WM_THEMECHANGED || message == WM_SETTINGCHANGE ||
+        message == WM_DPICHANGED || message == WM_FONTCHANGE) {
+        ApplyExplorerStatusFont(window);
+        const HWND label = reinterpret_cast<HWND>(
+            GetWindowLongPtrW(window, GWLP_USERDATA));
+        if (label != nullptr) InvalidateRect(label, nullptr, TRUE);
     }
     return DefWindowProcW(window, message, wparam, lparam);
 }

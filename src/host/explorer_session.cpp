@@ -14,6 +14,7 @@
 #include <chrono>
 #include <limits>
 #include <iomanip>
+#include <iostream>
 #include <memory>
 #include <new>
 #include <ostream>
@@ -348,6 +349,12 @@ Status ExplorerSession::SendUpdate(const SessionWindowSnapshot& snapshot) {
             response, requestId, snapshot.top_level_generation, &result);
     }
     if (!status.ok() || result.result != 0) {
+        std::cerr << "BACKGROUND_UPDATE_FAILED pid=" << process_id_
+                  << " hwnd="
+                  << reinterpret_cast<std::uintptr_t>(snapshot.top_level)
+                  << " request=" << requestId
+                  << " transport_code=" << static_cast<int>(status.code)
+                  << " result=" << result.result << '\n';
         uncertain_ = true;
         return status.ok()
             ? Failed(ErrorCode::WINDOW_ATTACH_FAILED, result.result)
@@ -399,6 +406,50 @@ Status ExplorerSession::SendRemoval(const WindowState& window) {
         {reinterpret_cast<std::uint64_t>(window.snapshot.top_level),
          window.snapshot.top_level_generation},
         result));
+    return Ok();
+}
+
+Status ExplorerSession::SendPaneText(const SessionWindowSnapshot& snapshot) {
+    if (snapshot.active_tab == nullptr || snapshot.active_tab_generation == 0 ||
+        snapshot.display_text.empty() != snapshot.tooltip_text.empty()) {
+        return Invalid();
+    }
+    std::uint64_t requestId = 0;
+    Status status = NextRequestId(&requestId);
+    std::vector<std::uint8_t> request;
+    if (status.ok()) {
+        status = ipc::EncodePaneTextUpdate(
+            requestId,
+            {reinterpret_cast<std::uint64_t>(snapshot.top_level),
+             snapshot.top_level_generation,
+             reinterpret_cast<std::uint64_t>(snapshot.active_tab),
+             snapshot.active_tab_generation,
+             snapshot.display_text,
+             snapshot.tooltip_text},
+            &request);
+    }
+    ipc::DecodedFrame response{};
+    if (status.ok()) status = operations_.exchange(request, &response);
+    ipc::PaneTextResult result{};
+    if (status.ok()) {
+        status = ipc::DecodePaneTextResult(
+            response, requestId, snapshot.top_level_generation,
+            snapshot.active_tab_generation, &result);
+    }
+    if (!status.ok() || result.result != 0) {
+        std::cerr << "BACKGROUND_PANE_TEXT_FAILED pid=" << process_id_
+                  << " hwnd="
+                  << reinterpret_cast<std::uintptr_t>(snapshot.top_level)
+                  << " request=" << requestId
+                  << " code=" << static_cast<int>(status.code)
+                  << " hresult=" << status.hresult
+                  << " win32=" << status.win32
+                  << " result=" << result.result << '\n';
+        uncertain_ = true;
+        return status.ok()
+            ? Failed(ErrorCode::WINDOW_ATTACH_FAILED, result.result)
+            : status;
+    }
     return Ok();
 }
 
@@ -480,6 +531,13 @@ Status ExplorerSession::Reconcile(
                 },
                 &outcome);
             if (!ExactSuccess(attached) || !outcome.unload_authorized) {
+                std::cerr << "BACKGROUND_ATTACH_FAILED pid=" << process_id_
+                          << " tid=" << first.ui_thread_id
+                          << " code=" << static_cast<int>(attached.code)
+                          << " hresult=" << attached.hresult
+                          << " win32=" << attached.win32
+                          << " unload_authorized=" << outcome.unload_authorized
+                          << '\n';
                 uncertain_ = true;
                 return attached.ok()
                     ? Failed(ErrorCode::WINDOW_ATTACH_FAILED)
@@ -511,6 +569,11 @@ Status ExplorerSession::Reconcile(
                             : status;
                 });
             if (!ExactSuccess(ensured)) {
+                std::cerr << "BACKGROUND_ENSURE_HOOK_FAILED pid="
+                          << process_id_ << " tid=" << window.ui_thread_id
+                          << " code=" << static_cast<int>(ensured.code)
+                          << " hresult=" << ensured.hresult
+                          << " win32=" << ensured.win32 << '\n';
                 uncertain_ = true;
                 return ensured;
             }
@@ -519,6 +582,21 @@ Status ExplorerSession::Reconcile(
             }
             const Status updated = SendUpdate(window.snapshot);
             if (!updated.ok()) return updated;
+            const auto priorWindow = std::find_if(
+                windows_.begin(), windows_.end(),
+                [&window](const WindowState& existing) {
+                    return existing.snapshot.top_level == window.snapshot.top_level;
+                });
+            const bool paneChanged = priorWindow == windows_.end() ||
+                priorWindow->snapshot.active_tab != window.snapshot.active_tab ||
+                priorWindow->snapshot.active_tab_generation !=
+                    window.snapshot.active_tab_generation ||
+                priorWindow->snapshot.display_text != window.snapshot.display_text ||
+                priorWindow->snapshot.tooltip_text != window.snapshot.tooltip_text;
+            if (window.snapshot.active_tab != nullptr && paneChanged) {
+                const Status text = SendPaneText(window.snapshot);
+                if (!text.ok()) return text;
+            }
         }
 
         for (auto prior = windows_.rbegin(); prior != windows_.rend(); ++prior) {
@@ -651,8 +729,17 @@ ExplorerSessionOperations CreateProductionExplorerSessionOperations(
             std::wstring pipeName;
             Status status = ipc::BuildCurrentUserPipeNameForProcess(
                 target.explorer_pid, &pipeName);
+            if (!status.ok()) {
+                std::cerr << "BACKGROUND_PIPE_FAILED stage=name pid="
+                          << target.explorer_pid << " win32=" << status.win32 << '\n';
+            }
             if (status.ok()) {
                 status = ipc::CreateControllerPipeServer(pipeName, &state->pipe);
+                if (!status.ok()) {
+                    std::cerr << "BACKGROUND_PIPE_FAILED stage=create pid="
+                              << target.explorer_pid << " win32="
+                              << status.win32 << '\n';
+                }
             }
             if (!status.ok()) return status;
             auto platform = injection::CreateProductionHookPlatformOperations(
@@ -704,6 +791,13 @@ ExplorerSessionOperations CreateProductionExplorerSessionOperations(
             state->injector =
                 std::make_unique<injection::ThreadHookInjector>(std::move(platform));
             status = state->injector->Attach(target, output);
+            if (!status.ok()) {
+                std::cerr << "BACKGROUND_INJECTOR_FAILED pid="
+                          << target.explorer_pid << " tid="
+                          << target.ui_thread_id << " code="
+                          << static_cast<int>(status.code) << " win32="
+                          << status.win32 << '\n';
+            }
             state->pending_attach_validation = {};
             return status;
         },

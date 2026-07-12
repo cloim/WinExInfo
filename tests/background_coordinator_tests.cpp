@@ -228,6 +228,25 @@ WXI_TEST(background_unsupported_skip,
         std::count(recorder.events.begin(), recorder.events.end(), "create:41"), 0);
 }
 
+WXI_TEST(background_transient_unsupported_keeps_existing_session,
+         "background_coordinator.transient_unsupported_process_keeps_session") {
+    Recorder recorder;
+    recorder.inputs.push_back({
+        {1, {Process(41, true, {Window(0x1000, 1)})}}, false});
+    recorder.inputs.push_back({{2, {Process(41, false, {})}}, false});
+    recorder.inputs.push_back({
+        {3, {Process(41, true, {Window(0x1000, 2)})}}, false});
+    StopInput(&recorder);
+
+    WXI_REQUIRE_EQ(
+        winexinfo::RunBackgroundCoordinator(recorder.Operations()),
+        HostExitCode::Pass);
+    WXI_REQUIRE_EQ(
+        std::count(recorder.events.begin(), recorder.events.end(), "create:41"), 1);
+    WXI_REQUIRE_EQ(
+        std::count(recorder.events.begin(), recorder.events.end(), "stop:41"), 1);
+}
+
 WXI_TEST(background_strict_snapshot_sequence,
          "background_coordinator.rejects_duplicate_or_stale_snapshot_sequence") {
     for (const std::uint64_t second : {std::uint64_t{1}, std::uint64_t{0}}) {

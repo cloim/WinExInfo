@@ -196,11 +196,6 @@ Status ValidateGenerations(
         update.top_level_generation < state.top_level_generation) {
         return Failure(ERROR_INVALID_STATE);
     }
-    if (update.top_level_generation == state.top_level_generation) {
-        return desired == state.authoritative
-            ? Success()
-            : Failure(ERROR_INVALID_STATE);
-    }
     for (const InstalledTab& tab : desired) {
         const InstalledTab* const prior = Find(state.known_generations, tab.window);
         const InstalledTab* const active = Find(state.authoritative, tab.window);
@@ -372,10 +367,13 @@ Status TabSubclassSet::Apply(
     SetResult(result, update.top_level_generation, Failure());
     std::vector<InstalledTab> desired;
     Status status = ValidateUpdate(topLevel, update, operations, &desired);
+    std::uint32_t stage = 0xE001;
     if (status.ok()) {
+        stage = 0xE002;
         status = ValidateGenerations(*impl_, topLevel, update, desired);
     }
     if (status.ok()) {
+        stage = 0xE003;
         status = Reconcile(*impl_, desired, operations);
     }
     if (status.ok()) {
@@ -398,6 +396,7 @@ Status TabSubclassSet::Apply(
         }
     }
     SetResult(result, update.top_level_generation, status);
+    if (!status.ok()) result->result = stage;
     return status;
 }
 
@@ -431,6 +430,15 @@ bool TabSubclassSet::cleanup_safe() const noexcept {
 
 std::size_t TabSubclassSet::active_count() const noexcept {
     return impl_->installed.size();
+}
+
+bool TabSubclassSet::Matches(
+    const HWND topLevel, const std::uint64_t topGeneration,
+    const HWND tab, const std::uint64_t tabGeneration) const noexcept {
+    const InstalledTab* const installed = Find(impl_->authoritative, tab);
+    return impl_->top_level == topLevel &&
+        impl_->top_level_generation == topGeneration && installed != nullptr &&
+        installed->generation == tabGeneration;
 }
 
 TabSubclassOperations CreateProductionTabSubclassOperations(

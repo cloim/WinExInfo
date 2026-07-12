@@ -62,6 +62,10 @@ int wmain(const int argc, const wchar_t* const argv[]) {
     const HRESULT initialized =
         CoInitializeEx(nullptr, winexinfo::kShellComApartmentFlags);
     if (FAILED(initialized)) {
+        if (command.command == winexinfo::HostCommand::Background) {
+            std::cerr << "BACKGROUND_START_FAILED stage=com hresult="
+                      << initialized << '\n';
+        }
         const winexinfo::ProbeRunResult failureResult =
             command.command == winexinfo::HostCommand::ProbeObserve
             ? winexinfo::CreateObserveInfrastructureFailure(

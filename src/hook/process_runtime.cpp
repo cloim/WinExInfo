@@ -130,7 +130,7 @@ bool HandleProcessRuntimeControlMessageFor(ProcessRuntime&r,HWND top,UINT msg,WP
             }
         }
     }
-    if(!status.ok()&&r.pending_.kind==ProcessRuntime::ControlKind::Update)r.pending_.result={r.pending_.key.generation,status.win32?status.win32:ERROR_INVALID_STATE,"window runtime update failed"};
+    if(!status.ok()&&r.pending_.kind==ProcessRuntime::ControlKind::Update&&r.pending_.result.result==0)r.pending_.result={r.pending_.key.generation,status.win32?status.win32:ERROR_INVALID_STATE,"window runtime update failed"};
     r.pending_.status=status;r.pending_.completed.store(true,std::memory_order_release);return true;
  }catch(...){r.retention_required_.store(true,std::memory_order_release);return false;}
 }

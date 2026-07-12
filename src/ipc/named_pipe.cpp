@@ -174,7 +174,7 @@ Status CreateControllerPipeServer(
     std::wstring name{pipeName};
     const HANDLE pipe = CreateNamedPipeW(
         name.c_str(),
-        PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+        PIPE_ACCESS_DUPLEX,
         kControllerPipeMode,
         1,
         static_cast<DWORD>(kMaximumFrameSize),

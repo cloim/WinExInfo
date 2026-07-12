@@ -69,8 +69,7 @@ function Assert-IsolatedControlledProcess {
     }
     $unexpected = @($AllTopLevelWindows | Where-Object {
         $_.Pid -eq $ProcessId -and $_.Visible -and
-        $_.ClassName -cne 'CabinetWClass' -and
-        $_.ClassName -cne 'ApplicationFrameWindow'
+        $_.ClassName -cne 'CabinetWClass'
     })
     if ($unexpected.Count -ne 0) {
         throw 'Controlled Explorer PID owns an unexpected visible top-level window.'
@@ -87,11 +86,48 @@ function Assert-ExactCleanupDiagnostic {
 
 function Assert-SafetyBaseline {
     param($Before, $After)
-    foreach ($name in @('RunCount','ServiceCount','TaskCount','TcpCount')) {
+    foreach ($name in @('RunCount','ServiceCount','TaskCount','TcpCount','WinExInfoProcessCount')) {
         if ([int]$Before.$name -ne [int]$After.$name) {
             throw "Safety baseline changed: $name"
         }
     }
+}
+
+function Assert-AuthoritativeUpdateHistory {
+    param($Window, [string[]]$Lines, [bool]$RequireTwoTabs, [bool]$RequireRemoval)
+    $hwnd = '0x' + ([long]$Window.Hwnd).ToString('X16')
+    $updates = @($Lines | Where-Object {
+        $_ -like "LIFECYCLE_EVENT event=update pid=$($Window.Pid) * hwnd=$hwnd *"
+    })
+    if ($updates.Count -eq 0) { throw "No update diagnostic for hwnd=$hwnd" }
+    $topGenerations = @()
+    $tabCounts = @()
+    foreach ($line in $updates) {
+        if ($line -cnotmatch ' top_generation=([1-9][0-9]*) tabs=([^ ]+) result=0$') {
+            throw "Malformed update diagnostic: $line"
+        }
+        $topGenerations += [uint64]$Matches[1]
+        $tabs = @($Matches[2] -split ',')
+        foreach ($tab in $tabs) {
+            if ($tab -cnotmatch '^0x[0-9A-F]{16}:[1-9][0-9]*:[1-9][0-9]*$') {
+                throw "Malformed tab generation diagnostic: $tab"
+            }
+        }
+        $tabCounts += $tabs.Count
+    }
+    if (@($topGenerations | Sort-Object -Unique).Count -ne 1) {
+        throw "Top-level generation changed without HWND reuse: hwnd=$hwnd"
+    }
+    if ($RequireTwoTabs -and (-not ($tabCounts -contains 1) -or -not ($tabCounts -contains 2))) {
+        throw "One-to-two tab generation transition was not recorded: hwnd=$hwnd"
+    }
+    if ($RequireRemoval) {
+        $removals = @($Lines | Where-Object {
+            $_ -like "LIFECYCLE_EVENT event=remove pid=$($Window.Pid) * hwnd=$hwnd top_generation=$($topGenerations[0]) result=0"
+        })
+        if ($removals.Count -ne 1) { throw "Removal diagnostic cardinality hwnd=$hwnd count=$($removals.Count)" }
+    }
+    Write-Output "GENERATION hwnd=$hwnd pid=$($Window.Pid) top=$($topGenerations[0]) tab_counts=$(@($tabCounts | Sort-Object -Unique) -join ',')"
 }
 
 function Invoke-HarnessSelfTest {
@@ -266,11 +302,28 @@ $tabsChanged = $false
 $restartObserved = $false
 
 try {
+    if ($before.WinExInfoProcessCount -ne 0) { throw 'A WinExInfo process already existed before the run.' }
+    foreach ($existing in $baselineWindows) {
+        if ([GateCHelper]::ExactPaneCount([long]$existing.Hwnd) -ne 0) {
+            throw "A baseline Explorer window already contained a WinExInfo pane."
+        }
+    }
+    foreach ($existingPid in $baselinePids) {
+        if ((Get-ExactModuleCount $existingPid) -ne 0) {
+            throw "A baseline Explorer process already contained the exact Hook DLL. pid=$existingPid"
+        }
+    }
     $windowA = Open-ControlledWindow $baselineWindows $pathA $urlA
     $controlled += $windowA
     $beforeB = @(Get-StableShellWindows)
     $windowB = Open-ControlledWindow $beforeB $pathB $urlB
     $controlled += $windowB
+    foreach ($window in $controlled) {
+        if ([GateCHelper]::ExactPaneCount([long]$window.Hwnd) -ne 0 -or
+            (Get-ExactModuleCount $window.Pid) -ne 0) {
+            throw 'A controlled Explorer target was not clean before Host start.'
+        }
+    }
     $resourceBefore = Get-ExplorerResourceState $windowB.Pid
     $hostProcess = Start-Process -FilePath $hostExecutable -ArgumentList '--background' -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -WindowStyle Hidden -PassThru
 
@@ -288,6 +341,9 @@ try {
     [void][GateCHelper]::RestoreSingleTab([long]$windowB.Hwnd)
 
     $ownedA = @($controlled | Where-Object Pid -EQ $windowA.Pid)
+    if ($ownedA.Count -ne 1) {
+        throw 'Restart source PID did not own exactly one controlled Explorer window.'
+    }
     $topClasses = @([LifecycleNative]::VisibleTopLevelClasses([int]$windowA.Pid) | ForEach-Object {
         [pscustomobject]@{ Pid=[int]$windowA.Pid; Visible=$true; ClassName=$_ }
     })
@@ -321,9 +377,17 @@ try {
         Assert-ExactCleanupDiagnostic $stopLines[0] $attachedPid
         if ((Get-ExactModuleCount $attachedPid) -ne 0) { throw "Hook module remained pid=$attachedPid" }
     }
+    Assert-AuthoritativeUpdateHistory $windowA $hostOut $true $true
+    Assert-AuthoritativeUpdateHistory $windowB $hostOut $true $false
+    Assert-AuthoritativeUpdateHistory $restartWindow $hostOut $false $false
     foreach ($window in @($windowB,$restartWindow)) {
         if ([GateCHelper]::Exists([long]$window.Hwnd) -and [GateCHelper]::ExactPaneCount([long]$window.Hwnd) -ne 0) {
             throw "Pane remained hwnd=0x$(([long]$window.Hwnd).ToString('X16'))"
+        }
+    }
+    foreach ($remaining in @(Get-StableShellWindows)) {
+        if ([GateCHelper]::ExactPaneCount([long]$remaining.Hwnd) -ne 0) {
+            throw "Pane remained in Explorer window hwnd=0x$(([long]$remaining.Hwnd).ToString('X16'))"
         }
     }
     $resourceAfter = Get-ExplorerResourceState $windowB.Pid

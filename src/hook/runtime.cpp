@@ -1,5 +1,6 @@
 #include "hook/runtime.h"
 
+#include "common/utf8.h"
 #include "common/win32_handle.h"
 #include "hook/explorer_layout.h"
 #include "hook/process_runtime.h"
@@ -50,6 +51,7 @@ struct RuntimeWindowResources final {
     HookRuntimeRefreshIngress ingress;
     bool worker_started = false;
     bool ui_cleaned = false;
+    bool pane_text_available = false;
 };
 
 struct RuntimeContext final {
@@ -303,8 +305,61 @@ Status ActivateRuntimeWindow(WindowRuntime& window) {
 
 Status ApplyRuntimeWindowUpdate(WindowRuntime& window, const ipc::TabSetUpdate& update,
                                 ipc::TabSetResult* result) {
-    return window.tab_subclasses->Apply(window.key.top_level, update,
-        CreateProductionTabSubclassOperations(*window.tab_subclasses), result);
+    RuntimeWindowResources* const resources = Resources(&window);
+    if (!resources) return PlacementFailure(ERROR_INVALID_STATE);
+    TabSubclassOperations operations =
+        CreateProductionTabSubclassOperations(*window.tab_subclasses);
+    operations.post_refresh = [resources] {
+        if (!resources->worker_started) return Success();
+        return resources->ingress.SignalEvent(resources->refresh_event.get());
+    };
+    return window.tab_subclasses->Apply(
+        window.key.top_level, update, operations, result);
+}
+
+Status ApplyRuntimePaneText(
+    ProcessRuntime& process, const ipc::PaneTextUpdate& update,
+    ipc::PaneTextResult* const result) {
+    if (result == nullptr) return PlacementFailure(ERROR_INVALID_PARAMETER);
+    *result = {update.top_level_generation, update.tab_generation,
+               ERROR_INVALID_STATE, "WINDOW_ATTACH_FAILED"};
+    const HWND top = reinterpret_cast<HWND>(update.top_level_hwnd);
+    const HWND tab = reinterpret_cast<HWND>(update.tab_hwnd);
+    for (std::size_t index = 0; index < kMaximumRuntimeWindows; ++index) {
+        auto lease = AcquireProcessWindowStorageAt(process, index);
+        WindowRuntime* const window = lease.get();
+        if (!window || window->key.top_level != top) continue;
+        RuntimeWindowResources* const resources = Resources(window);
+        if (window->key.generation != update.top_level_generation ||
+            !window->tab_subclasses->Matches(
+                top, update.top_level_generation, tab, update.tab_generation) ||
+            !resources || !resources->pane.hwnd || resources->ui_cleaned) {
+            return Success();
+        }
+        std::wstring text;
+        const Status converted = Utf16FromUtf8(update.display_text, &text);
+        if (!converted.ok()) {
+            result->result = converted.win32 != 0
+                ? converted.win32 : ERROR_NO_UNICODE_TRANSLATION;
+            return Success();
+        }
+        DWORD_PTR ignored = 0;
+        if (SendMessageTimeoutW(
+                resources->pane.hwnd, WM_SETTEXT, 0,
+                reinterpret_cast<LPARAM>(text.c_str()),
+                SMTO_ABORTIFHUNG | SMTO_BLOCK, 5000, &ignored) == 0) {
+            const DWORD error = GetLastError();
+            result->result = error != ERROR_SUCCESS ? error : ERROR_TIMEOUT;
+            return Success();
+        }
+        resources->pane_text_available = !update.display_text.empty();
+        ShowWindow(
+            resources->pane.hwnd,
+            resources->pane_text_available ? SW_SHOWNOACTIVATE : SW_HIDE);
+        *result = {update.top_level_generation, update.tab_generation, 0, {}};
+        return Success();
+    }
+    return Success();
 }
 
 Status CleanupRuntimeWindowOnUi(WindowRuntime& window) {
@@ -398,6 +453,23 @@ DWORD WINAPI RuntimeWorker(void* const parameter) {
         }
         if (ipc::DecodeDetachRequest(request).ok()) {
             detachRequested = true;
+            break;
+        }
+        if (request.message_type == ipc::MessageType::PaneTextUpdate) {
+            ipc::PaneTextUpdate paneText{};
+            status = ipc::DecodePaneTextUpdate(request, &paneText);
+            ipc::PaneTextResult result{};
+            if (status.ok()) {
+                status = ApplyRuntimePaneText(
+                    context->process, paneText, &result);
+            }
+            std::vector<std::uint8_t> response;
+            if (status.ok()) {
+                status = ipc::EncodePaneTextResult(
+                    request.request_id, result, &response);
+            }
+            if (status.ok()) status = ipc::WriteFrame(pipe.get(), response);
+            if (status.ok()) continue;
             break;
         }
         if (request.message_type == ipc::MessageType::WindowRemoveRequest) {
@@ -544,6 +616,7 @@ bool HandleStatusPaneRuntimeMessage(
     if (!resources->refresh.Consume(&result)) {
         return true;
     }
+    result.visible = result.visible && resources->pane_text_available;
     const bool accepted = ApplyStatusPanePlacementResult(pane, result).ok() &&
         UpdateRuntimeParentSubclass(resources, result.parent).ok();
     static_cast<void>(resources->refresh.ApplyCompleted(

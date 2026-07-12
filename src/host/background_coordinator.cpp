@@ -1,5 +1,6 @@
 #include "host/background_coordinator.h"
 
+#include "common/utf8.h"
 #include "common/win32_handle.h"
 #include "probe/shell_probe.h"
 #include "probe/target_validator.h"
@@ -7,6 +8,7 @@
 
 #include <algorithm>
 #include <Aclapi.h>
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <ExDisp.h>
@@ -16,7 +18,9 @@
 #include <mutex>
 #include <new>
 #include <objbase.h>
+#include <optional>
 #include <set>
+#include <string>
 #include <thread>
 #include <utility>
 #include <wrl/client.h>
@@ -31,6 +35,96 @@ bool ExactSuccess(const Status& status) noexcept {
 
 Status BackgroundFailure(const DWORD error) noexcept {
     return {ErrorCode::PIPE_DISCONNECTED, HRESULT_FROM_WIN32(error), error};
+}
+
+std::optional<std::pair<std::string, std::string>> CaptureGitDisplay(
+    const std::wstring& folder) {
+    constexpr wchar_t gitPath[] = L"C:\\Program Files\\Git\\cmd\\git.exe";
+    if (folder.empty() || folder.find(L'"') != std::wstring::npos ||
+        GetFileAttributesW(gitPath) == INVALID_FILE_ATTRIBUTES) {
+        return std::nullopt;
+    }
+    SECURITY_ATTRIBUTES attributes{sizeof(attributes), nullptr, TRUE};
+    HANDLE readRaw = nullptr;
+    HANDLE writeRaw = nullptr;
+    if (CreatePipe(&readRaw, &writeRaw, &attributes, 0) == FALSE) {
+        return std::nullopt;
+    }
+    UniqueHandle readPipe{readRaw};
+    UniqueHandle writePipe{writeRaw};
+    if (SetHandleInformation(readPipe.get(), HANDLE_FLAG_INHERIT, 0) == FALSE) {
+        return std::nullopt;
+    }
+    std::wstring command = L"\"" + std::wstring{gitPath} +
+        L"\" -C \"" + folder +
+        L"\" status --porcelain=v2 --branch --untracked-files=all";
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    startup.wShowWindow = SW_HIDE;
+    startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    startup.hStdOutput = writePipe.get();
+    startup.hStdError = writePipe.get();
+    PROCESS_INFORMATION process{};
+    if (CreateProcessW(
+            gitPath, command.data(), nullptr, nullptr, TRUE,
+            CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process) == FALSE) {
+        return std::nullopt;
+    }
+    UniqueHandle processHandle{process.hProcess};
+    UniqueHandle threadHandle{process.hThread};
+    writePipe.reset();
+    if (WaitForSingleObject(processHandle.get(), 2000) != WAIT_OBJECT_0) {
+        TerminateProcess(processHandle.get(), ERROR_TIMEOUT);
+        return std::nullopt;
+    }
+    DWORD exitCode = 1;
+    if (GetExitCodeProcess(processHandle.get(), &exitCode) == FALSE || exitCode != 0) {
+        return std::nullopt;
+    }
+    std::string output;
+    std::array<char, 4096> buffer{};
+    for (;;) {
+        DWORD read = 0;
+        if (ReadFile(readPipe.get(), buffer.data(), static_cast<DWORD>(buffer.size()),
+                     &read, nullptr) == FALSE || read == 0) break;
+        output.append(buffer.data(), read);
+        if (output.size() > 1024 * 1024) return std::nullopt;
+    }
+    std::string branch = "(detached)";
+    std::uint32_t staged = 0, unstaged = 0, untracked = 0, conflicts = 0;
+    std::size_t start = 0;
+    while (start < output.size()) {
+        const std::size_t end = output.find('\n', start);
+        const std::string_view line{output.data() + start,
+            (end == std::string::npos ? output.size() : end) - start};
+        if (line.starts_with("# branch.head ")) {
+            branch.assign(line.substr(14));
+            if (branch == "(detached)") branch = "detached";
+        } else if (line.starts_with("? ")) {
+            ++untracked;
+        } else if (line.starts_with("u ")) {
+            ++conflicts;
+        } else if ((line.starts_with("1 ") || line.starts_with("2 ")) &&
+                   line.size() >= 4) {
+            if (line[2] != '.') ++staged;
+            if (line[3] != '.') ++unstaged;
+        }
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    std::string display = branch;
+    if (staged == 0 && unstaged == 0 && untracked == 0 && conflicts == 0) {
+        display += "  ✓";
+    } else {
+        if (staged) display += "  +" + std::to_string(staged);
+        if (unstaged) display += "  ~" + std::to_string(unstaged);
+        if (untracked) display += "  ?" + std::to_string(untracked);
+        if (conflicts) display += "  !" + std::to_string(conflicts);
+    }
+    std::string pathUtf8;
+    if (!Utf8FromUtf16(folder, &pathUtf8).ok()) return std::nullopt;
+    return std::pair{std::move(display), std::move(pathUtf8)};
 }
 
 Status CaptureCurrentUserSid(std::vector<std::uint8_t>* const output) {
@@ -264,6 +358,7 @@ public:
         std::vector<ExplorerWindowRecord> windows;
         std::vector<ObserverTopLevelTabOrder> orders;
         std::vector<std::pair<HWND, HWND>> uiaTargets;
+        std::vector<HWND> activeTabs;
         std::set<DWORD> invalidPids;
         try {
             for (const ExplorerWindowRecord& window : enumerated) {
@@ -297,6 +392,7 @@ public:
                 windows.push_back(window);
                 orders.push_back(std::move(order));
                 uiaTargets.push_back({window.hwnd, contract.active_view});
+                activeTabs.push_back(contract.active_shell_tab);
             }
 
             std::vector<HWND> topLevels;
@@ -351,6 +447,40 @@ public:
             status = tracker_.Reconcile(
                 sequence, windows, metadata, orders, validated, output);
             if (!status.ok()) return status;
+            for (std::size_t index = 0; index < windows.size(); ++index) {
+                ActiveShellViewSnapshot active{};
+                const Status activeStatus = CaptureActiveShellViewFromBrowserSet(
+                    shellCapture, windows[index].hwnd,
+                    activeTabs[index], &active);
+                const auto process = std::find_if(
+                    output->processes.begin(), output->processes.end(),
+                    [&](const ExplorerProcessSnapshot& item) {
+                        return item.process_id == windows[index].process_id;
+                    });
+                if (process == output->processes.end() || !process->validated) continue;
+                const auto sessionWindow = std::find_if(
+                    process->windows.begin(), process->windows.end(),
+                    [&](const SessionWindowSnapshot& item) {
+                        return item.top_level == windows[index].hwnd;
+                    });
+                if (sessionWindow == process->windows.end()) continue;
+                const auto activeTab = std::find_if(
+                    sessionWindow->tabs.begin(), sessionWindow->tabs.end(),
+                    [&](const ipc::TabDescriptor& item) {
+                        return item.tab_hwnd == reinterpret_cast<std::uint64_t>(
+                            activeTabs[index]);
+                    });
+                if (activeTab == sessionWindow->tabs.end()) continue;
+                sessionWindow->active_tab = activeTabs[index];
+                sessionWindow->active_tab_generation = activeTab->tab_generation;
+                if (activeStatus.ok() && active.filesystem_path_available) {
+                    const auto git = CaptureGitDisplay(active.filesystem_path);
+                    if (git) {
+                        sessionWindow->display_text = git->first;
+                        sessionWindow->tooltip_text = git->second;
+                    }
+                }
+            }
             for (const ExplorerWindowRecord& window : enumerated) {
                 if (!invalidPids.contains(window.process_id)) continue;
                 const auto found = std::find_if(
@@ -638,6 +768,10 @@ HostExitCode RunBackgroundCoordinator(const BackgroundOperations& operations) {
             bool stop = false;
             const Status received = operations.next_snapshot(&incoming, &stop);
             if (!ExactSuccess(received)) {
+                std::cerr << "BACKGROUND_FAILED stage=snapshot code="
+                          << static_cast<int>(received.code)
+                          << " hresult=" << received.hresult
+                          << " win32=" << received.win32 << '\n';
                 static_cast<void>(stopAll(0));
                 return HostExitCode::Win32ComFailure;
             }
@@ -654,8 +788,8 @@ HostExitCode RunBackgroundCoordinator(const BackgroundOperations& operations) {
             std::vector<DWORD> desired;
             desired.reserve(snapshot.processes.size());
             for (const ExplorerProcessSnapshot& process : snapshot.processes) {
-                if (!process.validated) continue;
                 desired.push_back(process.process_id);
+                if (!process.validated) continue;
                 auto found = sessions.find(process.process_id);
                 if (found == sessions.end()) {
                     if (process.windows.empty()) continue;
@@ -663,6 +797,11 @@ HostExitCode RunBackgroundCoordinator(const BackgroundOperations& operations) {
                     const Status creation =
                         operations.create_session(process.process_id, &created);
                     if (!ExactSuccess(creation) || !created) {
+                        std::cerr << "BACKGROUND_FAILED stage=session_create pid="
+                                  << process.process_id
+                                  << " code=" << static_cast<int>(creation.code)
+                                  << " hresult=" << creation.hresult
+                                  << " win32=" << creation.win32 << '\n';
                         static_cast<void>(stopAll(0));
                         return HostExitCode::Win32ComFailure;
                     }
@@ -674,6 +813,11 @@ HostExitCode RunBackgroundCoordinator(const BackgroundOperations& operations) {
                 const Status reconciled =
                     found->second.session->Reconcile(process.windows);
                 if (!ExactSuccess(reconciled)) {
+                    std::cerr << "BACKGROUND_FAILED stage=reconcile pid="
+                              << process.process_id
+                              << " code=" << static_cast<int>(reconciled.code)
+                              << " hresult=" << reconciled.hresult
+                              << " win32=" << reconciled.win32 << '\n';
                     static_cast<void>(stopAll(process.process_id));
                     return HostExitCode::Win32ComFailure;
                 }
@@ -724,10 +868,14 @@ HostExitCode RunProductionBackgroundCoordinator(const std::wstring& hookDllPath)
                 nullptr, TRUE, std::wstring{kBackgroundMutexName}.c_str()));
             if (!state->mutex) {
                 const DWORD error = GetLastError();
+                std::cerr << "BACKGROUND_START_FAILED stage=mutex_create win32="
+                          << error << '\n';
                 return Status{ErrorCode::PIPE_DISCONNECTED,
                               HRESULT_FROM_WIN32(error), error};
             }
             if (GetLastError() == ERROR_ALREADY_EXISTS) {
+                std::cerr << "BACKGROUND_START_FAILED stage=mutex_exists win32="
+                          << ERROR_ALREADY_EXISTS << '\n';
                 state->mutex.reset();
                 return Status{ErrorCode::PIPE_DISCONNECTED,
                               HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS),
@@ -736,12 +884,20 @@ HostExitCode RunProductionBackgroundCoordinator(const std::wstring& hookDllPath)
             const Status stopEvent = CreateBackgroundStopEvent(
                 GetCurrentProcessId(), &state->stop_event);
             if (!stopEvent.ok()) {
+                std::cerr << "BACKGROUND_START_FAILED stage=stop_event code="
+                          << static_cast<int>(stopEvent.code)
+                          << " hresult=" << stopEvent.hresult
+                          << " win32=" << stopEvent.win32 << '\n';
                 ReleaseMutex(state->mutex.get());
                 state->mutex.reset();
                 return stopEvent;
             }
             const Status observer = state->observer.Start();
             if (!observer.ok()) {
+                std::cerr << "BACKGROUND_START_FAILED stage=observer code="
+                          << static_cast<int>(observer.code)
+                          << " hresult=" << observer.hresult
+                          << " win32=" << observer.win32 << '\n';
                 ReleaseMutex(state->mutex.get());
                 state->mutex.reset();
                 state->stop_event.reset();
@@ -751,6 +907,8 @@ HostExitCode RunProductionBackgroundCoordinator(const std::wstring& hookDllPath)
                 state->stop_event.get(), std::memory_order_release);
             if (SetConsoleCtrlHandler(BackgroundConsoleHandler, TRUE) == FALSE) {
                 const DWORD error = GetLastError();
+                std::cerr << "BACKGROUND_START_FAILED stage=console_handler win32="
+                          << error << '\n';
                 g_background_stop_event.store(nullptr, std::memory_order_release);
                 ReleaseMutex(state->mutex.get());
                 state->mutex.reset();
@@ -796,7 +954,16 @@ HostExitCode RunProductionBackgroundCoordinator(const std::wstring& hookDllPath)
                               ERROR_ARITHMETIC_OVERFLOW};
             }
             *stop = false;
-            return state->observer.Capture(++state->sequence, output);
+            const Status captured =
+                state->observer.Capture(++state->sequence, output);
+            if (!captured.ok()) {
+                std::cerr << "BACKGROUND_CAPTURE_FAILED sequence="
+                          << state->sequence
+                          << " code=" << static_cast<int>(captured.code)
+                          << " hresult=" << captured.hresult
+                          << " win32=" << captured.win32 << '\n';
+            }
+            return captured;
         },
         [state](const DWORD pid, std::unique_ptr<BackgroundSession>* const output) {
             if (pid == 0 || output == nullptr || *output) {
