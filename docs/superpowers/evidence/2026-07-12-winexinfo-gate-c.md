@@ -1,24 +1,117 @@
 # WinExInfo Gate C Evidence
 
-Gate C: FAIL
+Gate C: PASS
 
 Captured on 2026-07-12 KST against the approved Windows 11 Explorer target.
 
 ## Decision
 
-The fresh Debug live run at approved product head `4864b5a` proved exact
-initial placement, resize reflow, and migration to the newly selected tab's
-active `DUIViewWndClassName`. After closing the added tab and restoring the
-original active tab, however, exact pane cardinality remained zero for the
-entire bounded 3000 ms wait. Failure cleanup also left one exact Hook DLL
-module in the now-windowless controlled Explorer process. Gate C is therefore
-FAIL. Per the stop condition, Release was not executed and product
-implementation must not continue from this gate.
+Fresh Debug and Release live runs at review-approved product head `3612965`
+both passed the complete contract. The same pane HWND survived resize, moved
+to the newly selected tab's exact active `DUIViewWndClassName`, moved back to
+the restored original view after the added tab closed, and returned to its
+original rectangle. Both Hosts exited normally, pane and exact module cleanup
+completed within bounds, only the controlled window was closed, and safety
+state remained clean. The earlier failures are retained below as superseded
+diagnostic history.
 
 No fallback selector, overlay, network access, persistence, service, scheduled
 task, Run-key mutation, or existing Explorer-window targeting was used.
 
-## Fresh run at approved head 4864b5a
+## Final passing runs at head 3612965
+
+### Debug
+
+Command and result:
+
+```text
+pwsh -NoProfile -File .\scripts\run-gate-c.ps1 -Configuration Debug
+exit 0
+```
+
+Controlled identity and safety baseline:
+
+```text
+CONTROLLED hwnd=0x00000000000D0FC0 pid=42620 tid=12980 class=CabinetWClass url=file:///D:/PROJECTS/WinExInfo
+SAFETY stage=before explorer_windows=1 explorer_pids=1 run=0 service=0 task=0 processes=0 tcp=0
+```
+
+Pane continuity and exact transitions:
+
+```text
+initial      active_tab=0x00000000020F0DDA pane=0x0000000000431056 parent=0x00000000004C0F9C rect=262,960,1604,984 expected=262,960,1604,984 overlap=false
+resized      active_tab=0x00000000020F0DDA pane=0x0000000000431056 parent=0x00000000004C0F9C rect=262,870,1444,894 expected=262,870,1444,894 overlap=false
+tab_switched active_tab=0x0000000000091046 pane=0x0000000000431056 parent=0x0000000000B10C9A rect=255,870,1444,894 expected=255,870,1444,894 overlap=false
+restored     active_tab=0x00000000020F0DDA pane=0x0000000000431056 parent=0x00000000004C0F9C rect=262,960,1604,984 expected=262,960,1604,984 overlap=false
+```
+
+The pane owner was Explorer PID/TID `42620/12980` in every stage; class was
+`WinExInfo.StatusPane`, text was `WinExInfo Gate B`, parent class was
+`DUIViewWndClassName`, and DPI was 96. The tab transition was exactly one tab
+to two tabs, original selected, new tab selected, then restored to one tab.
+
+```text
+TARGET_ACCEPTED protocol=1 pid=42620 tid=12980 hwnd=0x00000000000D0FC0
+CLEANUP pane_absent=true exact_module_count=0 host_exit=0
+SAFETY stage=after explorer_windows=1 explorer_pids=2 run=0 service=0 task=0 processes=0 tcp=0
+GATE_C_PASS configuration=Debug pane_owner=explorer overlap=false cleanup=true
+```
+
+### Release
+
+Current head was rebuilt first:
+
+```text
+pwsh -NoProfile -File .\scripts\build.ps1 -Configuration Release
+exit 0
+```
+
+Live command and result:
+
+```text
+pwsh -NoProfile -File .\scripts\run-gate-c.ps1 -Configuration Release
+exit 0
+```
+
+Controlled identity and safety baseline:
+
+```text
+CONTROLLED hwnd=0x00000000001B0FF4 pid=16824 tid=18908 class=CabinetWClass url=file:///D:/PROJECTS/WinExInfo
+SAFETY stage=before explorer_windows=1 explorer_pids=2 run=0 service=0 task=0 processes=0 tcp=0
+```
+
+Pane continuity and exact transitions:
+
+```text
+initial      active_tab=0x0000000000A30FBC pane=0x00000000001E10A2 parent=0x0000000000300FF0 rect=262,960,1604,984 expected=262,960,1604,984 overlap=false
+resized      active_tab=0x0000000000A30FBC pane=0x00000000001E10A2 parent=0x0000000000300FF0 rect=262,870,1444,894 expected=262,870,1444,894 overlap=false
+tab_switched active_tab=0x00000000011B0D6C pane=0x00000000001E10A2 parent=0x000000000006103A rect=255,870,1444,894 expected=255,870,1444,894 overlap=false
+restored     active_tab=0x0000000000A30FBC pane=0x00000000001E10A2 parent=0x0000000000300FF0 rect=262,960,1604,984 expected=262,960,1604,984 overlap=false
+```
+
+The pane owner was Explorer PID/TID `16824/18908` in every stage, with the
+same exact class/text/parent/DPI contract as Debug.
+
+```text
+TARGET_ACCEPTED protocol=1 pid=16824 tid=18908 hwnd=0x00000000001B0FF4
+CLEANUP pane_absent=true exact_module_count=0 host_exit=0
+SAFETY stage=after explorer_windows=1 explorer_pids=2 run=0 service=0 task=0 processes=0 tcp=0
+GATE_C_PASS configuration=Release pane_owner=explorer overlap=false cleanup=true
+```
+
+Final read-only safety capture:
+
+```text
+explorer_windows=1 explorer_pids=2 processes=0 tcp=0 run=0 service=0 task=0
+pid=15836 hook_count=0
+pid=16824 hook_count=0
+```
+
+Both controlled top-level HWNDs were closed by the harness. No unrelated
+Explorer top-level was acted on. PID 16824 remained temporarily windowless
+after Release, with exact Hook DLL count zero.
+
+## Superseded failure at approved head 4864b5a
 
 Command:
 
@@ -251,7 +344,8 @@ Run/service/task/WinExInfo-process/TCP counts were zero.
 ## Required result
 
 ```text
-GATE_C_FAIL configuration=Debug reason=Pane_did_not_reach_exact_restored_state_within_3000ms._diagnostic=pane_cardinality=0 cleanup=false
+GATE_C_PASS configuration=Debug pane_owner=explorer overlap=false cleanup=true
+GATE_C_PASS configuration=Release pane_owner=explorer overlap=false cleanup=true
 ```
 
-Gate C: FAIL. Release is untested and downstream product work is blocked.
+Gate C: PASS. This evidence does not itself authorize downstream product work.
