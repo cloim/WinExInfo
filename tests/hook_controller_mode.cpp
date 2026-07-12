@@ -499,8 +499,11 @@ int RunHookControllerMode(const HookTestCommand& command) {
         const Status attached = injector.Attach(
             {command.target_pid, match.tid, match.hwnd}, &outcome);
         if (command.mode == HookTestMode::ControllerFault) {
-            const bool retained = !attached.ok() &&
-                attached.code == ErrorCode::HOOK_RELEASE_FAILED &&
+            const Status released = attached.ok()
+                ? injector.ReleaseHookForDetach(command.target_pid)
+                : attached;
+            const bool retained = !released.ok() &&
+                released.code == ErrorCode::HOOK_RELEASE_FAILED &&
                 WaitForModuleState(command.target_pid, hookDllPath, true);
             UniqueHandle releaseEvent{
                 OpenEventW(SYNCHRONIZE, FALSE, outcome.event_name.c_str())};
@@ -516,6 +519,9 @@ int RunHookControllerMode(const HookTestCommand& command) {
             return 1;
         }
         if (!attached.ok() || !outcome.unload_authorized) {
+            return 1;
+        }
+        if (!injector.ReleaseHookForDetach(command.target_pid).ok()) {
             return 1;
         }
         std::vector<std::uint8_t> detach;

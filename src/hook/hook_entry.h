@@ -11,6 +11,7 @@ namespace winexinfo::hook {
 
 struct HookEntryOperations final {
     std::function<Status(HWND, std::uint64_t)> begin_attach;
+    std::function<void(HWND, UINT)> observe_message;
     std::function<LRESULT(int, WPARAM, LPARAM)> call_next;
 };
 

@@ -12,18 +12,21 @@ LRESULT ProcessHookCall(
     const LPARAM hookLparam,
     const UINT attachMessage,
     const HookEntryOperations& operations) {
-    if (!operations.begin_attach || !operations.call_next) {
+    if (!operations.begin_attach || !operations.observe_message ||
+        !operations.call_next) {
         return 0;
     }
-    if (code >= 0 && hookLparam != 0 && attachMessage != 0) {
+    if (code >= 0 && hookLparam != 0) {
         const auto* message = reinterpret_cast<const CWPSTRUCT*>(hookLparam);
-        if (message->hwnd != nullptr && message->message == attachMessage &&
+        if (attachMessage != 0 && message->hwnd != nullptr &&
+            message->message == attachMessage &&
             message->wParam == injection::kAttachMagic &&
             message->lParam > 0) {
             static_cast<void>(operations.begin_attach(
                 message->hwnd,
                 static_cast<std::uint64_t>(message->lParam)));
         }
+        operations.observe_message(message->hwnd, message->message);
     }
     return operations.call_next(code, hookWparam, hookLparam);
 }

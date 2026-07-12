@@ -67,6 +67,26 @@ struct RuntimeSignalSubclassOperations final {
     std::function<Status(HWND)> install;
 };
 
+struct HookRuntimeWindowMessageOperations final {
+    std::function<DWORD(HWND, DWORD*)> get_window_thread_process_id;
+    std::function<HWND(HWND)> get_root;
+    std::function<Status(HWND, std::wstring*)> get_class_name;
+    std::function<bool(HWND)> is_window_visible;
+};
+
+[[nodiscard]] bool ShouldNotifyHookRuntimeWindowMessage(
+    HWND window,
+    UINT message,
+    HWND target,
+    DWORD expectedProcess,
+    DWORD expectedThread,
+    const HookRuntimeWindowMessageOperations& operations);
+[[nodiscard]] Status SignalHookRuntimeWindowMessage(
+    UINT message,
+    StatusPaneRefreshCoordinator* coordinator,
+    const std::function<Status()>& wakeWorker);
+void NotifyHookRuntimeWindowMessage(HWND window, UINT message) noexcept;
+
 [[nodiscard]] Status UpdateRuntimeSignalParent(
     RuntimeSignalSourceState* state,
     HWND parent,
@@ -114,7 +134,7 @@ private:
 class HookRuntimeStateMachine final {
 public:
     [[nodiscard]] Status BeginAttach() noexcept;
-    [[nodiscard]] Status MarkRunning(bool hookReleased) noexcept;
+    [[nodiscard]] Status MarkRunning(bool attachValidated) noexcept;
     [[nodiscard]] Status BeginStop() noexcept;
     [[nodiscard]] Status MarkStopped() noexcept;
     [[nodiscard]] RuntimeState state() const noexcept;

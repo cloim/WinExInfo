@@ -34,12 +34,14 @@ winexinfo::Status ParseHookCommand(
 
 WXI_TEST(hook_runtime_negative_code_never_dereferences_lparam, "hook_runtime.negative_code") {
     int beginCalls = 0;
+    int observeCalls = 0;
     int nextCalls = 0;
     const winexinfo::hook::HookEntryOperations operations{
         [&](HWND, std::uint64_t) {
             ++beginCalls;
             return Success();
         },
+        [&](HWND, UINT) { ++observeCalls; },
         [&](const int code, const WPARAM wparam, const LPARAM lparam) {
             ++nextCalls;
             WXI_REQUIRE_EQ(code, -1);
@@ -53,6 +55,7 @@ WXI_TEST(hook_runtime_negative_code_never_dereferences_lparam, "hook_runtime.neg
             -1, 0x1234, 1, 0xC123, operations),
         LRESULT{77});
     WXI_REQUIRE_EQ(beginCalls, 0);
+    WXI_REQUIRE_EQ(observeCalls, 0);
     WXI_REQUIRE_EQ(nextCalls, 1);
 }
 
@@ -64,6 +67,7 @@ WXI_TEST(hook_runtime_validates_inner_attach_message_and_forwards_originals, "ho
     message.wParam = 0x57495831;
     message.lParam = 9;
     int beginCalls = 0;
+    int observeCalls = 0;
     int nextCalls = 0;
     int nextCode = 0;
     WPARAM nextWparam = 0;
@@ -75,6 +79,7 @@ WXI_TEST(hook_runtime_validates_inner_attach_message_and_forwards_originals, "ho
             WXI_REQUIRE_EQ(attachId, std::uint64_t{9});
             return Success();
         },
+        [&](HWND, UINT) { ++observeCalls; },
         [&](const int code, const WPARAM wparam, const LPARAM lparam) {
             ++nextCalls;
             nextCode = code;
@@ -92,6 +97,7 @@ WXI_TEST(hook_runtime_validates_inner_attach_message_and_forwards_originals, "ho
             operations),
         LRESULT{88});
     WXI_REQUIRE_EQ(beginCalls, 1);
+    WXI_REQUIRE_EQ(observeCalls, 1);
     WXI_REQUIRE_EQ(nextCalls, 1);
     WXI_REQUIRE_EQ(nextCode, HC_ACTION);
     WXI_REQUIRE_EQ(nextWparam, WPARAM{0xDEADBEEF});
@@ -138,7 +144,7 @@ WXI_TEST(hook_runtime_state_machine_is_forward_only, "hook_runtime.state_machine
     WXI_REQUIRE(!state.MarkRunning(true).ok());
 }
 
-WXI_TEST(hook_runtime_requires_release_before_running, "hook_runtime.release_before_running") {
+WXI_TEST(hook_runtime_requires_validated_attach_before_running, "hook_runtime.validated_attach_before_running") {
     winexinfo::hook::HookRuntimeStateMachine state;
     WXI_REQUIRE(state.BeginAttach().ok());
     WXI_REQUIRE(!state.MarkRunning(false).ok());
@@ -216,6 +222,115 @@ WXI_TEST(hook_runtime_status_pane_uses_exact_subclass_identity, "hook_runtime.st
     WXI_REQUIRE_EQ(removals, installs);
     WXI_REQUIRE_EQ(destroys, 1);
     WXI_REQUIRE_EQ(pane.hwnd, nullptr);
+}
+
+WXI_TEST(hook_runtime_observes_before_call_next, "hook_runtime.observation_order") {
+    CWPSTRUCT message{};
+    message.hwnd = reinterpret_cast<HWND>(std::uintptr_t{0x701});
+    message.message = WM_WINDOWPOSCHANGED;
+    std::vector<std::string> calls;
+    const winexinfo::hook::HookEntryOperations operations{
+        [&](HWND, std::uint64_t) {
+            calls.emplace_back("attach");
+            return Success();
+        },
+        [&](const HWND hwnd, const UINT observed) {
+            WXI_REQUIRE_EQ(hwnd, message.hwnd);
+            WXI_REQUIRE_EQ(observed, message.message);
+            calls.emplace_back("observe");
+        },
+        [&](int, WPARAM, LPARAM) {
+            calls.emplace_back("next");
+            return LRESULT{91};
+        },
+    };
+    WXI_REQUIRE_EQ(
+        winexinfo::hook::ProcessHookCall(
+            HC_ACTION, 0, reinterpret_cast<LPARAM>(&message), 0xC123, operations),
+        LRESULT{91});
+    WXI_REQUIRE_EQ(calls, (std::vector<std::string>{"observe", "next"}));
+}
+
+WXI_TEST(hook_runtime_filters_exact_thread_hook_tab_view_messages, "hook_runtime.window_message_filter") {
+    const HWND target = reinterpret_cast<HWND>(std::uintptr_t{0x801});
+    const HWND tab = reinterpret_cast<HWND>(std::uintptr_t{0x802});
+    const HWND view = reinterpret_cast<HWND>(std::uintptr_t{0x803});
+    const DWORD pid = 51;
+    const DWORD tid = 52;
+    winexinfo::hook::HookRuntimeWindowMessageOperations operations{
+        [&](const HWND window, DWORD* const process) {
+            *process = pid;
+            return window == tab || window == view ? tid : DWORD{0};
+        },
+        [&](const HWND) { return target; },
+        [&](const HWND window, std::wstring* const name) {
+            *name = window == tab ? L"ShellTabWindowClass" : L"DUIViewWndClassName";
+            return Success();
+        },
+        [](HWND) { return true; },
+    };
+    for (const auto [window, message] : {
+             std::pair{tab, UINT{WM_SHOWWINDOW}},
+             std::pair{view, UINT{WM_WINDOWPOSCHANGED}}}) {
+        WXI_REQUIRE(winexinfo::hook::ShouldNotifyHookRuntimeWindowMessage(
+            window, message, target, pid, tid, operations));
+    }
+    WXI_REQUIRE(!winexinfo::hook::ShouldNotifyHookRuntimeWindowMessage(
+        tab, WM_SIZE, target, pid, tid, operations));
+
+    auto wrongRoot = operations;
+    wrongRoot.get_root = [](HWND) {
+        return reinterpret_cast<HWND>(std::uintptr_t{0x999});
+    };
+    WXI_REQUIRE(!winexinfo::hook::ShouldNotifyHookRuntimeWindowMessage(
+        tab, WM_SHOWWINDOW, target, pid, tid, wrongRoot));
+    auto wrongClass = operations;
+    wrongClass.get_class_name = [](HWND, std::wstring* name) {
+        *name = L"Other";
+        return Success();
+    };
+    WXI_REQUIRE(!winexinfo::hook::ShouldNotifyHookRuntimeWindowMessage(
+        tab, WM_SHOWWINDOW, target, pid, tid, wrongClass));
+    auto wrongThread = operations;
+    wrongThread.get_window_thread_process_id = [&](HWND, DWORD* process) {
+        *process = pid;
+        return tid + 1;
+    };
+    WXI_REQUIRE(!winexinfo::hook::ShouldNotifyHookRuntimeWindowMessage(
+        tab, WM_SHOWWINDOW, target, pid, tid, wrongThread));
+    auto wrongProcess = operations;
+    wrongProcess.get_window_thread_process_id = [&](HWND, DWORD* process) {
+        *process = pid + 1;
+        return tid;
+    };
+    WXI_REQUIRE(!winexinfo::hook::ShouldNotifyHookRuntimeWindowMessage(
+        tab, WM_SHOWWINDOW, target, pid, tid, wrongProcess));
+    auto oldHidden = operations;
+    oldHidden.is_window_visible = [](HWND) { return false; };
+    WXI_REQUIRE(!winexinfo::hook::ShouldNotifyHookRuntimeWindowMessage(
+        tab, WM_SHOWWINDOW, target, pid, tid, oldHidden));
+}
+
+WXI_TEST(hook_runtime_window_message_signal_coalesces_and_rejects_after_stop, "hook_runtime.window_message_signal") {
+    const HWND pane = reinterpret_cast<HWND>(std::uintptr_t{0x901});
+    winexinfo::hook::StatusPaneRefreshCoordinator coordinator{pane};
+    int wakes = 0;
+    const auto wake = [&] {
+        ++wakes;
+        return Success();
+    };
+    WXI_REQUIRE(winexinfo::hook::SignalHookRuntimeWindowMessage(
+                    WM_SHOWWINDOW, &coordinator, wake)
+                    .ok());
+    WXI_REQUIRE(winexinfo::hook::SignalHookRuntimeWindowMessage(
+                    WM_WINDOWPOSCHANGED, &coordinator, wake)
+                    .ok());
+    WXI_REQUIRE_EQ(wakes, 1);
+    coordinator.Stop();
+    WXI_REQUIRE(!winexinfo::hook::SignalHookRuntimeWindowMessage(
+                     WM_SHOWWINDOW, &coordinator, wake)
+                     .ok());
+    WXI_REQUIRE_EQ(wakes, 1);
 }
 
 WXI_TEST(hook_runtime_rollback_retains_module_when_pane_cleanup_fails, "hook_runtime.rollback_retention") {

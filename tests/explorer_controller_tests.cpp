@@ -23,6 +23,7 @@ struct Recorder final {
     HostExitCode attach_result = HostExitCode::Pass;
     HostExitCode pane_result = HostExitCode::Pass;
     HostExitCode detach_result = HostExitCode::Pass;
+    HostExitCode hook_release_result = HostExitCode::Pass;
     bool still_matches = true;
     DWORD pane_owner = 42;
     bool pane_absent = true;
@@ -71,6 +72,10 @@ ExplorerControllerOperations Operations(Recorder* const recorder) {
             recorder->waited_ms = duration;
         },
         [recorder](const ExplorerControllerTarget&) {
+            recorder->calls.push_back("release_hook");
+            return recorder->hook_release_result;
+        },
+        [recorder](const ExplorerControllerTarget&) {
             recorder->calls.push_back("detach");
             return recorder->detach_result;
         },
@@ -107,7 +112,7 @@ WXI_TEST(explorer_controller_accepts_one_exact_top_level_target,
     WXI_REQUIRE_EQ(recorder.waited_ms, 7000U);
     WXI_REQUIRE_EQ(recorder.calls, (std::vector<std::string>{
         "inspect", "attach_setup", "final_revalidate", "accepted", "hook_install", "pane", "wait",
-        "detach", "pane_absent", "module_absent", "release"}));
+        "release_hook", "detach", "pane_absent", "module_absent", "release"}));
 }
 
 WXI_TEST(explorer_controller_rejects_wrong_or_non_explorer_hwnd,
@@ -158,7 +163,7 @@ WXI_TEST(explorer_controller_rejects_pane_owner_pid_mismatch,
     recorder.pane_owner = 43;
     WXI_REQUIRE_EQ(Run(&recorder), HostExitCode::ContractFailure);
     WXI_REQUIRE_EQ(recorder.calls, (std::vector<std::string>{
-        "inspect", "attach_setup", "final_revalidate", "accepted", "hook_install", "pane", "detach",
+        "inspect", "attach_setup", "final_revalidate", "accepted", "hook_install", "pane", "release_hook", "detach",
         "pane_absent", "module_absent", "release"}));
 }
 
@@ -168,7 +173,7 @@ WXI_TEST(explorer_controller_reports_layout_failure,
     recorder.pane_result = HostExitCode::ContractFailure;
     WXI_REQUIRE_EQ(Run(&recorder), HostExitCode::ContractFailure);
     WXI_REQUIRE_EQ(recorder.calls, (std::vector<std::string>{
-        "inspect", "attach_setup", "final_revalidate", "accepted", "hook_install", "pane", "detach",
+        "inspect", "attach_setup", "final_revalidate", "accepted", "hook_install", "pane", "release_hook", "detach",
         "pane_absent", "module_absent", "release"}));
 }
 
@@ -185,8 +190,19 @@ WXI_TEST(explorer_controller_waits_duration_then_detaches,
     WXI_REQUIRE_EQ(Run(&recorder), HostExitCode::Pass);
     WXI_REQUIRE_EQ(recorder.waited_ms, 7000U);
     const auto& calls = recorder.calls;
-    WXI_REQUIRE(calls[6] == "wait" && calls[7] == "detach" &&
-                calls[8] == "pane_absent");
+    WXI_REQUIRE(calls[6] == "wait" && calls[7] == "release_hook" &&
+                calls[8] == "detach" && calls[9] == "pane_absent");
+}
+
+WXI_TEST(explorer_controller_release_failure_prevents_detach_request,
+         "explorer_controller.hook_release_order") {
+    Recorder recorder;
+    recorder.hook_release_result = HostExitCode::Win32ComFailure;
+    WXI_REQUIRE_EQ(Run(&recorder), HostExitCode::Win32ComFailure);
+    WXI_REQUIRE(std::find(recorder.calls.begin(), recorder.calls.end(), "release_hook") !=
+                recorder.calls.end());
+    WXI_REQUIRE(std::find(recorder.calls.begin(), recorder.calls.end(), "detach") ==
+                recorder.calls.end());
 }
 
 WXI_TEST(explorer_controller_pipe_cleanup_error_is_infrastructure,

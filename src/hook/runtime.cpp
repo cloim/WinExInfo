@@ -51,6 +51,7 @@ struct RuntimeContext final {
     StatusPaneRefreshCoordinator refresh;
     RuntimeSignalSourceState signal_source;
     bool top_signal_installed = false;
+    std::atomic<bool> accept_window_messages{false};
     HookRuntimeStateMachine state;
 };
 
@@ -81,7 +82,8 @@ LRESULT CALLBACK RuntimeParentSubclassProc(
     if (id == kRuntimeParentSubclassId && context != nullptr &&
         (window == context->target || window == context->signal_source.parent) &&
         (message == WM_SIZE || message == WM_DPICHANGED ||
-         message == WM_THEMECHANGED || message == WM_SHOWWINDOW)) {
+         message == WM_THEMECHANGED || message == WM_SHOWWINDOW ||
+         message == WM_WINDOWPOSCHANGED)) {
         static_cast<void>(context->refresh.Signal(
             message, [context] { return WakeRefreshWorker(context); }));
     }
@@ -179,9 +181,7 @@ DWORD WINAPI RuntimeWorker(void* const parameter) {
     if (status.ok()) {
         status = WriteAttachResult(pipe.get(), *context, 0, {});
     }
-    if (!status.ok() ||
-        WaitForSingleObject(context->hook_released.get(), 5000) != WAIT_OBJECT_0 ||
-        !context->state.MarkRunning(true).ok()) {
+    if (!status.ok() || !context->state.MarkRunning(true).ok()) {
         context.release();
         return 1;
     }
@@ -204,6 +204,7 @@ DWORD WINAPI RuntimeWorker(void* const parameter) {
         return 1;
     }
     g_callback_gate.RejectNewWork();
+    context->accept_window_messages.store(false, std::memory_order_release);
     if (!detachRequested) {
         pipe.reset();
     }
@@ -381,7 +382,8 @@ Status StatusPaneRefreshCoordinator::Signal(
     const UINT message,
     const std::function<Status()>& wakeWorker) {
     if ((message != WM_SIZE && message != WM_DPICHANGED &&
-         message != WM_THEMECHANGED && message != WM_SHOWWINDOW) || !wakeWorker) {
+         message != WM_THEMECHANGED && message != WM_SHOWWINDOW &&
+         message != WM_WINDOWPOSCHANGED) || !wakeWorker) {
         return PlacementFailure(ERROR_INVALID_PARAMETER);
     }
     {
@@ -561,6 +563,90 @@ Status UpdateRuntimeSignalParent(
     return Success();
 }
 
+bool ShouldNotifyHookRuntimeWindowMessage(
+    const HWND window,
+    const UINT message,
+    const HWND target,
+    const DWORD expectedProcess,
+    const DWORD expectedThread,
+    const HookRuntimeWindowMessageOperations& operations) {
+    if (window == nullptr || target == nullptr || expectedProcess == 0 ||
+        expectedThread == 0 ||
+        (message != WM_SHOWWINDOW && message != WM_WINDOWPOSCHANGED) ||
+        !operations.get_window_thread_process_id || !operations.get_root ||
+        !operations.get_class_name || !operations.is_window_visible) {
+        return false;
+    }
+    DWORD process = 0;
+    if (operations.get_window_thread_process_id(window, &process) != expectedThread ||
+        process != expectedProcess || operations.get_root(window) != target ||
+        !operations.is_window_visible(window)) {
+        return false;
+    }
+    std::wstring className;
+    if (!operations.get_class_name(window, &className).ok()) {
+        return false;
+    }
+    return className == L"ShellTabWindowClass" ||
+        className == kStatusPaneParentClassName;
+}
+
+Status SignalHookRuntimeWindowMessage(
+    const UINT message,
+    StatusPaneRefreshCoordinator* const coordinator,
+    const std::function<Status()>& wakeWorker) {
+    if (coordinator == nullptr ||
+        (message != WM_SHOWWINDOW && message != WM_WINDOWPOSCHANGED)) {
+        return PlacementFailure(ERROR_INVALID_PARAMETER);
+    }
+    return coordinator->Signal(message, wakeWorker);
+}
+
+void NotifyHookRuntimeWindowMessage(
+    const HWND window,
+    const UINT message) noexcept {
+    try {
+        RuntimeContext* const context = g_runtime.load(std::memory_order_acquire);
+        if (context == nullptr ||
+            !context->accept_window_messages.load(std::memory_order_acquire)) {
+            return;
+        }
+        const HookRuntimeWindowMessageOperations operations{
+            &GetWindowThreadProcessId,
+            [](const HWND candidate) { return GetAncestor(candidate, GA_ROOT); },
+            [](const HWND candidate, std::wstring* const output) {
+                if (output == nullptr) {
+                    return PlacementFailure(ERROR_INVALID_PARAMETER);
+                }
+                wchar_t buffer[256]{};
+                const int length = GetClassNameW(candidate, buffer, 256);
+                if (length <= 0) {
+                    return PlacementFailure(GetLastError());
+                }
+                output->assign(buffer, static_cast<std::size_t>(length));
+                return Success();
+            },
+            [](const HWND candidate) {
+                return IsWindowVisible(candidate) != FALSE;
+            },
+        };
+        if (ShouldNotifyHookRuntimeWindowMessage(
+                window,
+                message,
+                context->target,
+                context->pid,
+                context->tid,
+                operations)) {
+            static_cast<void>(SignalHookRuntimeWindowMessage(
+                message,
+                &context->refresh,
+                [context] { return WakeRefreshWorker(context); }));
+        }
+    } catch (...) {
+        // Hook callbacks must remain no-throw and continue to CallNextHookEx.
+    }
+}
+
 std::size_t StatusPaneRefreshCoordinator::pending_results() const noexcept {
     const std::scoped_lock lock{mutex_};
     return result_ ? 1u : 0u;
@@ -642,8 +728,8 @@ Status HookRuntimeStateMachine::BeginAttach() noexcept {
     return Success();
 }
 
-Status HookRuntimeStateMachine::MarkRunning(const bool hookReleased) noexcept {
-    if (state_ != RuntimeState::Starting || !hookReleased) {
+Status HookRuntimeStateMachine::MarkRunning(const bool attachValidated) noexcept {
+    if (state_ != RuntimeState::Starting || !attachValidated) {
         return ContractFailure();
     }
     state_ = RuntimeState::Running;
@@ -786,6 +872,7 @@ Status BeginHookRuntimeAttach(
                 HRESULT_FROM_WIN32(error), error};
     }
     CloseHandle(worker);
+    context->accept_window_messages.store(true, std::memory_order_release);
     context.release();
     return Success();
 }

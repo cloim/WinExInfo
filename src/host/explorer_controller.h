@@ -49,6 +49,7 @@ struct ExplorerControllerOperations final {
     std::function<HostExitCode(const ExplorerControllerTarget&, DWORD*)>
         query_pane_owner;
     std::function<void(std::uint32_t)> wait_duration;
+    std::function<HostExitCode(const ExplorerControllerTarget&)> release_hook;
     std::function<HostExitCode(const ExplorerControllerTarget&)> detach;
     std::function<HostExitCode(const ExplorerControllerTarget&, bool*)> pane_absent;
     std::function<HostExitCode(DWORD, bool*)> exact_module_absent;

@@ -154,12 +154,21 @@ Status ThreadHookInjector::Attach(
         output->original_status = primary;
     }
 
+    if (primary.ok()) {
+        retained_targets_.emplace(
+            target.explorer_pid,
+            RetainedTarget{hook, releaseEvent.handle, false});
+        releaseEvent.handle = nullptr;
+        output->unload_authorized = true;
+        return primary;
+    }
+
     bool unhooked = false;
     const Status released = operations_.unhook(hook, &unhooked);
     if (!ExactSuccess(released) || !unhooked) {
         retained_targets_.emplace(
             target.explorer_pid,
-            RetainedTarget{releaseEvent.handle});
+            RetainedTarget{hook, releaseEvent.handle, false});
         releaseEvent.handle = nullptr;
         return Failure(ErrorCode::HOOK_RELEASE_FAILED);
     }
@@ -170,7 +179,7 @@ Status ThreadHookInjector::Attach(
     if (!ExactSuccess(eventSet) || !signaled) {
         retained_targets_.emplace(
             target.explorer_pid,
-            RetainedTarget{releaseEvent.handle});
+            RetainedTarget{nullptr, releaseEvent.handle, false});
         releaseEvent.handle = nullptr;
         return Failure(ErrorCode::HOOK_RELEASE_FAILED);
     }
@@ -182,10 +191,37 @@ Status ThreadHookInjector::Attach(
     }
     retained_targets_.emplace(
         target.explorer_pid,
-        RetainedTarget{releaseEvent.handle});
+        RetainedTarget{nullptr, releaseEvent.handle, true});
     releaseEvent.handle = nullptr;
     output->unload_authorized = primary.ok();
     return primary;
+}
+
+Status ThreadHookInjector::ReleaseHookForDetach(
+    const DWORD explorerPid) noexcept {
+    const auto found = retained_targets_.find(explorerPid);
+    if (explorerPid == 0 || found == retained_targets_.end() ||
+        !operations_.unhook || !operations_.set_event) {
+        return {ErrorCode::INVALID_ARGUMENT, E_INVALIDARG, ERROR_INVALID_PARAMETER};
+    }
+    RetainedTarget& target = found->second;
+    if (target.hook != nullptr) {
+        bool unhooked = false;
+        const Status released = operations_.unhook(target.hook, &unhooked);
+        if (!ExactSuccess(released) || !unhooked) {
+            return Failure(ErrorCode::HOOK_RELEASE_FAILED);
+        }
+        target.hook = nullptr;
+    }
+    if (!target.release_event_signaled) {
+        bool signaled = false;
+        const Status eventSet = operations_.set_event(target.release_event, &signaled);
+        if (!ExactSuccess(eventSet) || !signaled) {
+            return Failure(ErrorCode::HOOK_RELEASE_FAILED);
+        }
+        target.release_event_signaled = true;
+    }
+    return Success();
 }
 
 Status ThreadHookInjector::ConfirmTargetGone(const DWORD explorerPid) noexcept {

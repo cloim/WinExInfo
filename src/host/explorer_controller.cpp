@@ -33,7 +33,7 @@ constexpr DWORD kBoundedWaitMs = 5000;
 bool ValidOperations(const ExplorerControllerOperations& operations) {
     return operations.inspect_target && operations.emit_target_accepted &&
         operations.attach && operations.query_pane_owner && operations.wait_duration &&
-        operations.detach && operations.pane_absent &&
+        operations.release_hook && operations.detach && operations.pane_absent &&
         operations.exact_module_absent && operations.release_retained_target;
 }
 
@@ -481,6 +481,16 @@ ExplorerControllerOperations ProductionOperations(
             }
         },
         [state](const ExplorerControllerTarget& target) {
+            if (!state->injector) {
+                return HostExitCode::Win32ComFailure;
+            }
+            const Status released =
+                state->injector->ReleaseHookForDetach(target.process_id);
+            return released.ok()
+                ? HostExitCode::Pass
+                : StatusExit(released);
+        },
+        [state](const ExplorerControllerTarget& target) {
             if (!state->pipe || !state->injector) {
                 return HostExitCode::Win32ComFailure;
             }
@@ -687,6 +697,11 @@ HostExitCode RunGateCPlacementWithOperations(
     }
     if (primary == HostExitCode::Pass) {
         operations.wait_duration(durationMs);
+    }
+    const HostExitCode hookReleased = operations.release_hook(inspected);
+    if (hookReleased != HostExitCode::Pass) {
+        RetainContextForHostLifetime(operations.retention_context);
+        return hookReleased;
     }
     const HostExitCode detached = operations.detach(inspected);
     bool paneAbsent = false;

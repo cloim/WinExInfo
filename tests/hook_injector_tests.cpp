@@ -134,11 +134,13 @@ winexinfo::injection::HookPlatformOperations Operations(FakeState* const state) 
         },
         [state](const HHOOK, bool* const output) {
             ++state->unhook_calls;
+            state->install_order.push_back("unhook");
             *output = state->unhook_succeeds;
             return Success();
         },
         [state](const HANDLE, bool* const output) {
             ++state->set_event_calls;
+            state->install_order.push_back("signal");
             *output = state->set_event_succeeds;
             return Success();
         },
@@ -206,11 +208,51 @@ WXI_TEST(hook_injector_uses_exact_event_hook_and_trigger, "hook_injector.exact_c
     WXI_REQUIRE_EQ(state.trigger_timeouts, std::vector<UINT>{1000});
     WXI_REQUIRE_EQ(state.waited_ids, std::vector<std::uint64_t>{1});
     WXI_REQUIRE_EQ(state.wait_timeouts, std::vector<DWORD>{5000});
-    WXI_REQUIRE_EQ(state.unhook_calls, 1);
-    WXI_REQUIRE_EQ(state.set_event_calls, 1);
-    WXI_REQUIRE(outcome.hook_released);
+    WXI_REQUIRE_EQ(state.unhook_calls, 0);
+    WXI_REQUIRE_EQ(state.set_event_calls, 0);
+    WXI_REQUIRE(!outcome.hook_released);
+    WXI_REQUIRE(!outcome.release_event_signaled);
     WXI_REQUIRE(outcome.unload_authorized);
     WXI_REQUIRE_EQ(injector.retained_target_count(), std::size_t{1});
+    WXI_REQUIRE(injector.ReleaseHookForDetach(100).ok());
+    WXI_REQUIRE_EQ(state.unhook_calls, 1);
+    WXI_REQUIRE_EQ(state.set_event_calls, 1);
+    WXI_REQUIRE(state.install_order.size() >= 2);
+    WXI_REQUIRE_EQ(state.install_order[state.install_order.size() - 2], "unhook");
+    WXI_REQUIRE_EQ(state.install_order.back(), "signal");
+}
+
+WXI_TEST(hook_injector_retains_active_hook_until_detach_release, "hook_injector.active_retention") {
+    FakeState state;
+    winexinfo::injection::ThreadHookInjector injector{Operations(&state)};
+    winexinfo::injection::HookAttachOutcome outcome{};
+    WXI_REQUIRE(injector.Attach(Target(), &outcome).ok());
+    WXI_REQUIRE_EQ(state.unhook_calls, 0);
+    WXI_REQUIRE_EQ(state.set_event_calls, 0);
+    WXI_REQUIRE_EQ(injector.retained_target_count(), std::size_t{1});
+    WXI_REQUIRE(injector.ReleaseHookForDetach(100).ok());
+    WXI_REQUIRE_EQ(state.unhook_calls, 1);
+    WXI_REQUIRE_EQ(state.set_event_calls, 1);
+}
+
+WXI_TEST(hook_injector_detach_release_failure_retains_hook_state, "hook_injector.detach_release_failure") {
+    FakeState unhookFailure;
+    winexinfo::injection::ThreadHookInjector first{Operations(&unhookFailure)};
+    winexinfo::injection::HookAttachOutcome outcome{};
+    WXI_REQUIRE(first.Attach(Target(), &outcome).ok());
+    unhookFailure.unhook_succeeds = false;
+    WXI_REQUIRE(!first.ReleaseHookForDetach(100).ok());
+    WXI_REQUIRE_EQ(unhookFailure.set_event_calls, 0);
+    WXI_REQUIRE_EQ(first.retained_target_count(), std::size_t{1});
+
+    FakeState signalFailure;
+    winexinfo::injection::ThreadHookInjector second{Operations(&signalFailure)};
+    WXI_REQUIRE(second.Attach(Target(), &outcome).ok());
+    signalFailure.set_event_succeeds = false;
+    WXI_REQUIRE(!second.ReleaseHookForDetach(100).ok());
+    WXI_REQUIRE_EQ(signalFailure.unhook_calls, 1);
+    WXI_REQUIRE_EQ(signalFailure.set_event_calls, 1);
+    WXI_REQUIRE_EQ(second.retained_target_count(), std::size_t{1});
 }
 
 WXI_TEST(hook_injector_sethook_failure_never_unhooks_or_signals, "hook_injector.sethook_failure") {
@@ -246,13 +288,14 @@ WXI_TEST(hook_injector_unhook_failure_blocks_signal_and_unload, "hook_injector.u
     state.unhook_succeeds = false;
     winexinfo::injection::ThreadHookInjector injector{Operations(&state)};
     winexinfo::injection::HookAttachOutcome outcome{};
+    WXI_REQUIRE(injector.Attach(Target(), &outcome).ok());
     RequireStatus(
-        injector.Attach(Target(), &outcome),
+        injector.ReleaseHookForDetach(100),
         winexinfo::ErrorCode::HOOK_RELEASE_FAILED);
     WXI_REQUIRE_EQ(state.unhook_calls, 1);
     WXI_REQUIRE_EQ(state.set_event_calls, 0);
     WXI_REQUIRE(!outcome.hook_released);
-    WXI_REQUIRE(!outcome.unload_authorized);
+    WXI_REQUIRE(outcome.unload_authorized);
     WXI_REQUIRE_EQ(injector.retained_target_count(), std::size_t{1});
 }
 

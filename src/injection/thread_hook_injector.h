@@ -45,12 +45,15 @@ public:
     [[nodiscard]] Status Attach(
         const HookTarget& target,
         HookAttachOutcome* output);
+    [[nodiscard]] Status ReleaseHookForDetach(DWORD explorerPid) noexcept;
     [[nodiscard]] Status ConfirmTargetGone(DWORD explorerPid) noexcept;
     [[nodiscard]] std::size_t retained_target_count() const noexcept;
 
 private:
     struct RetainedTarget final {
+        HHOOK hook;
         HANDLE release_event;
+        bool release_event_signaled;
     };
 
     HookPlatformOperations operations_;
