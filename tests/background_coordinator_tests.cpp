@@ -272,4 +272,54 @@ WXI_TEST(background_persistent_observer_generations,
     WXI_REQUIRE_EQ(reused.processes[0].windows[0].tabs[0].tab_generation, 2u);
 }
 
+WXI_TEST(background_production_empty_then_later_window,
+         "background_coordinator.production_empty_observation_allows_later_window") {
+    winexinfo::BackgroundObserverTracker tracker;
+    BackgroundSnapshot empty{};
+    const std::vector<winexinfo::ExplorerWindowRecord> none;
+    WXI_REQUIRE(winexinfo::ReconcileEmptyProductionBackgroundObservation(
+        1, none, &tracker, &empty).ok());
+    WXI_REQUIRE(empty.processes.empty());
+
+    const HWND top = reinterpret_cast<HWND>(0x3000);
+    const HWND tab = reinterpret_cast<HWND>(0x3100);
+    const std::vector windows{winexinfo::ExplorerWindowRecord{top, 51, 21}};
+    const std::vector metadata{
+        winexinfo::ObserverShellEntryMetadata{3, true, top, tab}};
+    const std::vector orders{
+        winexinfo::ObserverTopLevelTabOrder{top, {{tab, true}}}};
+    const std::vector<DWORD> validated{51};
+    BackgroundSnapshot later{};
+    WXI_REQUIRE(tracker.Reconcile(
+        2, windows, metadata, orders, validated, &later).ok());
+    WXI_REQUIRE(later.processes[0].validated);
+    WXI_REQUIRE_EQ(later.processes[0].windows[0].top_level_generation, 1u);
+}
+
+WXI_TEST(background_production_unsupported_then_supported,
+         "background_coordinator.production_all_unsupported_allows_later_supported") {
+    winexinfo::BackgroundObserverTracker tracker;
+    const HWND top = reinterpret_cast<HWND>(0x4000);
+    const HWND tab = reinterpret_cast<HWND>(0x4100);
+    const std::vector enumerated{
+        winexinfo::ExplorerWindowRecord{top, 61, 31}};
+    BackgroundSnapshot unsupported{};
+    WXI_REQUIRE(winexinfo::ReconcileEmptyProductionBackgroundObservation(
+        1, enumerated, &tracker, &unsupported).ok());
+    WXI_REQUIRE_EQ(unsupported.processes.size(), 1u);
+    WXI_REQUIRE(!unsupported.processes[0].validated);
+    WXI_REQUIRE(unsupported.processes[0].windows.empty());
+
+    const std::vector metadata{
+        winexinfo::ObserverShellEntryMetadata{4, true, top, tab}};
+    const std::vector orders{
+        winexinfo::ObserverTopLevelTabOrder{top, {{tab, true}}}};
+    const std::vector<DWORD> validated{61};
+    BackgroundSnapshot supported{};
+    WXI_REQUIRE(tracker.Reconcile(
+        2, enumerated, metadata, orders, validated, &supported).ok());
+    WXI_REQUIRE(supported.processes[0].validated);
+    WXI_REQUIRE_EQ(supported.processes[0].windows.size(), 1u);
+}
+
 }  // namespace

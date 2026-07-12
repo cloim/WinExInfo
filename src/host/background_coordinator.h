@@ -68,6 +68,12 @@ private:
     ObserverTabGenerationState generations_;
 };
 
+[[nodiscard]] Status ReconcileEmptyProductionBackgroundObservation(
+    std::uint64_t sequence,
+    std::span<const ExplorerWindowRecord> enumeratedWindows,
+    BackgroundObserverTracker* tracker,
+    BackgroundSnapshot* output);
+
 [[nodiscard]] HostExitCode RunBackgroundCoordinator(
     const BackgroundOperations& operations);
 

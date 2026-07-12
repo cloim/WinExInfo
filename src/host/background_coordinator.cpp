@@ -267,22 +267,8 @@ public:
                 topLevels.push_back(window.hwnd);
             }
             if (topLevels.empty()) {
-                const std::vector<ObserverShellEntryMetadata> metadata;
-                const std::vector<DWORD> validated;
-                status = tracker_.Reconcile(
-                    sequence, windows, metadata, orders, validated, output);
-                if (!status.ok()) return status;
-                for (const ExplorerWindowRecord& window : enumerated) {
-                    if (std::find_if(
-                            output->processes.begin(), output->processes.end(),
-                            [&](const ExplorerProcessSnapshot& process) {
-                                return process.process_id == window.process_id;
-                            }) == output->processes.end()) {
-                        output->processes.push_back(
-                            {window.process_id, false, {}});
-                    }
-                }
-                return {ErrorCode::OK, S_OK, ERROR_SUCCESS};
+                return ReconcileEmptyProductionBackgroundObservation(
+                    sequence, enumerated, &tracker_, output);
             }
             ShellBrowserSetCapture shellCapture{};
             status = CaptureShellBrowserSet(
@@ -460,6 +446,42 @@ Status BackgroundObserverTracker::Reconcile(
         tabs_ = reconciliation.current;
         generations_ = reconciliation.generations;
         *output = std::move(candidate);
+        return {ErrorCode::OK, S_OK, ERROR_SUCCESS};
+    } catch (const std::bad_alloc&) {
+        return {ErrorCode::PIPE_DISCONNECTED, E_OUTOFMEMORY, ERROR_SUCCESS};
+    }
+}
+
+Status ReconcileEmptyProductionBackgroundObservation(
+    const std::uint64_t sequence,
+    const std::span<const ExplorerWindowRecord> enumeratedWindows,
+    BackgroundObserverTracker* const tracker,
+    BackgroundSnapshot* const output) {
+    if (tracker == nullptr || output == nullptr) {
+        return {ErrorCode::INVALID_ARGUMENT, E_INVALIDARG,
+                ERROR_INVALID_PARAMETER};
+    }
+    const std::vector<ExplorerWindowRecord> windows;
+    const std::vector<ObserverShellEntryMetadata> metadata;
+    const std::vector<ObserverTopLevelTabOrder> orders;
+    const std::vector<DWORD> validated;
+    Status status = tracker->Reconcile(
+        sequence, windows, metadata, orders, validated, output);
+    if (!status.ok()) return status;
+    try {
+        for (const ExplorerWindowRecord& window : enumeratedWindows) {
+            if (window.process_id == 0) {
+                return {ErrorCode::ACTIVE_VIEW_CONTRACT_MISMATCH,
+                        S_FALSE, ERROR_INVALID_DATA};
+            }
+            if (std::find_if(
+                    output->processes.begin(), output->processes.end(),
+                    [&](const ExplorerProcessSnapshot& process) {
+                        return process.process_id == window.process_id;
+                    }) == output->processes.end()) {
+                output->processes.push_back({window.process_id, false, {}});
+            }
+        }
         return {ErrorCode::OK, S_OK, ERROR_SUCCESS};
     } catch (const std::bad_alloc&) {
         return {ErrorCode::PIPE_DISCONNECTED, E_OUTOFMEMORY, ERROR_SUCCESS};
