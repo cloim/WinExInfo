@@ -16,7 +16,7 @@ LRESULT ProcessHookCall(
         !operations.call_next) {
         return 0;
     }
-    if (code >= 0 && hookLparam != 0) {
+    if (code == HC_ACTION && hookLparam != 0) {
         const auto* message = reinterpret_cast<const CWPSTRUCT*>(hookLparam);
         if (attachMessage != 0 && message->hwnd != nullptr &&
             message->message == attachMessage &&

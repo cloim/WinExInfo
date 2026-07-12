@@ -51,7 +51,7 @@ struct RuntimeContext final {
     StatusPaneRefreshCoordinator refresh;
     RuntimeSignalSourceState signal_source;
     bool top_signal_installed = false;
-    std::atomic<bool> accept_window_messages{false};
+    HookRuntimeRefreshIngress ingress;
     HookRuntimeStateMachine state;
 };
 
@@ -84,8 +84,7 @@ LRESULT CALLBACK RuntimeParentSubclassProc(
         (message == WM_SIZE || message == WM_DPICHANGED ||
          message == WM_THEMECHANGED || message == WM_SHOWWINDOW ||
          message == WM_WINDOWPOSCHANGED)) {
-        static_cast<void>(context->refresh.Signal(
-            message, [context] { return WakeRefreshWorker(context); }));
+        static_cast<void>(context->ingress.SignalEvent(context->refresh_event.get()));
     }
     return DefSubclassProc(window, message, wparam, lparam);
 }
@@ -121,6 +120,19 @@ DWORD WINAPI RefreshWorker(void* const parameter) {
     auto* const context = static_cast<RuntimeContext*>(parameter);
     const HANDLE waits[]{context->refresh_stop.get(), context->refresh_event.get()};
     while (WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0 + 1) {
+        bool captureRequested = true;
+        if (context->ingress.Consume()) {
+            captureRequested = false;
+            static_cast<void>(context->refresh.Signal(
+                WM_WINDOWPOSCHANGED,
+                [&captureRequested] {
+                    captureRequested = true;
+                    return Success();
+                }));
+        }
+        if (!captureRequested) {
+            continue;
+        }
         ExplorerLayoutMetrics metrics{};
         HWND parent = nullptr;
         RECT rect{};
@@ -204,7 +216,7 @@ DWORD WINAPI RuntimeWorker(void* const parameter) {
         return 1;
     }
     g_callback_gate.RejectNewWork();
-    context->accept_window_messages.store(false, std::memory_order_release);
+    context->ingress.Disable();
     if (!detachRequested) {
         pipe.reset();
     }
@@ -376,6 +388,59 @@ void StatusPaneRefreshCoordinator::Initialize(const HWND pane) noexcept {
     const std::scoped_lock lock{mutex_};
     pane_ = pane;
     stopped_ = false;
+}
+
+void HookRuntimeRefreshIngress::Enable() noexcept {
+    pending_.store(false, std::memory_order_release);
+    enabled_.store(true, std::memory_order_release);
+}
+
+void HookRuntimeRefreshIngress::Disable() noexcept {
+    enabled_.store(false, std::memory_order_release);
+    pending_.store(false, std::memory_order_release);
+}
+
+Status HookRuntimeRefreshIngress::Signal(
+    const std::function<Status()>& setEvent) noexcept {
+    if (!setEvent || !enabled_.load(std::memory_order_acquire)) {
+        return PlacementFailure(ERROR_INVALID_STATE);
+    }
+    bool expected = false;
+    if (!pending_.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) {
+        return Success();
+    }
+    Status status{};
+    try {
+        status = setEvent();
+    } catch (...) {
+        status = PlacementFailure(ERROR_INVALID_FUNCTION);
+    }
+    if (!status.ok()) {
+        pending_.store(false, std::memory_order_release);
+    }
+    return status;
+}
+
+Status HookRuntimeRefreshIngress::SignalEvent(const HANDLE event) noexcept {
+    if (event == nullptr || !enabled_.load(std::memory_order_acquire)) {
+        return PlacementFailure(ERROR_INVALID_STATE);
+    }
+    bool expected = false;
+    if (!pending_.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) {
+        return Success();
+    }
+    if (SetEvent(event) == FALSE) {
+        const DWORD error = GetLastError();
+        pending_.store(false, std::memory_order_release);
+        return PlacementFailure(error);
+    }
+    return Success();
+}
+
+bool HookRuntimeRefreshIngress::Consume() noexcept {
+    return pending_.exchange(false, std::memory_order_acq_rel);
 }
 
 Status StatusPaneRefreshCoordinator::Signal(
@@ -591,57 +656,34 @@ bool ShouldNotifyHookRuntimeWindowMessage(
         className == kStatusPaneParentClassName;
 }
 
-Status SignalHookRuntimeWindowMessage(
-    const UINT message,
-    StatusPaneRefreshCoordinator* const coordinator,
-    const std::function<Status()>& wakeWorker) {
-    if (coordinator == nullptr ||
-        (message != WM_SHOWWINDOW && message != WM_WINDOWPOSCHANGED)) {
-        return PlacementFailure(ERROR_INVALID_PARAMETER);
-    }
-    return coordinator->Signal(message, wakeWorker);
-}
-
 void NotifyHookRuntimeWindowMessage(
     const HWND window,
     const UINT message) noexcept {
     try {
         RuntimeContext* const context = g_runtime.load(std::memory_order_acquire);
-        if (context == nullptr ||
-            !context->accept_window_messages.load(std::memory_order_acquire)) {
+        if (context == nullptr) {
             return;
         }
-        const HookRuntimeWindowMessageOperations operations{
-            &GetWindowThreadProcessId,
-            [](const HWND candidate) { return GetAncestor(candidate, GA_ROOT); },
-            [](const HWND candidate, std::wstring* const output) {
-                if (output == nullptr) {
-                    return PlacementFailure(ERROR_INVALID_PARAMETER);
-                }
-                wchar_t buffer[256]{};
-                const int length = GetClassNameW(candidate, buffer, 256);
-                if (length <= 0) {
-                    return PlacementFailure(GetLastError());
-                }
-                output->assign(buffer, static_cast<std::size_t>(length));
-                return Success();
-            },
-            [](const HWND candidate) {
-                return IsWindowVisible(candidate) != FALSE;
-            },
-        };
-        if (ShouldNotifyHookRuntimeWindowMessage(
-                window,
-                message,
-                context->target,
-                context->pid,
-                context->tid,
-                operations)) {
-            static_cast<void>(SignalHookRuntimeWindowMessage(
-                message,
-                &context->refresh,
-                [context] { return WakeRefreshWorker(context); }));
+        if (window == nullptr ||
+            (message != WM_SHOWWINDOW && message != WM_WINDOWPOSCHANGED)) {
+            return;
         }
+        DWORD process = 0;
+        if (GetWindowThreadProcessId(window, &process) != context->tid ||
+            process != context->pid || GetAncestor(window, GA_ROOT) != context->target ||
+            IsWindowVisible(window) == FALSE) {
+            return;
+        }
+        wchar_t className[64]{};
+        const int length = GetClassNameW(window, className, 64);
+        if (length <= 0 ||
+            (std::wstring_view{className, static_cast<std::size_t>(length)} !=
+                 L"ShellTabWindowClass" &&
+             std::wstring_view{className, static_cast<std::size_t>(length)} !=
+                 kStatusPaneParentClassName)) {
+            return;
+        }
+        static_cast<void>(context->ingress.SignalEvent(context->refresh_event.get()));
     } catch (...) {
         // Hook callbacks must remain no-throw and continue to CallNextHookEx.
     }
@@ -872,7 +914,7 @@ Status BeginHookRuntimeAttach(
                 HRESULT_FROM_WIN32(error), error};
     }
     CloseHandle(worker);
-    context->accept_window_messages.store(true, std::memory_order_release);
+    context->ingress.Enable();
     context.release();
     return Success();
 }

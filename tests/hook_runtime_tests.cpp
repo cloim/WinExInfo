@@ -32,7 +32,7 @@ winexinfo::Status ParseHookCommand(
 
 }  // namespace
 
-WXI_TEST(hook_runtime_negative_code_never_dereferences_lparam, "hook_runtime.negative_code") {
+WXI_TEST(hook_runtime_non_action_codes_never_dereference_lparam, "hook_runtime.non_action_code") {
     int beginCalls = 0;
     int observeCalls = 0;
     int nextCalls = 0;
@@ -44,7 +44,7 @@ WXI_TEST(hook_runtime_negative_code_never_dereferences_lparam, "hook_runtime.neg
         [&](HWND, UINT) { ++observeCalls; },
         [&](const int code, const WPARAM wparam, const LPARAM lparam) {
             ++nextCalls;
-            WXI_REQUIRE_EQ(code, -1);
+            WXI_REQUIRE(code == -1 || code == 1);
             WXI_REQUIRE_EQ(wparam, WPARAM{0x1234});
             WXI_REQUIRE_EQ(lparam, LPARAM{1});
             return LRESULT{77};
@@ -57,6 +57,13 @@ WXI_TEST(hook_runtime_negative_code_never_dereferences_lparam, "hook_runtime.neg
     WXI_REQUIRE_EQ(beginCalls, 0);
     WXI_REQUIRE_EQ(observeCalls, 0);
     WXI_REQUIRE_EQ(nextCalls, 1);
+    WXI_REQUIRE_EQ(
+        winexinfo::hook::ProcessHookCall(
+            1, 0x1234, 1, 0xC123, operations),
+        LRESULT{77});
+    WXI_REQUIRE_EQ(beginCalls, 0);
+    WXI_REQUIRE_EQ(observeCalls, 0);
+    WXI_REQUIRE_EQ(nextCalls, 2);
 }
 
 WXI_TEST(hook_runtime_validates_inner_attach_message_and_forwards_originals, "hook_runtime.callback_contract") {
@@ -311,26 +318,65 @@ WXI_TEST(hook_runtime_filters_exact_thread_hook_tab_view_messages, "hook_runtime
         tab, WM_SHOWWINDOW, target, pid, tid, oldHidden));
 }
 
-WXI_TEST(hook_runtime_window_message_signal_coalesces_and_rejects_after_stop, "hook_runtime.window_message_signal") {
-    const HWND pane = reinterpret_cast<HWND>(std::uintptr_t{0x901});
-    winexinfo::hook::StatusPaneRefreshCoordinator coordinator{pane};
-    int wakes = 0;
-    const auto wake = [&] {
-        ++wakes;
+WXI_TEST(hook_runtime_atomic_ingress_coalesces_without_losing_race, "hook_runtime.atomic_ingress_race") {
+    winexinfo::hook::HookRuntimeRefreshIngress ingress;
+    ingress.Enable();
+    int sets = 0;
+    const auto setEvent = [&] {
+        ++sets;
         return Success();
     };
-    WXI_REQUIRE(winexinfo::hook::SignalHookRuntimeWindowMessage(
-                    WM_SHOWWINDOW, &coordinator, wake)
-                    .ok());
-    WXI_REQUIRE(winexinfo::hook::SignalHookRuntimeWindowMessage(
-                    WM_WINDOWPOSCHANGED, &coordinator, wake)
-                    .ok());
-    WXI_REQUIRE_EQ(wakes, 1);
-    coordinator.Stop();
-    WXI_REQUIRE(!winexinfo::hook::SignalHookRuntimeWindowMessage(
-                     WM_SHOWWINDOW, &coordinator, wake)
-                     .ok());
-    WXI_REQUIRE_EQ(wakes, 1);
+    for (int index = 0; index < 100; ++index) {
+        WXI_REQUIRE(ingress.Signal(setEvent).ok());
+    }
+    WXI_REQUIRE_EQ(sets, 1);
+    WXI_REQUIRE(ingress.Consume());
+
+    WXI_REQUIRE(ingress.Signal(setEvent).ok());
+    WXI_REQUIRE_EQ(sets, 2);
+    WXI_REQUIRE(ingress.Consume());
+    WXI_REQUIRE(!ingress.Consume());
+
+    ingress.Disable();
+    WXI_REQUIRE(!ingress.Signal(setEvent).ok());
+    WXI_REQUIRE_EQ(sets, 2);
+}
+
+WXI_TEST(hook_runtime_atomic_ingress_setevent_failure_rearms, "hook_runtime.atomic_ingress_failure") {
+    winexinfo::hook::HookRuntimeRefreshIngress ingress;
+    ingress.Enable();
+    int attempts = 0;
+    WXI_REQUIRE(!ingress.Signal([&] {
+        ++attempts;
+        return winexinfo::Status{winexinfo::ErrorCode::WINDOW_ATTACH_FAILED,
+                                 E_FAIL, ERROR_INVALID_HANDLE};
+    }).ok());
+    WXI_REQUIRE(!ingress.Consume());
+    WXI_REQUIRE(ingress.Signal([&] {
+        ++attempts;
+        return Success();
+    }).ok());
+    WXI_REQUIRE_EQ(attempts, 2);
+    WXI_REQUIRE(ingress.Consume());
+}
+
+WXI_TEST(hook_runtime_notify_path_is_atomic_only, "hook_runtime.atomic_ingress_structure") {
+    const std::filesystem::path source =
+        std::filesystem::path{__FILE__}.parent_path().parent_path() /
+        "src" / "hook" / "runtime.cpp";
+    std::ifstream stream{source, std::ios::binary};
+    WXI_REQUIRE(stream.good());
+    const std::string text{
+        std::istreambuf_iterator<char>{stream},
+        std::istreambuf_iterator<char>{}};
+    const std::size_t begin = text.find("void NotifyHookRuntimeWindowMessage(");
+    const std::size_t end = text.find("bool HookCallbackGate::Enter", begin);
+    WXI_REQUIRE(begin != std::string::npos && end != std::string::npos);
+    const std::string body = text.substr(begin, end - begin);
+    WXI_REQUIRE(body.find("ingress.Signal") != std::string::npos);
+    WXI_REQUIRE(body.find("refresh.Signal") == std::string::npos);
+    WXI_REQUIRE(body.find("CaptureExplorerLayout") == std::string::npos);
+    WXI_REQUIRE(body.find("WaitFor") == std::string::npos);
 }
 
 WXI_TEST(hook_runtime_rollback_retains_module_when_pane_cleanup_fails, "hook_runtime.rollback_retention") {

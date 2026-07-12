@@ -29,6 +29,19 @@ struct StatusPanePlacementResult final {
     bool visible = false;
 };
 
+class HookRuntimeRefreshIngress final {
+public:
+    void Enable() noexcept;
+    void Disable() noexcept;
+    [[nodiscard]] Status Signal(const std::function<Status()>& setEvent) noexcept;
+    [[nodiscard]] Status SignalEvent(HANDLE event) noexcept;
+    [[nodiscard]] bool Consume() noexcept;
+
+private:
+    std::atomic<bool> enabled_{false};
+    std::atomic<bool> pending_{false};
+};
+
 class StatusPaneRefreshCoordinator final {
 public:
     explicit StatusPaneRefreshCoordinator(HWND pane = nullptr) noexcept;
@@ -81,10 +94,6 @@ struct HookRuntimeWindowMessageOperations final {
     DWORD expectedProcess,
     DWORD expectedThread,
     const HookRuntimeWindowMessageOperations& operations);
-[[nodiscard]] Status SignalHookRuntimeWindowMessage(
-    UINT message,
-    StatusPaneRefreshCoordinator* coordinator,
-    const std::function<Status()>& wakeWorker);
 void NotifyHookRuntimeWindowMessage(HWND window, UINT message) noexcept;
 
 [[nodiscard]] Status UpdateRuntimeSignalParent(
