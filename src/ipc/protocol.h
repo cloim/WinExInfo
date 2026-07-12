@@ -44,10 +44,21 @@ struct AttachResult final {
     bool operator==(const AttachResult&) const = default;
 };
 
+struct DetachCleanupProof final {
+    std::uint32_t pane_count = 0;
+    std::uint32_t tab_subclass_count = 0;
+    std::uint32_t parent_subclass_count = 0;
+    std::uint32_t refresh_worker_count = 0;
+    std::uint32_t callback_count = 0;
+
+    bool operator==(const DetachCleanupProof&) const = default;
+};
+
 struct DetachResult final {
     std::uint32_t explorer_pid = 0;
     std::uint32_t result = 0;
     std::string error_code;
+    DetachCleanupProof cleanup;
 
     bool operator==(const DetachResult&) const = default;
 };

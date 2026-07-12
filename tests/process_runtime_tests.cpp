@@ -28,6 +28,7 @@ struct Fixture {
     int creates = 0;
     int applies = 0;
     bool activate_fail = false;
+    winexinfo::ipc::DetachCleanupProof cleanup_proof{};
     std::vector<HWND> cleaned;
     std::vector<std::string> lifecycle_events;
 
@@ -63,6 +64,12 @@ struct Fixture {
         };
         runtime.operations.cleanup_window_from_worker =
             runtime.operations.cleanup_window_on_ui;
+        runtime.operations.capture_cleanup_proof =
+            [&](const winexinfo::hook::WindowRuntime&,
+                winexinfo::ipc::DetachCleanupProof* output) {
+                *output = cleanup_proof;
+                return Ok();
+            };
         runtime.operations.shelter_window_on_destroy = [&](winexinfo::hook::WindowRuntime& window) {
             lifecycle_events.push_back("shelter:" + std::to_string(
                 reinterpret_cast<std::uintptr_t>(window.key.top_level)));
@@ -83,6 +90,22 @@ struct Fixture {
         };
     }
 };
+}
+
+WXI_TEST(process_runtime_cleanup_proof_aggregates_authoritative_window_state,
+         "process_runtime.cleanup_proof") {
+    Fixture f;
+    f.cleanup_proof = {1, 2, 3, 4, 5};
+    winexinfo::ipc::TabSetResult result{};
+    WXI_REQUIRE(winexinfo::hook::DispatchProcessTabSetUpdate(
+                    f.runtime, U(0x200, 1, 11), &result).ok());
+    WXI_REQUIRE(winexinfo::hook::DispatchProcessTabSetUpdate(
+                    f.runtime, U(0x300, 1, 12), &result).ok());
+    WXI_REQUIRE(winexinfo::hook::RemoveAllProcessWindows(f.runtime).ok());
+    winexinfo::ipc::DetachCleanupProof proof{};
+    WXI_REQUIRE(winexinfo::hook::CaptureProcessDetachCleanupProof(
+                    f.runtime, &proof).ok());
+    WXI_REQUIRE_EQ(proof, (winexinfo::ipc::DetachCleanupProof{2, 4, 6, 8, 10}));
 }
 
 WXI_TEST(process_runtime_retired_slot_is_reserved_before_create,

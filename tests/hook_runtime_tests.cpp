@@ -401,6 +401,25 @@ WXI_TEST(hook_runtime_tab_cleanup_failure_withholds_cleanup_ack,
         body.find("!window->tab_subclasses->cleanup_safe()") != std::string::npos);
 }
 
+WXI_TEST(hook_runtime_detach_ack_uses_pre_reap_authoritative_cleanup_proof,
+         "hook_runtime.detach_cleanup_proof_order") {
+    const std::filesystem::path source =
+        std::filesystem::path{__FILE__}.parent_path().parent_path() /
+        "src" / "hook" / "runtime.cpp";
+    std::ifstream stream{source, std::ios::binary};
+    WXI_REQUIRE(stream.good());
+    const std::string text{
+        std::istreambuf_iterator<char>{stream},
+        std::istreambuf_iterator<char>{}};
+    const std::size_t begin = text.find("status = RemoveAllProcessWindows");
+    const std::size_t proof = text.find("CaptureProcessDetachCleanupProof", begin);
+    const std::size_t reap = text.find("ReapRemovedProcessWindows", begin);
+    const std::size_t ack = text.find("ipc::EncodeDetachResult", begin);
+    WXI_REQUIRE(begin != std::string::npos && proof != std::string::npos &&
+                reap != std::string::npos && ack != std::string::npos);
+    WXI_REQUIRE(begin < proof && proof < reap && reap < ack);
+}
+
 WXI_TEST(hook_runtime_rollback_retains_module_when_pane_cleanup_fails, "hook_runtime.rollback_retention") {
     const HWND child = reinterpret_cast<HWND>(std::uintptr_t{0x610});
     for (const auto path : {

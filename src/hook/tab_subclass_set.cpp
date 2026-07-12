@@ -429,6 +429,10 @@ bool TabSubclassSet::cleanup_safe() const noexcept {
     return !impl_->lifetime_failed && !impl_->cleanup_blocked;
 }
 
+std::size_t TabSubclassSet::active_count() const noexcept {
+    return impl_->installed.size();
+}
+
 TabSubclassOperations CreateProductionTabSubclassOperations(
     TabSubclassSet& owner) {
     return {

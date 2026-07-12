@@ -87,6 +87,8 @@ struct ProcessRuntimeOperations final {
     std::function<Status(WindowRuntime&)> activate_window;
     std::function<Status(WindowRuntime&)> cleanup_window_on_ui;
     std::function<Status(WindowRuntime&)> cleanup_window_from_worker;
+    std::function<Status(const WindowRuntime&, ipc::DetachCleanupProof*)>
+        capture_cleanup_proof;
     std::function<Status(WindowRuntime&)> shelter_window_on_destroy;
 };
 
@@ -119,6 +121,8 @@ private:
     friend Status ReapRemovedProcessWindows(ProcessRuntime&, DWORD) noexcept;
     friend Status RemoveAllProcessWindows(ProcessRuntime&);
     friend Status FinalizeProcessWindowsAfterDrain(ProcessRuntime&, DWORD) noexcept;
+    friend Status CaptureProcessDetachCleanupProof(
+        ProcessRuntime&, ipc::DetachCleanupProof*) noexcept;
     friend bool HandleProcessRuntimeTopLevelDestroy(ProcessRuntime&, HWND) noexcept;
     friend Status ProcessRequestedWindowRemovals(ProcessRuntime&);
     friend Status RetireProcessWindowOnCurrentUi(ProcessRuntime&, HWND);
@@ -164,6 +168,8 @@ private:
 [[nodiscard]] Status ReapRemovedProcessWindows(ProcessRuntime&, DWORD) noexcept;
 [[nodiscard]] Status RemoveAllProcessWindows(ProcessRuntime&);
 [[nodiscard]] Status FinalizeProcessWindowsAfterDrain(ProcessRuntime&, DWORD) noexcept;
+[[nodiscard]] Status CaptureProcessDetachCleanupProof(
+    ProcessRuntime&, ipc::DetachCleanupProof*) noexcept;
 [[nodiscard]] bool HandleProcessRuntimeTopLevelDestroy(ProcessRuntime&, HWND) noexcept;
 [[nodiscard]] Status ProcessRequestedWindowRemovals(ProcessRuntime&);
 [[nodiscard]] Status RetireProcessWindowOnCurrentUi(ProcessRuntime&, HWND);

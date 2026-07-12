@@ -244,15 +244,27 @@ Status EncodeDetachResult(
     const DetachResult& result,
     std::vector<std::uint8_t>* const output) {
     const Status valid = ValidateResultRule(result.result, result.error_code);
-    if (!valid.ok()) {
-        return valid;
+    const bool cleanupZero = result.cleanup.pane_count == 0 &&
+        result.cleanup.tab_subclass_count == 0 &&
+        result.cleanup.parent_subclass_count == 0 &&
+        result.cleanup.refresh_worker_count == 0 &&
+        result.cleanup.callback_count == 0;
+    if (!valid.ok() || (result.result == 0 && !cleanupZero)) {
+        return valid.ok() ? ProtocolError() : valid;
     }
     try {
         std::vector<std::uint8_t> payload;
-        payload.reserve(12 + result.error_code.size());
+        payload.reserve(32 + result.error_code.size());
         AppendU32(&payload, result.explorer_pid);
         AppendU32(&payload, result.result);
         const Status appended = AppendString(&payload, result.error_code);
+        if (appended.ok()) {
+            AppendU32(&payload, result.cleanup.pane_count);
+            AppendU32(&payload, result.cleanup.tab_subclass_count);
+            AppendU32(&payload, result.cleanup.parent_subclass_count);
+            AppendU32(&payload, result.cleanup.refresh_worker_count);
+            AppendU32(&payload, result.cleanup.callback_count);
+        }
         return appended.ok()
             ? EncodeFrame(MessageType::DetachResult, requestId, std::move(payload), output)
             : appended;
@@ -514,7 +526,20 @@ Status DecodeDetachResult(
     }
     const Status read = ReadString(frame.payload, &offset, &candidate.error_code);
     const Status valid = ValidateResultRule(candidate.result, candidate.error_code);
-    if (!read.ok() || !valid.ok() || offset != frame.payload.size()) {
+    const bool countsRead = read.ok() &&
+        ReadU32(frame.payload, &offset, &candidate.cleanup.pane_count) &&
+        ReadU32(frame.payload, &offset, &candidate.cleanup.tab_subclass_count) &&
+        ReadU32(frame.payload, &offset, &candidate.cleanup.parent_subclass_count) &&
+        ReadU32(frame.payload, &offset, &candidate.cleanup.refresh_worker_count) &&
+        ReadU32(frame.payload, &offset, &candidate.cleanup.callback_count);
+    const bool cleanupZero = candidate.cleanup.pane_count == 0 &&
+        candidate.cleanup.tab_subclass_count == 0 &&
+        candidate.cleanup.parent_subclass_count == 0 &&
+        candidate.cleanup.refresh_worker_count == 0 &&
+        candidate.cleanup.callback_count == 0;
+    if (!countsRead || !valid.ok() ||
+        (candidate.result == 0 && !cleanupZero) ||
+        offset != frame.payload.size()) {
         return ProtocolError();
     }
     *output = std::move(candidate);

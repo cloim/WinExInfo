@@ -72,6 +72,17 @@ private:
     bool stopped_ = false;
 };
 
+[[nodiscard]] std::string FormatLifecycleAttachDiagnostic(
+    DWORD processId, DWORD threadId, HWND topLevel, std::uint32_t result);
+[[nodiscard]] std::string FormatLifecycleUpdateDiagnostic(
+    DWORD processId, std::uint64_t requestId,
+    const ipc::TabSetUpdate&, const ipc::TabSetResult&);
+[[nodiscard]] std::string FormatLifecycleRemoveDiagnostic(
+    DWORD processId, std::uint64_t requestId,
+    const ipc::WindowRemoveRequest&, const ipc::WindowRemoveResult&);
+[[nodiscard]] std::string FormatLifecycleDetachDiagnostic(
+    DWORD processId, std::uint64_t requestId, const ipc::DetachResult&);
+
 [[nodiscard]] ExplorerSessionOperations CreateProductionExplorerSessionOperations(
     DWORD processId,
     std::wstring hookDllPath);

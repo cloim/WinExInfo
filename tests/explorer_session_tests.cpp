@@ -181,6 +181,28 @@ WXI_TEST(explorer_session_one_attach_one_pipe,
     WXI_REQUIRE_EQ(recorder.wire_types[1], winexinfo::ipc::MessageType::TabSetUpdate);
 }
 
+WXI_TEST(explorer_session_formats_machine_parseable_authoritative_diagnostics,
+         "explorer_session.lifecycle_diagnostics") {
+    const winexinfo::ipc::TabSetUpdate update{
+        0x1000, 7, {{0x1100, 9, 11}, {0x1200, 10, 11}}};
+    WXI_REQUIRE_EQ(
+        winexinfo::FormatLifecycleAttachDiagnostic(
+            41, 11, reinterpret_cast<HWND>(0x1000), 0),
+        std::string{"LIFECYCLE_EVENT event=attach pid=41 tid=11 hwnd=0x0000000000001000 result=0"});
+    WXI_REQUIRE_EQ(
+        winexinfo::FormatLifecycleUpdateDiagnostic(
+            41, 3, update, {7, 0, {}}),
+        std::string{"LIFECYCLE_EVENT event=update pid=41 request=3 hwnd=0x0000000000001000 top_generation=7 tabs=0x0000000000001100:9:11,0x0000000000001200:10:11 result=0"});
+    WXI_REQUIRE_EQ(
+        winexinfo::FormatLifecycleRemoveDiagnostic(
+            41, 4, {0x1000, 7}, {7, 0, {}}),
+        std::string{"LIFECYCLE_EVENT event=remove pid=41 request=4 hwnd=0x0000000000001000 top_generation=7 result=0"});
+    WXI_REQUIRE_EQ(
+        winexinfo::FormatLifecycleDetachDiagnostic(
+            41, 5, {41, 0, {}, {0, 0, 0, 0, 0}}),
+        std::string{"LIFECYCLE_EVENT event=stop pid=41 request=5 result=0 pane=0 tab_subclass=0 parent_subclass=0 refresh_worker=0 callback=0"});
+}
+
 WXI_TEST(explorer_session_shared_tid_deduplicates_lease,
          "explorer_session.shared_tid_uses_no_duplicate_hook_lease") {
     Recorder recorder;

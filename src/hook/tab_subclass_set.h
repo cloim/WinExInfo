@@ -41,6 +41,7 @@ public:
         ipc::TabSetResult* result);
     [[nodiscard]] Status RemoveAll(const TabSubclassOperations& operations);
     [[nodiscard]] bool cleanup_safe() const noexcept;
+    [[nodiscard]] std::size_t active_count() const noexcept;
     void Notify(HWND window, UINT message) noexcept;
 
 private:

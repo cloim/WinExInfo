@@ -222,6 +222,29 @@ Status RemoveAllProcessWindows(ProcessRuntime&r){
         w.lifecycle.store(s.ok()?2u:3u,std::memory_order_release);r.occupied_[chosen]=false;r.removed_[chosen]=true;if(decrement)r.active_count_.fetch_sub(1,std::memory_order_acq_rel);if(!s.ok()&&first.ok())first=s;
     }if(!first.ok())r.retention_required_.store(true,std::memory_order_release);return first;
 }
+Status CaptureProcessDetachCleanupProof(
+    ProcessRuntime&r,ipc::DetachCleanupProof*out)noexcept{
+    if(!out||!r.operations.capture_cleanup_proof)return Fail(ERROR_INVALID_PARAMETER);
+    ipc::DetachCleanupProof total{};
+    const auto add=[](std::uint32_t*target,std::uint32_t value){
+        if(value>(std::numeric_limits<std::uint32_t>::max)()-*target)return false;
+        *target+=value;return true;
+    };
+    for(std::size_t i=0;i<kMaximumRuntimeWindows;++i){
+        if(!r.slots_[i]||(!r.occupied_[i]&&!r.removed_[i]))continue;
+        ipc::DetachCleanupProof window{};
+        const Status status=r.operations.capture_cleanup_proof(*r.slots_[i],&window);
+        if(!status.ok()||
+            !add(&total.pane_count,window.pane_count)||
+            !add(&total.tab_subclass_count,window.tab_subclass_count)||
+            !add(&total.parent_subclass_count,window.parent_subclass_count)||
+            !add(&total.refresh_worker_count,window.refresh_worker_count)||
+            !add(&total.callback_count,window.callback_count)||
+            !add(&total.callback_count,r.slots_[i]->callback_gate.in_flight()))
+            return status.ok()?Fail(ERROR_ARITHMETIC_OVERFLOW):status;
+    }
+    *out=total;return Ok();
+}
 Status FinalizeProcessWindowsAfterDrain(ProcessRuntime&r,DWORD timeout)noexcept{
     for(auto&e:r.admission_epoch_)e.store(0,std::memory_order_release);for(auto&e:r.storage_epoch_)e.store(0,std::memory_order_release);
     for(auto&s:r.slots_)s->storage_gate.RejectNewWork();for(auto&s:r.slots_)if(!s->storage_gate.WaitForZero(timeout)){r.retention_required_.store(true,std::memory_order_release);return Fail(ERROR_TIMEOUT);}return Ok();

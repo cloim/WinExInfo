@@ -143,6 +143,7 @@ WXI_TEST(tab_subclass_applies_exact_order_and_duplicate_is_idempotent,
     TabSetResult result{};
     WXI_REQUIRE(recorder.tabs.Apply(
                     recorder.top, update, recorder.Operations(), &result).ok());
+    WXI_REQUIRE_EQ(recorder.tabs.active_count(), std::size_t{2});
     WXI_REQUIRE_EQ(
         recorder.calls,
         (std::vector<std::string>{"add:513:20", "add:514:21", "refresh"}));
@@ -150,6 +151,7 @@ WXI_TEST(tab_subclass_applies_exact_order_and_duplicate_is_idempotent,
     recorder.calls.clear();
     WXI_REQUIRE(recorder.tabs.Apply(
                     recorder.top, update, recorder.Operations(), &result).ok());
+    WXI_REQUIRE_EQ(recorder.tabs.active_count(), std::size_t{2});
     WXI_REQUIRE(recorder.calls.empty());
 }
 

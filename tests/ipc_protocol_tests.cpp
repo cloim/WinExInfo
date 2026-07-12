@@ -80,7 +80,12 @@ WXI_TEST(ipc_attach_result_is_byte_exact, "ipc.attach_result_bytes") {
 }
 
 WXI_TEST(ipc_detach_result_is_byte_exact, "ipc.detach_result_bytes") {
-    const DetachResult result{0x11223344, 7, "PIPE_DISCONNECTED"};
+    const DetachResult result{
+        0x11223344,
+        7,
+        "PIPE_DISCONNECTED",
+        {1, 2, 3, 4, 5},
+    };
     std::vector<std::uint8_t> frame;
     WXI_REQUIRE(winexinfo::ipc::EncodeDetachResult(11, result, &frame).ok());
     DecodedFrame decoded{};
@@ -89,6 +94,30 @@ WXI_TEST(ipc_detach_result_is_byte_exact, "ipc.detach_result_bytes") {
     WXI_REQUIRE_EQ(decoded.message_type, MessageType::DetachResult);
     WXI_REQUIRE(winexinfo::ipc::DecodeDetachResult(decoded, 11, &roundTrip).ok());
     WXI_REQUIRE_EQ(roundTrip, result);
+
+    const std::vector<std::uint8_t> expectedPayload{
+        0x44, 0x33, 0x22, 0x11,
+        0x07, 0x00, 0x00, 0x00,
+        0x11, 0x00, 0x00, 0x00,
+        'P','I','P','E','_','D','I','S','C','O','N','N','E','C','T','E','D',
+        0x01, 0x00, 0x00, 0x00,
+        0x02, 0x00, 0x00, 0x00,
+        0x03, 0x00, 0x00, 0x00,
+        0x04, 0x00, 0x00, 0x00,
+        0x05, 0x00, 0x00, 0x00,
+    };
+    WXI_REQUIRE_EQ(decoded.payload, expectedPayload);
+}
+
+WXI_TEST(ipc_successful_detach_requires_authoritative_zero_cleanup,
+         "ipc.detach_result_cleanup_proof") {
+    for (std::size_t index = 0; index < 5; ++index) {
+        DetachResult result{42, 0, {}, {0, 0, 0, 0, 0}};
+        auto* counts = reinterpret_cast<std::uint32_t*>(&result.cleanup);
+        counts[index] = 1;
+        std::vector<std::uint8_t> frame;
+        WXI_REQUIRE(!winexinfo::ipc::EncodeDetachResult(1, result, &frame).ok());
+    }
 }
 
 WXI_TEST(ipc_rejects_header_and_length_mismatches, "ipc.header_mismatches") {

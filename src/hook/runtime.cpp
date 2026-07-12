@@ -71,6 +71,24 @@ RuntimeWindowResources* Resources(WindowRuntime* window) noexcept {
     return window ? static_cast<RuntimeWindowResources*>(window->resources.get()) : nullptr;
 }
 
+Status CaptureRuntimeWindowCleanupProof(
+    const WindowRuntime& window,
+    ipc::DetachCleanupProof* const output) noexcept {
+    if (output == nullptr) return ContractFailure();
+    const auto* const resources =
+        static_cast<const RuntimeWindowResources*>(window.resources.get());
+    *output = {};
+    if (resources == nullptr) return Success();
+    output->pane_count = resources->pane.hwnd != nullptr ? 1u : 0u;
+    output->tab_subclass_count = static_cast<std::uint32_t>(
+        window.tab_subclasses ? window.tab_subclasses->active_count() : 0u);
+    output->parent_subclass_count =
+        resources->signal_source.parent != nullptr ? 1u : 0u;
+    output->refresh_worker_count =
+        resources->worker_started || resources->refresh_worker ? 1u : 0u;
+    return Success();
+}
+
 Status PostRuntimeMessage(const HWND pane, const UINT message) {
     return PostMessageW(pane, message, 0, 0) != FALSE
         ? Success()
@@ -432,6 +450,14 @@ DWORD WINAPI RuntimeWorker(void* const parameter) {
         context.release();
         return 1;
     }
+    ipc::DetachCleanupProof cleanupProof{};
+    status = CaptureProcessDetachCleanupProof(
+        context->process, &cleanupProof);
+    if (!status.ok() || g_callback_gate.in_flight() != 0) {
+        context.release();
+        return 1;
+    }
+    cleanupProof.callback_count += g_callback_gate.in_flight();
     if (!ReapRemovedProcessWindows(context->process, 5000).ok()) {
         context.release();
         return 1;
@@ -445,7 +471,7 @@ DWORD WINAPI RuntimeWorker(void* const parameter) {
         std::vector<std::uint8_t> response;
         status = ipc::EncodeDetachResult(
             request.request_id,
-            {context->pid, 0, {}},
+            {context->pid, 0, {}, cleanupProof},
             &response);
         if (status.ok()) {
             status = ipc::WriteFrame(pipe.get(), response);
@@ -1178,6 +1204,8 @@ Status BeginHookRuntimeAttach(
     context->process.operations.activate_window = &ActivateRuntimeWindow;
     context->process.operations.cleanup_window_on_ui = &CleanupRuntimeWindowOnUi;
     context->process.operations.cleanup_window_from_worker = &CleanupRuntimeWindowFromWorker;
+    context->process.operations.capture_cleanup_proof =
+        &CaptureRuntimeWindowCleanupProof;
     context->process.operations.shelter_window_on_destroy = &ShelterRuntimeWindowOnDestroy;
     SetProcessRuntimeForCallbacks(&context->process);
     std::unique_ptr<WindowRuntime> initial;
