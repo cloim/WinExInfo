@@ -266,6 +266,24 @@ public:
             for (const ExplorerWindowRecord& window : windows) {
                 topLevels.push_back(window.hwnd);
             }
+            if (topLevels.empty()) {
+                const std::vector<ObserverShellEntryMetadata> metadata;
+                const std::vector<DWORD> validated;
+                status = tracker_.Reconcile(
+                    sequence, windows, metadata, orders, validated, output);
+                if (!status.ok()) return status;
+                for (const ExplorerWindowRecord& window : enumerated) {
+                    if (std::find_if(
+                            output->processes.begin(), output->processes.end(),
+                            [&](const ExplorerProcessSnapshot& process) {
+                                return process.process_id == window.process_id;
+                            }) == output->processes.end()) {
+                        output->processes.push_back(
+                            {window.process_id, false, {}});
+                    }
+                }
+                return {ErrorCode::OK, S_OK, ERROR_SUCCESS};
+            }
             ShellBrowserSetCapture shellCapture{};
             status = CaptureShellBrowserSet(
                 shell_windows_.Get(), topLevels, &shellCapture);
