@@ -115,6 +115,13 @@ Status ThreadHookInjector::Attach(
         closeReleaseEvent();
         return Failure(ErrorCode::HOOK_INSTALL_FAILED);
     }
+    if (operations_.before_set_hook) {
+        const Status validated = operations_.before_set_hook();
+        if (!ExactSuccess(validated)) {
+            closeReleaseEvent();
+            return validated;
+        }
+    }
     HHOOK hook = nullptr;
     const Status installed = operations_.set_hook(
         WH_CALLWNDPROC, procedure, module, target.ui_thread_id, &hook);

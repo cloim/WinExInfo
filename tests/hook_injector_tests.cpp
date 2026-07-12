@@ -55,6 +55,7 @@ struct FakeState final {
     int unhook_calls = 0;
     int set_event_calls = 0;
     int close_event_calls = 0;
+    std::vector<std::string> install_order;
 };
 
 winexinfo::injection::HookPlatformOperations Operations(FakeState* const state) {
@@ -95,6 +96,7 @@ winexinfo::injection::HookPlatformOperations Operations(FakeState* const state) 
             HHOOK* const output) {
             state->hook_types.push_back(hookType);
             state->hook_threads.push_back(threadId);
+            state->install_order.push_back("set_hook");
             if (!state->set_hook_succeeds) {
                 return Failure(winexinfo::ErrorCode::HOOK_INSTALL_FAILED);
             }
@@ -142,6 +144,24 @@ winexinfo::injection::HookPlatformOperations Operations(FakeState* const state) 
         },
         [state](const HANDLE) { ++state->close_event_calls; },
     };
+}
+
+winexinfo::injection::HookTarget Target();
+
+WXI_TEST(hook_injector_runs_final_validation_adjacent_to_hook_install,
+         "hook_injector.final_validation_adjacency") {
+    FakeState state;
+    auto operations = Operations(&state);
+    operations.before_set_hook = [&state] {
+        state.install_order.push_back("final_validate");
+        return Success();
+    };
+    winexinfo::injection::ThreadHookInjector injector{std::move(operations)};
+    winexinfo::injection::HookAttachOutcome outcome{};
+    WXI_REQUIRE(injector.Attach(Target(), &outcome).ok());
+    WXI_REQUIRE_EQ(
+        state.install_order,
+        (std::vector<std::string>{"final_validate", "set_hook"}));
 }
 
 winexinfo::injection::HookTarget Target() {

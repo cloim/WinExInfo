@@ -9,10 +9,12 @@
 #include "probe/target_validator.h"
 
 #include <TlHelp32.h>
+#include <Psapi.h>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cwchar>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
@@ -30,8 +32,7 @@ constexpr DWORD kBoundedWaitMs = 5000;
 
 bool ValidOperations(const ExplorerControllerOperations& operations) {
     return operations.inspect_target && operations.emit_target_accepted &&
-        operations.target_still_matches && operations.attach &&
-        operations.query_pane_owner && operations.wait_duration &&
+        operations.attach && operations.query_pane_owner && operations.wait_duration &&
         operations.detach && operations.pane_absent &&
         operations.exact_module_absent && operations.release_retained_target;
 }
@@ -54,68 +55,125 @@ bool IsExactTargetWindow(
         expected.top_level == window;
 }
 
-enum class FileComparison { Same, Different, Error };
-
-FileComparison CompareFileIdentity(
-    const std::wstring_view firstPath,
-    const std::wstring_view secondPath) {
-    UniqueHandle first{CreateFileW(
-        std::wstring{firstPath}.c_str(), FILE_READ_ATTRIBUTES,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr)};
-    UniqueHandle second{CreateFileW(
-        std::wstring{secondPath}.c_str(), FILE_READ_ATTRIBUTES,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr)};
-    if (!first || !second) {
-        return FileComparison::Error;
+HostExitCode OpenFileIdentity(
+    const std::wstring_view path,
+    UniqueHandle* const file,
+    ExplorerControllerFileIdentity* const output) {
+    if (file == nullptr || *file || output == nullptr || path.empty() ||
+        path.find(L'\0') != std::wstring_view::npos) {
+        return HostExitCode::Win32ComFailure;
     }
-    FILE_ID_INFO firstInfo{};
-    FILE_ID_INFO secondInfo{};
+    UniqueHandle candidateFile{CreateFileW(
+        std::wstring{path}.c_str(), FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr)};
+    if (!candidateFile) {
+        return HostExitCode::Win32ComFailure;
+    }
+    FILE_ID_INFO information{};
     if (GetFileInformationByHandleEx(
-            first.get(), FileIdInfo, &firstInfo, sizeof(firstInfo)) == FALSE ||
-        GetFileInformationByHandleEx(
-            second.get(), FileIdInfo, &secondInfo, sizeof(secondInfo)) == FALSE) {
-        return FileComparison::Error;
+            candidateFile.get(), FileIdInfo,
+            &information, sizeof(information)) == FALSE) {
+        return HostExitCode::Win32ComFailure;
     }
-    return firstInfo.VolumeSerialNumber == secondInfo.VolumeSerialNumber &&
-        std::equal(
-            std::begin(firstInfo.FileId.Identifier),
-            std::end(firstInfo.FileId.Identifier),
-            std::begin(secondInfo.FileId.Identifier))
-        ? FileComparison::Same
-        : FileComparison::Different;
+    ExplorerControllerFileIdentity candidate{};
+    candidate.volume_serial = information.VolumeSerialNumber;
+    std::copy(
+        std::begin(information.FileId.Identifier),
+        std::end(information.FileId.Identifier),
+        candidate.file_id.begin());
+    *file = std::move(candidateFile);
+    *output = candidate;
+    return HostExitCode::Pass;
+}
+
+HostExitCode DosPathFromMappedDevicePath(
+    const std::wstring_view devicePath,
+    std::wstring* const output) {
+    if (output == nullptr || devicePath.empty()) {
+        return HostExitCode::Win32ComFailure;
+    }
+    wchar_t drives[512]{};
+    const DWORD length = GetLogicalDriveStringsW(512, drives);
+    if (length == 0 || length >= 512) {
+        return HostExitCode::Win32ComFailure;
+    }
+    for (const wchar_t* drive = drives; *drive != L'\0';
+         drive += std::wcslen(drive) + 1) {
+        const std::wstring driveName{drive, 2};
+        wchar_t device[32768]{};
+        if (QueryDosDeviceW(driveName.c_str(), device, 32768) == 0) {
+            return HostExitCode::Win32ComFailure;
+        }
+        const std::wstring_view deviceName{device};
+        if (devicePath.size() >= deviceName.size() &&
+            _wcsnicmp(
+                devicePath.data(), deviceName.data(), deviceName.size()) == 0) {
+            *output = driveName;
+            output->append(devicePath.substr(deviceName.size()));
+            return HostExitCode::Pass;
+        }
+    }
+    return HostExitCode::Win32ComFailure;
 }
 
 enum class ModulePresence { Present, Absent, Error };
 
-ModulePresence QueryExactModulePresence(
+HostExitCode QueryExactModulePresence(
     const DWORD processId,
-    const std::wstring_view hookDllPath) {
+    const ExplorerControllerFileIdentity& expected,
+    ModulePresence* const output) {
+    if (output == nullptr) {
+        return HostExitCode::Win32ComFailure;
+    }
+    UniqueHandle process{OpenProcess(
+        PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId)};
     UniqueHandle snapshot{CreateToolhelp32Snapshot(
         TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, processId)};
-    if (!snapshot) {
-        return ModulePresence::Error;
+    if (!process || !snapshot) {
+        return HostExitCode::Win32ComFailure;
     }
     MODULEENTRY32W entry{sizeof(entry)};
     if (Module32FirstW(snapshot.get(), &entry) == FALSE) {
-        return GetLastError() == ERROR_NO_MORE_FILES
-            ? ModulePresence::Absent
-            : ModulePresence::Error;
+        if (GetLastError() != ERROR_NO_MORE_FILES) {
+            return HostExitCode::Win32ComFailure;
+        }
+        *output = ModulePresence::Absent;
+        return HostExitCode::Pass;
     }
     do {
-        const FileComparison comparison =
-            CompareFileIdentity(entry.szExePath, hookDllPath);
-        if (comparison == FileComparison::Error) {
-            return ModulePresence::Error;
+        std::wstring mappedDevicePath(32768, L'\0');
+        const DWORD mappedLength = K32GetMappedFileNameW(
+            process.get(), entry.modBaseAddr,
+            mappedDevicePath.data(),
+            static_cast<DWORD>(mappedDevicePath.size()));
+        if (mappedLength == 0 ||
+            mappedLength == static_cast<DWORD>(mappedDevicePath.size())) {
+            return HostExitCode::Win32ComFailure;
         }
-        if (comparison == FileComparison::Same) {
-            return ModulePresence::Present;
+        mappedDevicePath.resize(mappedLength);
+        std::wstring mappedDosPath;
+        const HostExitCode converted =
+            DosPathFromMappedDevicePath(mappedDevicePath, &mappedDosPath);
+        if (converted != HostExitCode::Pass) {
+            return converted;
+        }
+        bool matches = false;
+        const HostExitCode checked = CheckExplorerControllerFileIdentity(
+            mappedDosPath, expected, &matches);
+        if (checked != HostExitCode::Pass) {
+            return checked;
+        }
+        if (matches) {
+            *output = ModulePresence::Present;
+            return HostExitCode::Pass;
         }
     } while (Module32NextW(snapshot.get(), &entry) != FALSE);
-    return GetLastError() == ERROR_NO_MORE_FILES
-        ? ModulePresence::Absent
-        : ModulePresence::Error;
+    if (GetLastError() != ERROR_NO_MORE_FILES) {
+        return HostExitCode::Win32ComFailure;
+    }
+    *output = ModulePresence::Absent;
+    return HostExitCode::Pass;
 }
 
 bool ConnectPipeBounded(const HANDLE pipe, const DWORD timeoutMs) {
@@ -171,9 +229,58 @@ bool WaitForPipeFrame(const HANDLE pipe, const DWORD timeoutMs) {
 
 struct ProductionControllerState final {
     UniqueHandle pipe;
+    UniqueHandle hook_identity_file;
     std::unique_ptr<injection::ThreadHookInjector> injector;
+    ExplorerControllerFileIdentity hook_identity{};
+    bool hook_identity_captured = false;
     std::uint64_t detach_id = 0;
 };
+
+struct PaneMatch final {
+    HWND pane = nullptr;
+    std::uint32_t count = 0;
+    bool failed = false;
+};
+
+HostExitCode EnumerateExactPanes(
+    const HWND target,
+    PaneMatch* const output) {
+    if (target == nullptr || output == nullptr) {
+        return HostExitCode::Win32ComFailure;
+    }
+    *output = {};
+    SetLastError(ERROR_SUCCESS);
+    const BOOL enumerated = EnumChildWindows(
+        target,
+        [](const HWND child, const LPARAM value) {
+            auto* const match = reinterpret_cast<PaneMatch*>(value);
+            wchar_t name[64]{};
+            if (GetClassNameW(child, name, 64) == 0) {
+                match->failed = true;
+                return FALSE;
+            }
+            if (std::wstring_view{name} == hook::kStatusPaneClassName) {
+                match->pane = child;
+                ++match->count;
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(output));
+    if (output->failed ||
+        (enumerated == FALSE && GetLastError() != ERROR_SUCCESS)) {
+        return HostExitCode::Win32ComFailure;
+    }
+    return HostExitCode::Pass;
+}
+
+void RetainContextForHostLifetime(const std::shared_ptr<void>& context) {
+    if (!context) {
+        return;
+    }
+    static auto* const retained =
+        new std::vector<std::shared_ptr<void>>();
+    retained->push_back(context);
+}
 
 HostExitCode StatusExit(const Status& status) {
     return status.code == ErrorCode::WINDOW_ATTACH_FAILED ||
@@ -222,11 +329,22 @@ ExplorerControllerOperations ProductionOperations(
                      << reinterpret_cast<std::uintptr_t>(target.top_level);
             std::cout << accepted.str() << '\n' << std::flush;
         },
-        [](const ExplorerControllerTarget& target) {
-            return IsExactTargetWindow(target.top_level, target);
-        },
         [state](const ExplorerControllerTarget& target,
-                const std::wstring_view hookDllPath) {
+                const std::wstring_view hookDllPath,
+                const std::function<void()>& accepted,
+                bool* const contextMayLive) {
+            if (contextMayLive == nullptr || !accepted) {
+                return HostExitCode::Win32ComFailure;
+            }
+            *contextMayLive = false;
+            HostExitCode identityResult = OpenFileIdentity(
+                hookDllPath,
+                &state->hook_identity_file,
+                &state->hook_identity);
+            if (identityResult != HostExitCode::Pass) {
+                return identityResult;
+            }
+            state->hook_identity_captured = true;
             std::wstring pipeName;
             Status status = ipc::BuildCurrentUserPipeName(&pipeName);
             if (status.ok()) {
@@ -252,11 +370,19 @@ ExplorerControllerOperations ProductionOperations(
                     }
                     ULONG clientPid = 0;
                     if (GetNamedPipeClientProcessId(
-                            state->pipe.get(), &clientPid) == FALSE ||
-                        clientPid != expectedPid ||
-                        !WaitForPipeFrame(state->pipe.get(), timeoutMs)) {
+                            state->pipe.get(), &clientPid) == FALSE) {
+                        const DWORD error = GetLastError();
+                        return Status{ErrorCode::PIPE_DISCONNECTED,
+                                      HRESULT_FROM_WIN32(error), error};
+                    }
+                    if (clientPid != expectedPid) {
                         return Status{ErrorCode::TARGET_VALIDATION_FAILED,
                                       S_FALSE, ERROR_ACCESS_DENIED};
+                    }
+                    if (!WaitForPipeFrame(state->pipe.get(), timeoutMs)) {
+                        return Status{ErrorCode::PIPE_DISCONNECTED,
+                                      HRESULT_FROM_WIN32(ERROR_TIMEOUT),
+                                      ERROR_TIMEOUT};
                     }
                     ipc::DecodedFrame frame{};
                     ipc::AttachResult result{};
@@ -275,41 +401,70 @@ ExplorerControllerOperations ProductionOperations(
                         result.result, result.error_code};
                     return Status{ErrorCode::OK, S_OK, ERROR_SUCCESS};
                 });
+            const auto resolveHookExport = platform.resolve_hook_export;
+            platform.resolve_hook_export =
+                [state, resolveHookExport](
+                    const std::string_view name,
+                    HMODULE* const module,
+                    HOOKPROC* const procedure) {
+                    const Status resolved =
+                        resolveHookExport(name, module, procedure);
+                    if (!resolved.ok() || module == nullptr || *module == nullptr) {
+                        return resolved;
+                    }
+                    std::wstring modulePath(32768, L'\0');
+                    const DWORD length = GetModuleFileNameW(
+                        *module, modulePath.data(),
+                        static_cast<DWORD>(modulePath.size()));
+                    if (length == 0 ||
+                        length == static_cast<DWORD>(modulePath.size())) {
+                        const DWORD error = GetLastError();
+                        return Status{ErrorCode::HOOK_INSTALL_FAILED,
+                                      HRESULT_FROM_WIN32(error), error};
+                    }
+                    modulePath.resize(length);
+                    ExplorerControllerFileIdentity loadedIdentity{};
+                    if (CaptureExplorerControllerFileIdentity(
+                            modulePath, &loadedIdentity) != HostExitCode::Pass ||
+                        !(loadedIdentity == state->hook_identity)) {
+                        return Status{ErrorCode::TARGET_VALIDATION_FAILED,
+                                      S_FALSE, ERROR_FILE_INVALID};
+                    }
+                    return resolved;
+                };
+            platform.before_set_hook = [target, accepted] {
+                if (!IsExactTargetWindow(target.top_level, target)) {
+                    return Status{ErrorCode::TARGET_VALIDATION_FAILED,
+                                  S_FALSE, ERROR_INVALID_WINDOW_HANDLE};
+                }
+                accepted();
+                return Status{ErrorCode::OK, S_OK, ERROR_SUCCESS};
+            };
             state->injector =
                 std::make_unique<injection::ThreadHookInjector>(std::move(platform));
             injection::HookAttachOutcome outcome{};
             status = state->injector->Attach(
                 {target.process_id, target.thread_id, target.top_level}, &outcome);
+            *contextMayLive = state->injector->retained_target_count() != 0;
             if (!status.ok() || !outcome.unload_authorized) {
                 return StatusExit(status);
             }
+            *contextMayLive = true;
             return HostExitCode::Pass;
         },
         [](const ExplorerControllerTarget& target, DWORD* const ownerPid) {
-            struct PaneMatch final {
-                HWND pane = nullptr;
-                std::uint32_t count = 0;
-            } match;
+            PaneMatch match{};
             if (ownerPid == nullptr) {
-                return HostExitCode::ContractFailure;
+                return HostExitCode::Win32ComFailure;
             }
             const auto deadline = std::chrono::steady_clock::now() +
                 std::chrono::milliseconds(kBoundedWaitMs);
             do {
-                match = {};
-                EnumChildWindows(
-                    target.top_level,
-                    [](const HWND child, const LPARAM value) {
-                        wchar_t name[64]{};
-                        if (GetClassNameW(child, name, 64) != 0 &&
-                            std::wstring_view{name} == hook::kStatusPaneClassName) {
-                            auto* found = reinterpret_cast<PaneMatch*>(value);
-                            found->pane = child;
-                            ++found->count;
-                        }
-                        return TRUE;
-                    },
-                    reinterpret_cast<LPARAM>(&match));
+                const HostExitCode enumerated =
+                    EnumerateExactPanes(target.top_level, &match);
+                if (enumerated != HostExitCode::Pass) {
+                    return enumerated;
+                }
                 if (match.count == 1 && match.pane != nullptr) {
                     break;
                 }
@@ -321,7 +476,7 @@ ExplorerControllerOperations ProductionOperations(
             GetWindowThreadProcessId(match.pane, ownerPid);
             return *ownerPid != 0
                 ? HostExitCode::Pass
-                : HostExitCode::ContractFailure;
+                : HostExitCode::Win32ComFailure;
         },
         [](const std::uint32_t durationMs) {
             std::uint32_t remaining = durationMs;
@@ -360,51 +515,87 @@ ExplorerControllerOperations ProductionOperations(
             state->pipe.reset();
             return HostExitCode::Pass;
         },
-        [](const ExplorerControllerTarget& target) {
+        [](const ExplorerControllerTarget& target, bool* const absent) {
+            if (absent == nullptr) {
+                return HostExitCode::Win32ComFailure;
+            }
             const auto deadline = std::chrono::steady_clock::now() +
                 std::chrono::milliseconds(kBoundedWaitMs);
             do {
-                bool found = false;
-                EnumChildWindows(
-                    target.top_level,
-                    [](const HWND child, const LPARAM value) {
-                        wchar_t name[64]{};
-                        if (GetClassNameW(child, name, 64) != 0 &&
-                            std::wstring_view{name} == hook::kStatusPaneClassName) {
-                            *reinterpret_cast<bool*>(value) = true;
-                            return FALSE;
-                        }
-                        return TRUE;
-                    },
-                    reinterpret_cast<LPARAM>(&found));
-                if (!found) {
-                    return true;
+                PaneMatch match{};
+                const HostExitCode enumerated =
+                    EnumerateExactPanes(target.top_level, &match);
+                if (enumerated != HostExitCode::Pass) {
+                    return enumerated;
+                }
+                if (match.count == 0) {
+                    *absent = true;
+                    return HostExitCode::Pass;
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(25));
             } while (std::chrono::steady_clock::now() < deadline);
-            return false;
+            *absent = false;
+            return HostExitCode::Pass;
         },
-        [](const DWORD processId, const std::wstring_view hookDllPath) {
+        [state](const DWORD processId, bool* const absent) {
+            if (absent == nullptr || !state->hook_identity_captured) {
+                return HostExitCode::Win32ComFailure;
+            }
             const auto deadline = std::chrono::steady_clock::now() +
                 std::chrono::milliseconds(kBoundedWaitMs);
             do {
-                if (QueryExactModulePresence(processId, hookDllPath) ==
-                    ModulePresence::Absent) {
-                    return true;
+                ModulePresence presence = ModulePresence::Error;
+                const HostExitCode queried = QueryExactModulePresence(
+                    processId, state->hook_identity, &presence);
+                if (queried != HostExitCode::Pass) {
+                    return queried;
+                }
+                if (presence == ModulePresence::Absent) {
+                    *absent = true;
+                    return HostExitCode::Pass;
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(25));
             } while (std::chrono::steady_clock::now() < deadline);
-            return false;
+            *absent = false;
+            return HostExitCode::Pass;
         },
         [state](const DWORD processId) {
-            if (state->injector) {
-                static_cast<void>(state->injector->ConfirmTargetGone(processId));
+            if (!state->injector) {
+                return HostExitCode::Win32ComFailure;
             }
+            return state->injector->ConfirmTargetGone(processId).ok()
+                ? HostExitCode::Pass
+                : HostExitCode::Win32ComFailure;
         },
+        state,
     };
 }
 
 }  // namespace
+
+HostExitCode CaptureExplorerControllerFileIdentity(
+    const std::wstring_view path,
+    ExplorerControllerFileIdentity* const output) {
+    UniqueHandle file;
+    return OpenFileIdentity(path, &file, output);
+}
+
+HostExitCode CheckExplorerControllerFileIdentity(
+    const std::wstring_view path,
+    const ExplorerControllerFileIdentity& expected,
+    bool* const matches) {
+    if (matches == nullptr) {
+        return HostExitCode::Win32ComFailure;
+    }
+    ExplorerControllerFileIdentity candidate{};
+    const HostExitCode captured =
+        CaptureExplorerControllerFileIdentity(path, &candidate);
+    if (captured != HostExitCode::Pass) {
+        return captured;
+    }
+    *matches = candidate == expected;
+    return HostExitCode::Pass;
+}
 
 HostExitCode RunGateCPlacementWithOperations(
     const HWND target,
@@ -424,12 +615,18 @@ HostExitCode RunGateCPlacementWithOperations(
         inspected.top_level != target) {
         return HostExitCode::ContractFailure;
     }
-    operations.emit_target_accepted(inspected);
-    if (!operations.target_still_matches(inspected)) {
-        return HostExitCode::ContractFailure;
-    }
-    result = operations.attach(inspected, hookDllPath);
+    bool contextMayLive = false;
+    result = operations.attach(
+        inspected,
+        hookDllPath,
+        [&operations, &inspected] {
+            operations.emit_target_accepted(inspected);
+        },
+        &contextMayLive);
     if (result != HostExitCode::Pass) {
+        if (contextMayLive) {
+            RetainContextForHostLifetime(operations.retention_context);
+        }
         return result;
     }
 
@@ -442,15 +639,29 @@ HostExitCode RunGateCPlacementWithOperations(
         operations.wait_duration(durationMs);
     }
     const HostExitCode detached = operations.detach(inspected);
-    const bool paneAbsent = operations.pane_absent(inspected);
-    const bool moduleAbsent =
-        operations.exact_module_absent(inspected.process_id, hookDllPath);
-    if (detached != HostExitCode::Pass || !paneAbsent || !moduleAbsent) {
-        return detached == HostExitCode::Win32ComFailure
+    bool paneAbsent = false;
+    const HostExitCode paneCleanup =
+        operations.pane_absent(inspected, &paneAbsent);
+    bool moduleAbsent = false;
+    const HostExitCode moduleCleanup =
+        operations.exact_module_absent(inspected.process_id, &moduleAbsent);
+    if (detached != HostExitCode::Pass ||
+        paneCleanup != HostExitCode::Pass ||
+        moduleCleanup != HostExitCode::Pass ||
+        !paneAbsent || !moduleAbsent) {
+        RetainContextForHostLifetime(operations.retention_context);
+        return detached == HostExitCode::Win32ComFailure ||
+            paneCleanup == HostExitCode::Win32ComFailure ||
+            moduleCleanup == HostExitCode::Win32ComFailure
             ? HostExitCode::Win32ComFailure
             : HostExitCode::ContractFailure;
     }
-    operations.release_retained_target(inspected.process_id);
+    const HostExitCode released =
+        operations.release_retained_target(inspected.process_id);
+    if (released != HostExitCode::Pass) {
+        RetainContextForHostLifetime(operations.retention_context);
+        return released;
+    }
     return primary;
 }
 

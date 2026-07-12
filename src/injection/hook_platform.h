@@ -44,6 +44,7 @@ struct HookPlatformOperations final {
     std::function<Status(HHOOK, bool*)> unhook;
     std::function<Status(HANDLE, bool*)> set_event;
     std::function<void(HANDLE)> close_event;
+    std::function<Status()> before_set_hook;
 };
 
 using HookAttachWaitOperation =
