@@ -1,24 +1,24 @@
 # WinExInfo Gate C Evidence
 
-Gate C: FAIL
+Gate C: PASS
 
 Captured on 2026-07-12 KST against the approved Windows 11 Explorer target.
 
-Product under test: product head `3612965`. The harness evolved in separate
-evidence commits; the latest live result below used the strict harness state
-committed at `fa30256`. The additional fail-closed safety hardening documented
-next was made afterward and has not been used for a live rerun.
+Product under test: product head `3612965`. The prior snapshot-race Release
+failure below used an intermediate uncommitted strict harness state whose exact
+blob is not available. Commit `fa30256` is the first committed post-live
+candidate-stabilization hardening. Commit `5f174cf` adds the later fail-closed
+safety hardening and is the current approved harness head for the fresh runs.
 
 ## Decision
 
-The strict harness review invalidated the prior PASS as insufficient evidence.
-A fresh strict Debug run at head `3612965` passed all lifecycle, observed
-selection, continuity, cleanup, and controlled-window checks. After rebuilding
-Release, the strict Release run failed before Host launch because the new
-controlled window appeared between its two stable Shell samples. No Release
-product result was obtained. Per the stop condition, Gate C is FAIL for this
-run. Earlier commands and outcomes are retained below as explicitly
-superseded diagnostic history.
+The current approved harness at `5f174cf` passed fresh Debug and Release runs
+against product head `3612965`. Both runs proved exact controlled-window
+identity, observed tab selection, same-pane continuity, active-parent
+migration and recovery, original rectangle restoration, normal Host exit,
+bounded pane/module cleanup, atomic exact close, and sampled safety state.
+Earlier commands and outcomes are retained below as explicitly superseded
+diagnostic history.
 
 No fallback selector, overlay, persistence, service, scheduled task, Run-key
 mutation, existing Explorer-window targeting, or network command was used.
@@ -27,7 +27,98 @@ The harness contains no network command. TCP count zero was observed only at
 the recorded before/after safety samples; it is not treated as continuous
 network monitoring.
 
-## Final strict run
+## Final approved-harness runs at 5f174cf
+
+### Debug PASS
+
+```text
+CONTROLLED hwnd=0x0000000001070D90 pid=16496 tid=31720 class=CabinetWClass url=file:///D:/PROJECTS/WinExInfo
+SAFETY stage=before explorer_windows=1 explorer_pids=1 run=0 service=0 task=0 processes=0 tcp=0
+```
+
+Canonical lifecycle:
+
+```text
+initial      active_tab=0x0000000000370F70 pane=0x0000000002210DDA parent=0x0000000000101002 rect=262,960,1604,984
+resized      active_tab=0x0000000000370F70 pane=0x0000000002210DDA parent=0x0000000000101002 rect=262,870,1444,894
+tab_switched active_tab=0x00000000002E083C pane=0x0000000002210DDA parent=0x0000000000230F42 rect=255,870,1444,894
+restored     active_tab=0x0000000000370F70 pane=0x0000000002210DDA parent=0x0000000000101002 rect=262,960,1604,984
+```
+
+Each rectangle equaled expected and overlap was false. Runtime identities and
+observed selection states were:
+
+```text
+original_identity=42.2035700.4.11
+added_identity=42.2035700.4.101
+selected_original=true selected_added=true
+```
+
+The restored tab count was exactly one and its identity equaled the original.
+
+```text
+HOST_STDOUT TARGET_ACCEPTED protocol=1 pid=16496 tid=31720 hwnd=0x0000000001070D90
+CLEANUP pane_absent=true exact_module_count=0 host_exit=0
+SAFETY stage=after explorer_windows=1 explorer_pids=2 run=0 service=0 task=0 processes=0 tcp=0
+GATE_C_PASS configuration=Debug pane_owner=explorer overlap=false cleanup=true
+```
+
+### Release PASS
+
+The Release build returned exit 0, then the live harness returned exit 0:
+
+```text
+pwsh -NoProfile -File .\scripts\build.ps1 -Configuration Release
+pwsh -NoProfile -File .\scripts\run-gate-c.ps1 -Configuration Release
+```
+
+```text
+CONTROLLED hwnd=0x00000000003C0FCC pid=43912 tid=18640 class=CabinetWClass url=file:///D:/PROJECTS/WinExInfo
+SAFETY stage=before explorer_windows=1 explorer_pids=2 run=0 service=0 task=0 processes=0 tcp=0
+```
+
+Canonical lifecycle:
+
+```text
+initial      active_tab=0x0000000000230F64 pane=0x0000000000D30F82 parent=0x0000000000150F9A rect=262,960,1604,984
+resized      active_tab=0x0000000000230F64 pane=0x0000000000D30F82 parent=0x0000000000150F9A rect=262,870,1444,894
+tab_switched active_tab=0x00000000009C0CF0 pane=0x0000000000D30F82 parent=0x00000000000B1040 rect=255,870,1444,894
+restored     active_tab=0x0000000000230F64 pane=0x0000000000D30F82 parent=0x0000000000150F9A rect=262,960,1604,984
+```
+
+Each rectangle equaled expected and overlap was false. Runtime identities and
+observed selection states were:
+
+```text
+original_identity=42.1642458.4.11
+added_identity=42.1642458.4.101
+selected_original=true selected_added=true
+```
+
+```text
+HOST_STDOUT TARGET_ACCEPTED protocol=1 pid=43912 tid=18640 hwnd=0x00000000003C0FCC
+CLEANUP pane_absent=true exact_module_count=0 host_exit=0
+SAFETY stage=after explorer_windows=1 explorer_pids=3 run=0 service=0 task=0 processes=0 tcp=0
+GATE_C_PASS configuration=Release pane_owner=explorer overlap=false cleanup=true
+```
+
+Before each atomic native close, the exact Shell HWND/PID/TID/class/URL was
+revalidated. Final sampled state was:
+
+```text
+explorer_windows=1 explorer_pids=2 processes=0 run=0 service=0 task=0
+pid=15836 hook_count=0
+pid=43912 hook_count=0
+```
+
+Debug controlled PID 16496 had exited naturally. Release controlled PID 43912
+remained temporarily windowless with exact Hook count zero. No unrelated
+Explorer top-level was closed.
+
+The later final verification sample found one Shell window and only Explorer
+PID 15836 with Hook count zero; controlled PID 43912 had exited naturally.
+
+## Superseded intermediate strict run
 
 ### Strict Debug: PASS
 
@@ -114,8 +205,8 @@ when WinExInfo PIDs exist. Native close now atomically revalidates top-level
 HWND/PID/TID/class immediately before `WM_CLOSE`, after the exact Shell URL
 assertion. Module counting returns zero only when a full process enumeration
 shows the controlled PID has naturally exited; module access errors propagate.
-No live command has been run with these post-`fa30256` harness changes pending
-review approval.
+No live command had been run with commits `fa30256` or `5f174cf` when that
+superseded failure was recorded.
 
 Final read-only safety state after the separately revalidated controlled close:
 
@@ -451,7 +542,7 @@ Run/service/task/WinExInfo-process/TCP counts were zero.
 
 ```text
 GATE_C_PASS configuration=Debug pane_owner=explorer overlap=false cleanup=true
-GATE_C_FAIL configuration=Release reason=Shell_window_snapshot_was_not_stable
+GATE_C_PASS configuration=Release pane_owner=explorer overlap=false cleanup=true
 ```
 
-Gate C: FAIL. No downstream product work is authorized.
+Gate C: PASS. This evidence does not itself authorize downstream product work.
