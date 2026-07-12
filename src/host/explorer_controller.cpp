@@ -338,7 +338,8 @@ ExplorerControllerOperations ProductionOperations(
                 return identityResult;
             }
             std::wstring pipeName;
-            Status status = ipc::BuildCurrentUserPipeName(&pipeName);
+            Status status = ipc::BuildCurrentUserPipeNameForProcess(
+                target.process_id, &pipeName);
             if (status.ok()) {
                 status = ipc::CreateControllerPipeServer(pipeName, &state->pipe);
             }

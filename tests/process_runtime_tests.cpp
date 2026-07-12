@@ -344,6 +344,23 @@ WXI_TEST(process_runtime_removes_and_reuses_hwnd_after_callback_drain,
       WXI_REQUIRE(lease); WXI_REQUIRE_EQ(lease.get()->key.generation, std::uint64_t{2}); }
 }
 
+WXI_TEST(process_runtime_removal_identity_requires_exact_hwnd_and_generation,
+         "process_runtime.authoritative_removal_identity") {
+    Fixture f;
+    winexinfo::ipc::TabSetResult updateResult{};
+    WXI_REQUIRE(winexinfo::hook::DispatchProcessTabSetUpdate(
+                    f.runtime, U(0x200, 7, 11), &updateResult).ok());
+    winexinfo::ipc::WindowRemoveResult removalResult{};
+    WXI_REQUIRE(winexinfo::hook::DispatchProcessWindowRemovalByIdentity(
+                    f.runtime, {0x200, 6}, &removalResult).ok());
+    WXI_REQUIRE(removalResult.result != 0);
+    WXI_REQUIRE_EQ(f.runtime.active_window_count(), std::size_t{1});
+    WXI_REQUIRE(winexinfo::hook::DispatchProcessWindowRemovalByIdentity(
+                    f.runtime, {0x200, 7}, &removalResult).ok());
+    WXI_REQUIRE_EQ(removalResult.result, DWORD{0});
+    WXI_REQUIRE_EQ(f.runtime.active_window_count(), std::size_t{0});
+}
+
 WXI_TEST(process_runtime_maximum_and_reverse_cleanup_retention,
          "process_runtime.bound_cleanup") {
     Fixture f;

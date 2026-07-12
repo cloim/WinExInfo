@@ -224,7 +224,7 @@ WXI_TEST(ipc_production_rejects_invalid_text_and_results, "ipc.production.text_r
 WXI_TEST(ipc_production_rejects_unknown_types_and_stale_generations, "ipc.production.type_generation_rejections") {
     std::vector<std::uint8_t> encoded;
     WXI_REQUIRE(winexinfo::ipc::EncodeTabSetResult(1, {2, 0, ""}, &encoded).ok());
-    encoded[6] = 10;
+    encoded[6] = 12;
     DecodedFrame decoded{};
     RequireProtocolFailure(winexinfo::ipc::DecodeFrame(encoded, &decoded));
 
@@ -234,4 +234,36 @@ WXI_TEST(ipc_production_rejects_unknown_types_and_stale_generations, "ipc.produc
     RequireProtocolFailure(winexinfo::ipc::AcceptTopLevelGeneration(4, &last));
     RequireProtocolFailure(winexinfo::ipc::AcceptTopLevelGeneration(3, &last));
     WXI_REQUIRE_EQ(last, std::uint64_t{4});
+}
+
+WXI_TEST(ipc_production_window_removal_is_not_tab_update_fallback,
+         "ipc.production.authoritative_window_removal") {
+    std::vector<std::uint8_t> encoded;
+    WXI_REQUIRE(winexinfo::ipc::EncodeWindowRemoveRequest(
+                    21, {0x1000, 44}, &encoded).ok());
+    const auto requestFrame = Decode(encoded);
+    WXI_REQUIRE_EQ(
+        requestFrame.message_type,
+        winexinfo::ipc::MessageType::WindowRemoveRequest);
+    winexinfo::ipc::WindowRemoveRequest request{};
+    WXI_REQUIRE(winexinfo::ipc::DecodeWindowRemoveRequest(
+                    requestFrame, &request).ok());
+    WXI_REQUIRE_EQ(request.top_level_hwnd, std::uint64_t{0x1000});
+    WXI_REQUIRE_EQ(request.top_level_generation, std::uint64_t{44});
+
+    WXI_REQUIRE(winexinfo::ipc::EncodeWindowRemoveResult(
+                    21, {44, 0, {}}, &encoded).ok());
+    const auto resultFrame = Decode(encoded);
+    winexinfo::ipc::WindowRemoveResult result{};
+    WXI_REQUIRE(winexinfo::ipc::DecodeWindowRemoveResult(
+                    resultFrame, 21, 44, &result).ok());
+    WXI_REQUIRE_EQ(result.top_level_generation, std::uint64_t{44});
+
+    std::vector<std::uint8_t> tabUpdate;
+    WXI_REQUIRE(!winexinfo::ipc::EncodeTabSetUpdate(
+                     22, {0x1000, 44, {}}, &tabUpdate).ok());
+    WXI_REQUIRE(!winexinfo::ipc::DecodeWindowRemoveResult(
+                     resultFrame, 22, 44, &result).ok());
+    WXI_REQUIRE(!winexinfo::ipc::DecodeWindowRemoveResult(
+                     resultFrame, 21, 45, &result).ok());
 }

@@ -21,6 +21,7 @@ add_executable(WinExInfoTests
   src/common/utf8.cpp
   src/host/command_line.cpp
   src/host/explorer_controller.cpp
+  src/host/explorer_session.cpp
   src/hook/dll_main.cpp
   src/hook/explorer_layout.cpp
   src/hook/hook_entry.cpp
@@ -51,6 +52,7 @@ add_executable(WinExInfoTests
   tests/event_filter_tests.cpp
   tests/explorer_controller_tests.cpp
   tests/explorer_layout_tests.cpp
+  tests/explorer_session_tests.cpp
   tests/host_manifest_tests.cpp
   tests/hook_injector_tests.cpp
   tests/hook_controller_mode.cpp
@@ -169,6 +171,7 @@ add_executable(WinExInfoHost
   src/common/utf8.cpp
   src/host/command_line.cpp
   src/host/explorer_controller.cpp
+  src/host/explorer_session.cpp
   src/host/main.cpp
   src/host/WinExInfoHost.manifest
   src/injection/hook_platform.cpp

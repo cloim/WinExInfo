@@ -358,7 +358,8 @@ DWORD WINAPI RuntimeWorker(void* const parameter) {
         static_cast<RuntimeContext*>(parameter)};
     std::wstring pipeName;
     UniqueHandle pipe;
-    Status status = ipc::BuildCurrentUserPipeName(&pipeName);
+    Status status = ipc::BuildCurrentUserPipeNameForProcess(
+        context->pid, &pipeName);
     if (status.ok()) {
         status = ipc::ConnectHookPipeClient(pipeName, &pipe);
     }
@@ -379,6 +380,23 @@ DWORD WINAPI RuntimeWorker(void* const parameter) {
         }
         if (ipc::DecodeDetachRequest(request).ok()) {
             detachRequested = true;
+            break;
+        }
+        if (request.message_type == ipc::MessageType::WindowRemoveRequest) {
+            ipc::WindowRemoveRequest removal{};
+            status = ipc::DecodeWindowRemoveRequest(request, &removal);
+            ipc::WindowRemoveResult result{};
+            if (status.ok()) {
+                status = DispatchProcessWindowRemovalByIdentity(
+                    context->process, removal, &result);
+            }
+            std::vector<std::uint8_t> response;
+            if (status.ok()) {
+                status = ipc::EncodeWindowRemoveResult(
+                    request.request_id, result, &response);
+            }
+            if (status.ok()) status = ipc::WriteFrame(pipe.get(), response);
+            if (status.ok()) continue;
             break;
         }
         ipc::TabSetUpdate update{};

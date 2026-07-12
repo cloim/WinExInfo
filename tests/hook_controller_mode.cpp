@@ -490,7 +490,8 @@ int RunHookControllerMode(const HookTestCommand& command) {
         }
         std::wstring pipeName;
         UniqueHandle pipe;
-        if (!ipc::BuildCurrentUserPipeName(&pipeName).ok() ||
+        if (!ipc::BuildCurrentUserPipeNameForProcess(
+                command.target_pid, &pipeName).ok() ||
             !ipc::CreateControllerPipeServer(pipeName, &pipe).ok()) {
             return 3;
         }

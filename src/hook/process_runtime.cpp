@@ -193,6 +193,23 @@ Status DispatchProcessWindowRemoval(ProcessRuntime&r,const WindowRuntimeKey&key)
     DWORD_PTR ignored=0;s=r.operations.send_control(key.top_level,r.control_message,kProcessRuntimeControlMagic,static_cast<LPARAM>(token),SMTO_ABORTIFHUNG|SMTO_BLOCK,5000,&ignored);
     if(!s.ok()||!r.pending_.completed.load(std::memory_order_acquire)){r.retention_required_.store(true,std::memory_order_release);return s.ok()?Fail(ERROR_INVALID_STATE):s;}return r.pending_.status;
 }
+Status DispatchProcessWindowRemovalByIdentity(ProcessRuntime&r,const ipc::WindowRemoveRequest&request,ipc::WindowRemoveResult*out){
+    if(!out||!request.top_level_hwnd||!request.top_level_generation)return Fail(ERROR_INVALID_PARAMETER);
+    *out={request.top_level_generation,ERROR_INVALID_WINDOW_HANDLE,"window runtime removal failed"};
+    const HWND top=reinterpret_cast<HWND>(request.top_level_hwnd);
+    WindowRuntimeKey key{};
+    for(std::size_t i=0;i<kMaximumRuntimeWindows;++i){
+        auto lease=AcquireProcessWindowStorageAt(r,i);
+        if(!lease)continue;
+        const auto&candidate=lease.get()->key;
+        if(candidate.top_level==top&&candidate.generation==request.top_level_generation){key=candidate;break;}
+    }
+    if(!key.top_level)return Ok();
+    const Status removed=DispatchProcessWindowRemoval(r,key);
+    if(removed.ok())*out={request.top_level_generation,0,{}};
+    else *out={request.top_level_generation,removed.win32?removed.win32:ERROR_INVALID_STATE,"window runtime removal failed"};
+    return Ok();
+}
 Status RemoveAllProcessWindows(ProcessRuntime&r){
     Status first=Ok();for(;;){std::size_t chosen=kMaximumRuntimeWindows;std::uint64_t seq=0;
         for(std::size_t i=0;i<kMaximumRuntimeWindows;++i)if(r.occupied_[i]&&r.slots_[i]->creation_sequence>seq){seq=r.slots_[i]->creation_sequence;chosen=i;}if(chosen==kMaximumRuntimeWindows)break;

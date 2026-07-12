@@ -114,6 +114,8 @@ private:
     friend bool HandleProcessRuntimeControlMessageFor(ProcessRuntime&, HWND, UINT, WPARAM, LPARAM) noexcept;
     friend Status DispatchProcessTabSetUpdate(ProcessRuntime&, const ipc::TabSetUpdate&, ipc::TabSetResult*);
     friend Status DispatchProcessWindowRemoval(ProcessRuntime&, const WindowRuntimeKey&);
+    friend Status DispatchProcessWindowRemovalByIdentity(
+        ProcessRuntime&, const ipc::WindowRemoveRequest&, ipc::WindowRemoveResult*);
     friend Status ReapRemovedProcessWindows(ProcessRuntime&, DWORD) noexcept;
     friend Status RemoveAllProcessWindows(ProcessRuntime&);
     friend Status FinalizeProcessWindowsAfterDrain(ProcessRuntime&, DWORD) noexcept;
@@ -155,6 +157,10 @@ private:
 [[nodiscard]] bool HandleProcessRuntimeControlMessageFor(ProcessRuntime&, HWND, UINT, WPARAM, LPARAM) noexcept;
 [[nodiscard]] Status DispatchProcessTabSetUpdate(ProcessRuntime&, const ipc::TabSetUpdate&, ipc::TabSetResult*);
 [[nodiscard]] Status DispatchProcessWindowRemoval(ProcessRuntime&, const WindowRuntimeKey&);
+[[nodiscard]] Status DispatchProcessWindowRemovalByIdentity(
+    ProcessRuntime&,
+    const ipc::WindowRemoveRequest&,
+    ipc::WindowRemoveResult*);
 [[nodiscard]] Status ReapRemovedProcessWindows(ProcessRuntime&, DWORD) noexcept;
 [[nodiscard]] Status RemoveAllProcessWindows(ProcessRuntime&);
 [[nodiscard]] Status FinalizeProcessWindowsAfterDrain(ProcessRuntime&, DWORD) noexcept;

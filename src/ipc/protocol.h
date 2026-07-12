@@ -24,6 +24,8 @@ enum class MessageType : std::uint16_t {
     TabSetResult = 7,
     PaneTextUpdate = 8,
     PaneTextResult = 9,
+    WindowRemoveRequest = 10,
+    WindowRemoveResult = 11,
 };
 
 struct DecodedFrame final {
@@ -94,6 +96,21 @@ struct PaneTextResult final {
     bool operator==(const PaneTextResult&) const = default;
 };
 
+struct WindowRemoveRequest final {
+    std::uint64_t top_level_hwnd = 0;
+    std::uint64_t top_level_generation = 0;
+
+    bool operator==(const WindowRemoveRequest&) const = default;
+};
+
+struct WindowRemoveResult final {
+    std::uint64_t top_level_generation = 0;
+    std::uint32_t result = 0;
+    std::string error_code;
+
+    bool operator==(const WindowRemoveResult&) const = default;
+};
+
 [[nodiscard]] Status EncodeDetachRequest(
     std::uint64_t requestId,
     std::vector<std::uint8_t>* output);
@@ -120,6 +137,14 @@ struct PaneTextResult final {
 [[nodiscard]] Status EncodePaneTextResult(
     std::uint64_t requestId,
     const PaneTextResult& result,
+    std::vector<std::uint8_t>* output);
+[[nodiscard]] Status EncodeWindowRemoveRequest(
+    std::uint64_t requestId,
+    const WindowRemoveRequest& request,
+    std::vector<std::uint8_t>* output);
+[[nodiscard]] Status EncodeWindowRemoveResult(
+    std::uint64_t requestId,
+    const WindowRemoveResult& result,
     std::vector<std::uint8_t>* output);
 
 [[nodiscard]] Status DecodeFrame(
@@ -150,6 +175,14 @@ struct PaneTextResult final {
     std::uint64_t expectedTopLevelGeneration,
     std::uint64_t expectedTabGeneration,
     PaneTextResult* output);
+[[nodiscard]] Status DecodeWindowRemoveRequest(
+    const DecodedFrame& frame,
+    WindowRemoveRequest* output);
+[[nodiscard]] Status DecodeWindowRemoveResult(
+    const DecodedFrame& frame,
+    std::uint64_t expectedRequestId,
+    std::uint64_t expectedTopLevelGeneration,
+    WindowRemoveResult* output);
 
 [[nodiscard]] Status AcceptDetachId(
     std::uint64_t requestId,

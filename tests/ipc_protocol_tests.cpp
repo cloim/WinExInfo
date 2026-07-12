@@ -237,3 +237,14 @@ WXI_TEST(ipc_protocol_error_closes_without_resynchronizing, "ipc.no_resynchroniz
     WXI_REQUIRE(!server);
     WXI_REQUIRE_EQ(decoded.request_id, std::uint64_t{0});
 }
+
+WXI_TEST(ipc_pipe_names_are_isolated_per_explorer_process,
+         "ipc.pipe_name.per_process_isolation") {
+    std::wstring first;
+    std::wstring second;
+    WXI_REQUIRE(winexinfo::ipc::BuildCurrentUserPipeNameForProcess(41, &first).ok());
+    WXI_REQUIRE(winexinfo::ipc::BuildCurrentUserPipeNameForProcess(42, &second).ok());
+    WXI_REQUIRE(first != second);
+    WXI_REQUIRE(first.ends_with(L".41"));
+    WXI_REQUIRE(second.ends_with(L".42"));
+}

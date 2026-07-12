@@ -24,6 +24,9 @@ struct PipeSecurityInspection final {
 };
 
 [[nodiscard]] Status BuildCurrentUserPipeName(std::wstring* output);
+[[nodiscard]] Status BuildCurrentUserPipeNameForProcess(
+    DWORD processId,
+    std::wstring* output);
 [[nodiscard]] Status CreateControllerPipeServer(
     std::wstring_view pipeName,
     UniqueHandle* output);
