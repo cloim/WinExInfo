@@ -54,8 +54,12 @@ bool AllHooksGone(const auto& target) noexcept {
 
 ThreadHookInjector::ThreadHookInjector(
     HookPlatformOperations operations,
-    const std::uint64_t lastAttachId)
-    : operations_(std::move(operations)), last_attach_id_(lastAttachId) {}
+    const std::uint64_t lastAttachId,
+    std::function<void()> beforeRetainedTargetReservation)
+    : operations_(std::move(operations)),
+      last_attach_id_(lastAttachId),
+      before_retained_target_reservation_(
+          std::move(beforeRetainedTargetReservation)) {}
 
 ThreadHookInjector::~ThreadHookInjector() {
     if (!operations_.close_event) {
@@ -63,7 +67,9 @@ ThreadHookInjector::~ThreadHookInjector() {
     }
     for (const auto& [pid, target] : retained_targets_) {
         static_cast<void>(pid);
-        operations_.close_event(target.release_event);
+        if (target.release_event != nullptr) {
+            operations_.close_event(target.release_event);
+        }
     }
 }
 
@@ -96,6 +102,29 @@ Status ThreadHookInjector::Attach(
         return {ErrorCode::HOOK_INSTALL_FAILED, E_OUTOFMEMORY, ERROR_SUCCESS};
     }
 
+    std::map<DWORD, RetainedTarget>::iterator retainedPosition;
+    try {
+        if (before_retained_target_reservation_) {
+            before_retained_target_reservation_();
+        }
+        const auto [position, inserted] =
+            retained_targets_.try_emplace(target.explorer_pid);
+        if (!inserted) {
+            return Failure(ErrorCode::HOOK_INSTALL_FAILED);
+        }
+        retainedPosition = position;
+    } catch (const std::bad_alloc&) {
+        return {ErrorCode::HOOK_INSTALL_FAILED, E_OUTOFMEMORY, ERROR_SUCCESS};
+    }
+    RetainedTarget& retained = retainedPosition->second;
+    const auto eraseCleanReservation = [&]() {
+        if (retained.release_event != nullptr) {
+            operations_.close_event(retained.release_event);
+            retained.release_event = nullptr;
+        }
+        retained_targets_.erase(retainedPosition);
+    };
+
     HookReleaseEvent releaseEvent{};
     const Status created = operations_.create_release_event(
         output->event_name, &releaseEvent);
@@ -108,18 +137,17 @@ Status ThreadHookInjector::Attach(
             releaseEvent.handle != INVALID_HANDLE_VALUE) {
             operations_.close_event(releaseEvent.handle);
         }
+        retained_targets_.erase(retainedPosition);
         return Failure(ErrorCode::HOOK_INSTALL_FAILED);
     }
-    const auto closeReleaseEvent = [&]() {
-        operations_.close_event(releaseEvent.handle);
-        releaseEvent.handle = nullptr;
-    };
+    retained.release_event = releaseEvent.handle;
+    releaseEvent.handle = nullptr;
 
     UINT attachMessage = 0;
     const Status registered = operations_.register_message(
         kAttachMessageName, &attachMessage);
     if (!ExactSuccess(registered) || attachMessage == 0) {
-        closeReleaseEvent();
+        eraseCleanReservation();
         return Failure(ErrorCode::HOOK_INSTALL_FAILED);
     }
     HMODULE module = nullptr;
@@ -127,13 +155,13 @@ Status ThreadHookInjector::Attach(
     const Status resolved = operations_.resolve_hook_export(
         kHookExportName, &module, &procedure);
     if (!ExactSuccess(resolved) || module == nullptr || procedure == nullptr) {
-        closeReleaseEvent();
+        eraseCleanReservation();
         return Failure(ErrorCode::HOOK_INSTALL_FAILED);
     }
     if (operations_.before_set_hook) {
         const Status validated = operations_.before_set_hook();
         if (!ExactSuccess(validated)) {
-            closeReleaseEvent();
+            eraseCleanReservation();
             return ExactValidationFailure(validated);
         }
     }
@@ -141,9 +169,20 @@ Status ThreadHookInjector::Attach(
     const Status installed = operations_.set_hook(
         WH_CALLWNDPROC, procedure, module, target.ui_thread_id, &hook);
     if (!ExactSuccess(installed) || hook == nullptr) {
-        closeReleaseEvent();
+        if (hook != nullptr) {
+            retained.leases[0] = {target.ui_thread_id, hook};
+            retained.lease_count = 1;
+            retained.release_started = true;
+            output->original_status = installed;
+            return installed.ok()
+                ? Failure(ErrorCode::HOOK_INSTALL_FAILED)
+                : installed;
+        }
+        eraseCleanReservation();
         return Failure(ErrorCode::HOOK_INSTALL_FAILED);
     }
+    retained.leases[0] = {target.ui_thread_id, hook};
+    retained.lease_count = 1;
 
     Status primary = Success();
     const Status triggered = operations_.send_message_timeout(
@@ -160,22 +199,19 @@ Status ThreadHookInjector::Attach(
         const Status waited = operations_.wait_attach_result(
             attachId, 5000, &receipt);
         if (!ExactSuccess(waited)) {
-            primary = waited;
+            output->original_status = waited;
+            primary = waited.ok()
+                ? Failure(ErrorCode::WINDOW_ATTACH_FAILED)
+                : waited;
         } else if (!ReceiptMatches(receipt, attachId, target)) {
             primary = Failure(ErrorCode::WINDOW_ATTACH_FAILED);
         }
     }
-    if (!primary.ok()) {
+    if (!ExactSuccess(primary) && !output->original_status.has_value()) {
         output->original_status = primary;
     }
 
-    if (primary.ok()) {
-        RetainedTarget retained{};
-        retained.leases[0] = {target.ui_thread_id, hook};
-        retained.lease_count = 1;
-        retained.release_event = releaseEvent.handle;
-        retained_targets_.emplace(target.explorer_pid, retained);
-        releaseEvent.handle = nullptr;
+    if (ExactSuccess(primary)) {
         output->unload_authorized = true;
         return primary;
     }
@@ -183,40 +219,29 @@ Status ThreadHookInjector::Attach(
     bool unhooked = false;
     const Status released = operations_.unhook(hook, &unhooked);
     if (!ExactSuccess(released) || !unhooked) {
-        RetainedTarget retained{};
-        retained.leases[0] = {target.ui_thread_id, hook};
-        retained.lease_count = 1;
-        retained.release_event = releaseEvent.handle;
         retained.release_started = true;
-        retained_targets_.emplace(target.explorer_pid, retained);
-        releaseEvent.handle = nullptr;
         return Failure(ErrorCode::HOOK_RELEASE_FAILED);
     }
+    retained.leases[0].hook = nullptr;
     output->hook_released = true;
 
     bool signaled = false;
-    const Status eventSet = operations_.set_event(releaseEvent.handle, &signaled);
+    const Status eventSet = operations_.set_event(retained.release_event, &signaled);
     if (!ExactSuccess(eventSet) || !signaled) {
-        RetainedTarget retained{};
-        retained.release_event = releaseEvent.handle;
         retained.release_started = true;
-        retained_targets_.emplace(target.explorer_pid, retained);
-        releaseEvent.handle = nullptr;
-        return Failure(ErrorCode::HOOK_RELEASE_FAILED);
+        return eventSet.ok()
+            ? Failure(ErrorCode::HOOK_RELEASE_FAILED)
+            : eventSet;
     }
+    retained.release_event_signaled = true;
+    retained.release_started = true;
     output->release_event_signaled = true;
 
     if (primary.code == ErrorCode::HOOK_TRIGGER_FAILED) {
-        closeReleaseEvent();
+        eraseCleanReservation();
         return primary;
     }
-    RetainedTarget retained{};
-    retained.release_event = releaseEvent.handle;
-    retained.release_event_signaled = true;
-    retained.release_started = true;
-    retained_targets_.emplace(target.explorer_pid, retained);
-    releaseEvent.handle = nullptr;
-    output->unload_authorized = primary.ok();
+    output->unload_authorized = ExactSuccess(primary);
     return primary;
 }
 
@@ -260,6 +285,14 @@ Status ThreadHookInjector::EnsureThreadHookLease(
     const Status installed = operations_.set_hook(
         WH_CALLWNDPROC, procedure, module, target.ui_thread_id, &hook);
     if (!ExactSuccess(installed) || hook == nullptr) {
+        if (hook != nullptr) {
+            retained.leases[retained.lease_count++] = {
+                target.ui_thread_id, hook};
+            retained.release_started = true;
+            return installed.ok()
+                ? Failure(ErrorCode::HOOK_INSTALL_FAILED)
+                : installed;
+        }
         return Failure(ErrorCode::HOOK_INSTALL_FAILED);
     }
     retained.leases[retained.lease_count++] = {target.ui_thread_id, hook};
@@ -304,7 +337,9 @@ Status ThreadHookInjector::ReleaseHookForDetach(
         bool signaled = false;
         const Status eventSet = operations_.set_event(target.release_event, &signaled);
         if (!ExactSuccess(eventSet) || !signaled) {
-            return Failure(ErrorCode::HOOK_RELEASE_FAILED);
+            return eventSet.ok()
+                ? Failure(ErrorCode::HOOK_RELEASE_FAILED)
+                : eventSet;
         }
         target.release_event_signaled = true;
     }

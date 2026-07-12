@@ -130,3 +130,88 @@ used the status enum as an unset sentinel. Each issue received a focused RED
 test and implementation correction. The final focused/full/Gate B evidence
 above was regenerated after those corrections. Re-review of the corrected
 implementation found no remaining Critical, Important, or Minor findings.
+
+## Review-fix follow-up
+
+### RED
+
+Three additional regressions were added before production changes:
+
+- malformed attach-wait `{OK, S_FALSE, ERROR_BUSY}` must not authorize unload
+  or additional thread leases and must enter safe cleanup;
+- PID retention storage must be reserved before release-event/hook side effects,
+  with an injected `std::bad_alloc` producing `E_OUTOFMEMORY` and zero external
+  calls;
+- an exact non-OK `set_event` tuple must be returned intact and retried without
+  double-unhook.
+
+The first build failed at the deliberately absent allocation seam:
+
+```text
+tests/hook_injector_tests.cpp(287): error C2440
+ThreadHookInjector: function does not take 3 arguments
+```
+
+This was the expected RED: reservation could not be injected and the requested
+pre-side-effect failure contract did not yet exist.
+
+### Correction
+
+- `Attach` now inserts one empty, fixed-capacity `RetainedTarget` before calling
+  release-event creation or either hook installation path. `std::bad_alloc` is
+  caught before external side effects. Every proven-clean early exit closes any
+  event and erases this reservation; uncertain hook/event states retain this
+  same record. No `map::emplace` or other PID insertion remains after a hook
+  installation.
+- Attach authorization now requires the complete exact success tuple. A
+  malformed wait success is diagnosed through `original_status`, canonicalized
+  to `WINDOW_ATTACH_FAILED`, safely unhooked/signaled, retained only for
+  target-gone confirmation, and never made lease-eligible.
+- Detach release preserves an exact non-OK `set_event` status tuple. Only a
+  malformed `OK` tuple or false success output is canonicalized to
+  `HOOK_RELEASE_FAILED`.
+- `ThreadHookInjector` is explicitly documented as externally serialized.
+  Synchronization remains owned by the Task C2 `ExplorerSession`; no implicit
+  concurrency was added here.
+
+### Fresh verification
+
+```text
+hook_injector: passed=32 failed=0
+explorer_controller: passed=20 failed=0
+WinExInfo.Unit: passed=380 failed=0
+WinExInfo.CommandLineGateC: passed=2 failed=0
+CTest: 100% tests passed, 0 failed
+```
+
+Gate B normal and fault:
+
+```text
+GATE_B_PASS iterations=1 target_handles_delta=0 target_threads_delta=0
+controller_handles_delta=0 controller_threads_delta=0 target_exit=0
+GATE_B_FAULT_PASS fault=unhook_failure module_retained=true
+event_signaled=false target_exit=0
+```
+
+### Separate review corrections
+
+Review of the first follow-up commit found two additional Important malformed-
+operation paths. Focused tests were added and observed failing before correction:
+
+```text
+hook_injector.attach_set_event_status: expected PIPE_DISCONNECTED, got generic
+hook_injector.sethook_uncertain_handle: expected retained_target_count=1
+hook_injector.thread_lease_sethook_uncertain_handle: reverse release omitted
+the exposed additional handle
+```
+
+Attach cleanup now preserves an exact non-OK `set_event` tuple while retaining
+the unsignaled event for retry. Initial and additional hook installation now
+retain any non-null `HHOOK` exposed alongside a non-exact result, mark the PID
+release-started, reject more leases, and require explicit reverse release retry.
+Malformed `OK` tuples remain canonicalized to non-OK failures.
+
+The final verification counts above include these three adversarial tests. One
+Gate B normal sample reached the documented safe-source `+31` handle / `+3`
+thread lazy-init signature; the immediate fresh retry produced the recorded
+zero-delta pass, and the fault-retention run passed.

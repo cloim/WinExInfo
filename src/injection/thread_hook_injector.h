@@ -36,9 +36,11 @@ struct HookAttachOutcome final {
 
 class ThreadHookInjector final {
 public:
+    // Calls are externally serialized. ExplorerSession adds synchronization in C2.
     explicit ThreadHookInjector(
         HookPlatformOperations operations,
-        std::uint64_t lastAttachId = 0);
+        std::uint64_t lastAttachId = 0,
+        std::function<void()> beforeRetainedTargetReservation = {});
     ~ThreadHookInjector();
 
     ThreadHookInjector(const ThreadHookInjector&) = delete;
@@ -72,6 +74,7 @@ private:
 
     HookPlatformOperations operations_;
     std::uint64_t last_attach_id_ = 0;
+    std::function<void()> before_retained_target_reservation_;
     std::map<DWORD, RetainedTarget> retained_targets_;
 };
 
