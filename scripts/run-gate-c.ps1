@@ -28,7 +28,6 @@ $uiaReferences = @(
 )
 Add-Type -ReferencedAssemblies $uiaReferences -TypeDefinition @'
 using System;
-using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -50,6 +49,7 @@ public sealed class GateCRect {
 }
 
 public sealed class GateCLayout {
+    public long ActiveTabHwnd;
     public long PaneHwnd;
     public long ParentHwnd;
     public int PanePid;
@@ -82,6 +82,8 @@ public static class GateCHelper {
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetWindowText(IntPtr hwnd, StringBuilder value, int count);
     [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
     [DllImport("user32.dll")] private static extern IntPtr GetParent(IntPtr hwnd);
+    [DllImport("user32.dll")] private static extern IntPtr GetWindow(IntPtr hwnd, uint command);
+    [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr hwnd);
     [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
     [DllImport("user32.dll")] private static extern uint GetDpiForWindow(IntPtr hwnd);
     [DllImport("user32.dll")] private static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
@@ -92,6 +94,8 @@ public static class GateCHelper {
     [DllImport("kernel32.dll")] private static extern void Sleep(uint milliseconds);
 
     private const uint GA_ROOT = 2;
+    private const uint GW_CHILD = 5;
+    private const uint GW_HWNDNEXT = 2;
     private const uint WM_CLOSE = 0x0010;
     private const uint SWP_NOZORDER = 0x0004;
     private const uint SWP_NOACTIVATE = 0x0010;
@@ -118,10 +122,10 @@ public static class GateCHelper {
             Right=(int)Math.Round(value.Right), Bottom=(int)Math.Round(value.Bottom)
         };
     }
-    private static AutomationElement Exact(AutomationElement root, TreeScope scope, params Condition[] conditions) {
+    private static AutomationElement Exact(string label, AutomationElement root, TreeScope scope, params Condition[] conditions) {
         Condition condition = conditions.Length == 1 ? conditions[0] : new AndCondition(conditions);
         AutomationElementCollection matches = root.FindAll(scope, condition);
-        if (matches.Count != 1) throw new InvalidOperationException("UIA exact cardinality was " + matches.Count);
+        if (matches.Count != 1) throw new InvalidOperationException(label + "_cardinality=" + matches.Count);
         return matches[0];
     }
     private static Condition Property(AutomationProperty property, object value) { return new PropertyCondition(property, value); }
@@ -170,29 +174,74 @@ public static class GateCHelper {
         return count;
     }
 
+    private static string DirectChildZOrder(IntPtr top) {
+        StringBuilder result = new StringBuilder();
+        for (IntPtr child=GetWindow(top,GW_CHILD); child!=IntPtr.Zero; child=GetWindow(child,GW_HWNDNEXT))
+            result.Append(child.ToInt64().ToString("X16")).Append(';');
+        return result.ToString();
+    }
+    private static IntPtr ActiveView(IntPtr top, out IntPtr activeTab, out string before) {
+        before=DirectChildZOrder(top);
+        activeTab=IntPtr.Zero;
+        for(IntPtr child=GetWindow(top,GW_CHILD); child!=IntPtr.Zero; child=GetWindow(child,GW_HWNDNEXT)) {
+            if(ClassOf(child)=="ShellTabWindowClass" && IsWindowVisible(child)) { activeTab=child; break; }
+        }
+        if(activeTab==IntPtr.Zero) throw new InvalidOperationException("active_tab_hwnd=0");
+        int viewCount=0;
+        IntPtr view=IntPtr.Zero;
+        EnumWindowsProc callback=delegate(IntPtr child, IntPtr unused) {
+            if(ClassOf(child)=="DUIViewWndClassName") { viewCount++; view=child; }
+            return true;
+        };
+        if(!EnumChildWindows(activeTab,callback,IntPtr.Zero)) throw new InvalidOperationException("active_view_enumeration_failed");
+        GC.KeepAlive(callback);
+        if(viewCount!=1) throw new InvalidOperationException("active_tab_hwnd=0x"+activeTab.ToInt64().ToString("X16")+" active_view_cardinality="+viewCount);
+        if(!IsWindowVisible(activeTab)||!IsWindowVisible(view)) throw new InvalidOperationException("active_tab_or_view_not_visible");
+        return view;
+    }
+
     public static GateCLayout Capture(long topValue) {
         IntPtr top = new IntPtr(topValue);
-        AutomationElement root = AutomationElement.FromHandle(top);
-        AutomationElement status = Exact(root, TreeScope.Descendants,
+        uint topPid;
+        uint topTid=GetWindowThreadProcessId(top,out topPid);
+        IntPtr activeTab;
+        string before;
+        IntPtr activeView=ActiveView(top,out activeTab,out before);
+        AutomationElement root = AutomationElement.FromHandle(activeView);
+        AutomationElement status = Exact("status",root, TreeScope.Descendants,
             Property(AutomationElement.FrameworkIdProperty,"DirectUI"),
             Property(AutomationElement.ControlTypeProperty,ControlType.StatusBar),
             Property(AutomationElement.AutomationIdProperty,"StatusBarModuleInner"),
             Property(AutomationElement.ClassNameProperty,"StatusBarModuleInner"),
             Property(AutomationElement.NativeWindowHandleProperty,0));
-        AutomationElement left = Exact(status, TreeScope.Children,
+        AutomationElement left = Exact("left_group",status, TreeScope.Children,
             Property(AutomationElement.ControlTypeProperty,ControlType.Group),
             Property(AutomationElement.AutomationIdProperty,"System.StatusBarViewItemCount"),
             Property(AutomationElement.NativeWindowHandleProperty,0));
-        AutomationElement right = Exact(status, TreeScope.Children,
+        AutomationElement right = Exact("right_group",status, TreeScope.Children,
             Property(AutomationElement.ControlTypeProperty,ControlType.Group),
             Property(AutomationElement.AutomationIdProperty,"ViewButtonsGroup"),
             Property(AutomationElement.NativeWindowHandleProperty,0));
-        AutomationElement pane = Exact(root, TreeScope.Descendants,
-            Property(AutomationElement.ClassNameProperty,"WinExInfo.StatusPane"));
-        IntPtr paneHwnd = new IntPtr(pane.Current.NativeWindowHandle);
+        int paneCount=0;
+        IntPtr paneHwnd=IntPtr.Zero;
+        EnumWindowsProc paneCallback=delegate(IntPtr child, IntPtr unused) {
+            if(ClassOf(child)=="WinExInfo.StatusPane") { paneCount++; paneHwnd=child; }
+            return true;
+        };
+        if(!EnumChildWindows(top,paneCallback,IntPtr.Zero)) throw new InvalidOperationException("pane_enumeration_failed");
+        GC.KeepAlive(paneCallback);
+        if(paneCount!=1) throw new InvalidOperationException("active_tab_hwnd=0x"+activeTab.ToInt64().ToString("X16")+" active_view_hwnd=0x"+activeView.ToInt64().ToString("X16")+" pane_cardinality="+paneCount);
         IntPtr parentHwnd = GetParent(paneHwnd);
         uint panePid;
         uint paneTid = GetWindowThreadProcessId(paneHwnd, out panePid);
+        uint parentPid;
+        uint parentTid=GetWindowThreadProcessId(parentHwnd,out parentPid);
+        string after=DirectChildZOrder(top);
+        if(before!=after) throw new InvalidOperationException("active_z_order_changed");
+        if(parentHwnd!=activeView || ClassOf(parentHwnd)!="DUIViewWndClassName" ||
+           !IsWindowVisible(activeTab)||!IsWindowVisible(parentHwnd)||!IsWindowVisible(paneHwnd) ||
+           panePid!=topPid||parentPid!=topPid||paneTid!=topTid||parentTid!=topTid)
+            throw new InvalidOperationException("active_tab_hwnd=0x"+activeTab.ToInt64().ToString("X16")+" active_view_hwnd=0x"+activeView.ToInt64().ToString("X16")+" pane_parent_hwnd=0x"+parentHwnd.ToInt64().ToString("X16")+" active_parent_or_identity_mismatch");
         GateCRect parentRect = RectOf(parentHwnd);
         GateCRect statusRect = BoundsOf(status), leftRect = BoundsOf(left), rightRect = BoundsOf(right), paneRect = RectOf(paneHwnd);
         int dpi = (int)GetDpiForWindow(parentHwnd);
@@ -204,7 +253,7 @@ public static class GateCHelper {
             Bottom=Math.Min(parentRect.Bottom,statusRect.Bottom)
         };
         return new GateCLayout {
-            PaneHwnd=paneHwnd.ToInt64(), ParentHwnd=parentHwnd.ToInt64(), PanePid=(int)panePid, PaneTid=(int)paneTid,
+            ActiveTabHwnd=activeTab.ToInt64(), PaneHwnd=paneHwnd.ToInt64(), ParentHwnd=parentHwnd.ToInt64(), PanePid=(int)panePid, PaneTid=(int)paneTid,
             PaneClass=ClassOf(paneHwnd), PaneText=TextOf(paneHwnd), ParentClass=ClassOf(parentHwnd),
             Parent=parentRect, Status=statusRect, LeftGroup=leftRect, RightGroup=rightRect, Pane=paneRect,
             Expected=expected, Dpi=dpi, Overlap=Intersects(paneRect,leftRect)||Intersects(paneRect,rightRect)
@@ -212,12 +261,12 @@ public static class GateCHelper {
     }
     public static int AddAndSwitchTab(long topValue) {
         AutomationElement root = AutomationElement.FromHandle(new IntPtr(topValue));
-        AutomationElement tabView = Exact(root, TreeScope.Descendants,
+        AutomationElement tabView = Exact("tab_view",root, TreeScope.Descendants,
             Property(AutomationElement.FrameworkIdProperty,"XAML"),
             Property(AutomationElement.ControlTypeProperty,ControlType.Tab),
             Property(AutomationElement.AutomationIdProperty,"TabView"),
             Property(AutomationElement.ClassNameProperty,"Microsoft.UI.Xaml.Controls.TabView"));
-        AutomationElement list = Exact(tabView, TreeScope.Children,
+        AutomationElement list = Exact("tab_list",tabView, TreeScope.Children,
             Property(AutomationElement.FrameworkIdProperty,"XAML"),
             Property(AutomationElement.ControlTypeProperty,ControlType.List),
             Property(AutomationElement.AutomationIdProperty,"TabListView"),
@@ -228,7 +277,7 @@ public static class GateCHelper {
             Property(AutomationElement.ClassNameProperty,"ListViewItem"));
         AutomationElementCollection before = list.FindAll(TreeScope.Children,itemCondition);
         if (before.Count != 1) throw new InvalidOperationException("Controlled window did not begin with exactly one tab");
-        AutomationElement add = Exact(root, TreeScope.Descendants,
+        AutomationElement add = Exact("add_button",root, TreeScope.Descendants,
             Property(AutomationElement.FrameworkIdProperty,"XAML"),
             Property(AutomationElement.ControlTypeProperty,ControlType.Button),
             Property(AutomationElement.AutomationIdProperty,"AddButton"),
@@ -246,17 +295,17 @@ public static class GateCHelper {
     }
     public static void RestoreSingleTab(long topValue) {
         AutomationElement root = AutomationElement.FromHandle(new IntPtr(topValue));
-        AutomationElement tabView = Exact(root, TreeScope.Descendants,
+        AutomationElement tabView = Exact("tab_view",root, TreeScope.Descendants,
             Property(AutomationElement.ControlTypeProperty,ControlType.Tab), Property(AutomationElement.AutomationIdProperty,"TabView"),
             Property(AutomationElement.ClassNameProperty,"Microsoft.UI.Xaml.Controls.TabView"));
-        AutomationElement list = Exact(tabView, TreeScope.Children,
+        AutomationElement list = Exact("tab_list",tabView, TreeScope.Children,
             Property(AutomationElement.AutomationIdProperty,"TabListView"), Property(AutomationElement.ClassNameProperty,"ListView"));
         Condition itemCondition = new AndCondition(Property(AutomationElement.ControlTypeProperty,ControlType.TabItem),Property(AutomationElement.ClassNameProperty,"ListViewItem"));
         AutomationElementCollection items=list.FindAll(TreeScope.Children,itemCondition);
         if(items.Count!=2) throw new InvalidOperationException("Expected two tabs before restore");
         ((SelectionItemPattern)items[1].GetCurrentPattern(SelectionItemPattern.Pattern)).Select();
         Sleep(150);
-        AutomationElement close = Exact(items[1], TreeScope.Descendants,
+        AutomationElement close = Exact("close_button",items[1], TreeScope.Descendants,
             Property(AutomationElement.FrameworkIdProperty,"XAML"), Property(AutomationElement.ControlTypeProperty,ControlType.Button),
             Property(AutomationElement.AutomationIdProperty,"CloseButton"), Property(AutomationElement.ClassNameProperty,"Button"));
         ((InvokePattern)close.GetCurrentPattern(InvokePattern.Pattern)).Invoke();
@@ -306,7 +355,7 @@ function Wait-Until([scriptblock]$Condition, [int]$TimeoutMs, [string]$Failure) 
         if ($null -ne $result -and $result -ne $false) { return $result }
         Start-Sleep -Milliseconds 25
     } while ([DateTime]::UtcNow -lt $deadline)
-    throw $Failure
+    throw "$Failure diagnostic=$script:lastLayoutDiagnostic"
 }
 
 function Assert-Layout([GateCLayout]$Layout, [GateCWindowIdentity]$Target, [string]$Stage) {
@@ -316,7 +365,7 @@ function Assert-Layout([GateCLayout]$Layout, [GateCWindowIdentity]$Target, [stri
         $Layout.Pane.ToString() -cne $Layout.Expected.ToString()) {
         throw "Exact pane contract failed at $Stage"
     }
-    Write-Output "LAYOUT stage=$Stage pane_hwnd=0x$($Layout.PaneHwnd.ToString('X16')) parent_hwnd=0x$($Layout.ParentHwnd.ToString('X16')) pid=$($Layout.PanePid) tid=$($Layout.PaneTid) class=$($Layout.PaneClass) text=$($Layout.PaneText -replace ' ','_') dpi=$($Layout.Dpi) parent=$($Layout.Parent) status=$($Layout.Status) left=$($Layout.LeftGroup) right=$($Layout.RightGroup) pane=$($Layout.Pane) expected=$($Layout.Expected) overlap=$($Layout.Overlap.ToString().ToLowerInvariant())"
+    Write-Output "LAYOUT stage=$Stage active_tab_hwnd=0x$($Layout.ActiveTabHwnd.ToString('X16')) pane_hwnd=0x$($Layout.PaneHwnd.ToString('X16')) parent_hwnd=0x$($Layout.ParentHwnd.ToString('X16')) pid=$($Layout.PanePid) tid=$($Layout.PaneTid) class=$($Layout.PaneClass) text=$($Layout.PaneText -replace ' ','_') dpi=$($Layout.Dpi) parent=$($Layout.Parent) status=$($Layout.Status) left=$($Layout.LeftGroup) right=$($Layout.RightGroup) pane=$($Layout.Pane) expected=$($Layout.Expected) overlap=$($Layout.Overlap.ToString().ToLowerInvariant())"
 }
 
 $before = Get-SafetyState
@@ -326,6 +375,7 @@ $originalPlacement = $null
 $hostProcess = $null
 $tabAdded = $false
 $failure = $null
+$script:lastLayoutDiagnostic = 'none'
 Remove-Item -LiteralPath $stdoutPath,$stderrPath -ErrorAction SilentlyContinue
 
 try {
@@ -344,20 +394,20 @@ try {
     $hwndText = '0x' + $controlled.Hwnd.ToString('X16')
     $hostProcess = Start-Process -FilePath $hostExecutable -ArgumentList @('--gate-c-place','--hwnd',$hwndText,'--duration-ms','15000') -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -WindowStyle Hidden -PassThru
     $initial = Wait-Until -TimeoutMs 5000 -Failure 'Pane did not reach exact initial state within 5000ms.' -Condition {
-        try { [GateCHelper]::Capture($controlled.Hwnd) } catch { $null }
+        try { $value=[GateCHelper]::Capture($controlled.Hwnd); $script:lastLayoutDiagnostic='none'; $value } catch { $script:lastLayoutDiagnostic=$_.Exception.Message; $null }
     }
     Assert-Layout $initial $target 'initial'
 
     [GateCHelper]::Resize($controlled.Hwnd, -160, -90)
     $resized = Wait-Until -TimeoutMs 3000 -Failure 'Pane did not reflow after resize within 3000ms.' -Condition {
-        try { $value=[GateCHelper]::Capture($controlled.Hwnd); if ($value.Pane.ToString() -ne $initial.Pane.ToString()) { $value } } catch { $null }
+        try { $value=[GateCHelper]::Capture($controlled.Hwnd); $script:lastLayoutDiagnostic='none'; if ($value.Pane.ToString() -ne $initial.Pane.ToString()) { $value } } catch { $script:lastLayoutDiagnostic=$_.Exception.Message; $null }
     }
     Assert-Layout $resized $target 'resized'
 
     $tabCount = [GateCHelper]::AddAndSwitchTab($controlled.Hwnd)
     $tabAdded = $true
     $switched = Wait-Until -TimeoutMs 3000 -Failure 'Pane did not reach exact state after tab switch within 3000ms.' -Condition {
-        try { [GateCHelper]::Capture($controlled.Hwnd) } catch { $null }
+        try { $value=[GateCHelper]::Capture($controlled.Hwnd); $script:lastLayoutDiagnostic='none'; $value } catch { $script:lastLayoutDiagnostic=$_.Exception.Message; $null }
     }
     Assert-Layout $switched $target 'tab_switched'
     Write-Output "TAB_TRANSITION before=1 after_add=$tabCount selected_original=true selected_added=true"
@@ -366,7 +416,7 @@ try {
     $tabAdded = $false
     [GateCHelper]::Restore($controlled.Hwnd, $originalPlacement)
     $restored = Wait-Until -TimeoutMs 3000 -Failure 'Pane did not reach exact restored state within 3000ms.' -Condition {
-        try { [GateCHelper]::Capture($controlled.Hwnd) } catch { $null }
+        try { $value=[GateCHelper]::Capture($controlled.Hwnd); $script:lastLayoutDiagnostic='none'; $value } catch { $script:lastLayoutDiagnostic=$_.Exception.Message; $null }
     }
     Assert-Layout $restored $target 'restored'
 
