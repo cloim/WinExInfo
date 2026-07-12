@@ -369,7 +369,8 @@ bool HandleStatusPaneRuntimeMessage(
         return false;
     }
     if (message == kStatusPaneRuntimeCleanupMessage) {
-        if (!RemoveAllTabSubclasses(CreateProductionTabSubclassOperations()).ok()) {
+        if (!RemoveAllTabSubclasses(CreateProductionTabSubclassOperations()).ok() ||
+            !TabSubclassCleanupSafe()) {
             return true;
         }
         if (!RuntimeSignalCleanupSafe(context->signal_source)) {

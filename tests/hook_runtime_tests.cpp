@@ -379,6 +379,27 @@ WXI_TEST(hook_runtime_notify_path_is_atomic_only, "hook_runtime.atomic_ingress_s
     WXI_REQUIRE(body.find("WaitFor") == std::string::npos);
 }
 
+WXI_TEST(hook_runtime_tab_cleanup_failure_withholds_cleanup_ack,
+         "hook_runtime.tab_cleanup_retention") {
+    const std::filesystem::path source =
+        std::filesystem::path{__FILE__}.parent_path().parent_path() /
+        "src" / "hook" / "runtime.cpp";
+    std::ifstream stream{source, std::ios::binary};
+    WXI_REQUIRE(stream.good());
+    const std::string text{
+        std::istreambuf_iterator<char>{stream},
+        std::istreambuf_iterator<char>{}};
+    const std::size_t begin = text.find("if (message == kStatusPaneRuntimeCleanupMessage)");
+    const std::size_t end = text.find("if (message == kStatusPaneTabSetMessage)", begin);
+    WXI_REQUIRE(begin != std::string::npos && end != std::string::npos);
+    const std::string body = text.substr(begin, end - begin);
+    const std::size_t cleanup = body.find("RemoveAllTabSubclasses");
+    const std::size_t ack = body.find("SetEvent(context->parent_cleanup_ack");
+    WXI_REQUIRE(cleanup != std::string::npos && ack != std::string::npos);
+    WXI_REQUIRE(cleanup < ack);
+    WXI_REQUIRE(body.find("if (!RemoveAllTabSubclasses") != std::string::npos);
+}
+
 WXI_TEST(hook_runtime_rollback_retains_module_when_pane_cleanup_fails, "hook_runtime.rollback_retention") {
     const HWND child = reinterpret_cast<HWND>(std::uintptr_t{0x610});
     for (const auto path : {

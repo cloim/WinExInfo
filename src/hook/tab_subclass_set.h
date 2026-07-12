@@ -12,6 +12,7 @@
 namespace winexinfo::hook {
 
 inline constexpr UINT_PTR kTabSubclassId = 0x57495832;
+inline constexpr std::size_t kMaximumTabDirectChildren = 4096;
 
 struct TabSubclassOperations final {
     std::function<DWORD()> get_current_thread_id;
@@ -32,6 +33,7 @@ struct TabSubclassOperations final {
     ipc::TabSetResult* result);
 [[nodiscard]] Status RemoveAllTabSubclasses(
     const TabSubclassOperations& operations);
+[[nodiscard]] bool TabSubclassCleanupSafe() noexcept;
 [[nodiscard]] TabSubclassOperations CreateProductionTabSubclassOperations();
 void NotifyTabSubclassMessage(HWND window, UINT message) noexcept;
 

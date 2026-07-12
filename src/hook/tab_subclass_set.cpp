@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -25,6 +26,8 @@ struct TabSubclassState final {
     std::vector<InstalledTab> authoritative;
     std::vector<InstalledTab> installed;
     std::vector<InstalledTab> known_generations;
+    bool lifetime_failed = false;
+    bool cleanup_blocked = false;
 };
 
 TabSubclassState g_tabs;
@@ -92,6 +95,26 @@ const InstalledTab* Find(
     return found == tabs.end() ? nullptr : &*found;
 }
 
+void TrackPossibleCallback(const InstalledTab& tab) {
+    const auto found = std::find_if(
+        g_tabs.installed.begin(), g_tabs.installed.end(),
+        [&](const InstalledTab& candidate) { return candidate.window == tab.window; });
+    if (found == g_tabs.installed.end()) {
+        g_tabs.installed.push_back(tab);
+    } else {
+        *found = tab;
+    }
+}
+
+void ForgetCallback(const HWND window) {
+    const auto found = std::find_if(
+        g_tabs.installed.begin(), g_tabs.installed.end(),
+        [&](const InstalledTab& candidate) { return candidate.window == window; });
+    if (found != g_tabs.installed.end()) {
+        g_tabs.installed.erase(found);
+    }
+}
+
 Status ValidateUpdate(
     const HWND topLevel,
     const ipc::TabSetUpdate& update,
@@ -109,9 +132,15 @@ Status ValidateUpdate(
     }
 
     std::vector<HWND> liveTabs;
+    std::unordered_set<HWND> visited;
+    std::size_t directChildCount = 0;
     for (HWND child = operations.get_first_child(topLevel);
          child != nullptr;
          child = operations.get_next_sibling(child)) {
+        if (++directChildCount > kMaximumTabDirectChildren ||
+            !visited.insert(child).second) {
+            return Failure(ERROR_INVALID_DATA);
+        }
         std::wstring childClass;
         if (!operations.get_class_name(child, &childClass).ok()) {
             return Failure(ERROR_INVALID_WINDOW_HANDLE);
@@ -159,6 +188,9 @@ Status ValidateGenerations(
     if (g_tabs.top_level == nullptr) {
         return Success();
     }
+    if (g_tabs.lifetime_failed || g_tabs.cleanup_blocked) {
+        return Failure(ERROR_INVALID_STATE);
+    }
     if (g_tabs.top_level != topLevel ||
         update.top_level_generation < g_tabs.top_level_generation) {
         return Failure(ERROR_INVALID_STATE);
@@ -170,7 +202,10 @@ Status ValidateGenerations(
     }
     for (const InstalledTab& tab : desired) {
         const InstalledTab* const prior = Find(g_tabs.known_generations, tab.window);
-        if (prior != nullptr && tab.generation < prior->generation) {
+        const InstalledTab* const active = Find(g_tabs.authoritative, tab.window);
+        if (prior != nullptr &&
+            (tab.generation < prior->generation ||
+             (active == nullptr && tab.generation == prior->generation))) {
             return Failure(ERROR_INVALID_STATE);
         }
     }
@@ -188,13 +223,27 @@ Status Rollback(
     const TabSubclassOperations& operations) {
     Status firstFailure = Success();
     for (auto mutation = mutations.rbegin(); mutation != mutations.rend(); ++mutation) {
-        const Status status = mutation->kind == MutationKind::Added
-            ? operations.remove_subclass(mutation->tab.window, kTabSubclassId)
-            : operations.install_subclass(
-                  mutation->tab.window, kTabSubclassId, mutation->tab.generation);
+        Status status{};
+        if (mutation->kind == MutationKind::Added) {
+            status = operations.remove_subclass(
+                mutation->tab.window, kTabSubclassId);
+            if (status.ok()) {
+                ForgetCallback(mutation->tab.window);
+            } else {
+                TrackPossibleCallback(mutation->tab);
+            }
+        } else {
+            status = operations.install_subclass(
+                mutation->tab.window, kTabSubclassId, mutation->tab.generation);
+            TrackPossibleCallback(mutation->tab);
+        }
         if (!status.ok() && firstFailure.ok()) {
             firstFailure = status;
         }
+    }
+    if (!firstFailure.ok()) {
+        g_tabs.lifetime_failed = true;
+        g_tabs.cleanup_blocked = true;
     }
     return firstFailure;
 }
@@ -202,15 +251,20 @@ Status Rollback(
 Status Reconcile(
     const std::vector<InstalledTab>& desired,
     const TabSubclassOperations& operations) {
+    const std::vector<InstalledTab> previousInstalled = g_tabs.installed;
     std::vector<Mutation> mutations;
     const auto fail = [&](const Status original) {
         const Status rollback = Rollback(mutations, operations);
-        return rollback.ok() ? original : rollback;
+        if (rollback.ok()) {
+            g_tabs.installed = previousInstalled;
+            return original;
+        }
+        return rollback;
     };
 
     // Reused HWND values must lose the old generation before the new reference is set.
     for (const InstalledTab& tab : desired) {
-        const InstalledTab* const prior = Find(g_tabs.installed, tab.window);
+        const InstalledTab* const prior = Find(previousInstalled, tab.window);
         if (prior == nullptr || prior->generation == tab.generation) {
             continue;
         }
@@ -219,12 +273,14 @@ Status Reconcile(
         if (!status.ok()) {
             return fail(status);
         }
+        ForgetCallback(old.window);
         mutations.push_back({MutationKind::Removed, old});
         status = operations.install_subclass(
             tab.window, kTabSubclassId, tab.generation);
         if (!status.ok()) {
             return fail(status);
         }
+        TrackPossibleCallback(tab);
         mutations.push_back({MutationKind::Added, tab});
     }
 
@@ -238,9 +294,11 @@ Status Reconcile(
         if (!status.ok()) {
             return fail(status);
         }
+        TrackPossibleCallback(tab);
         mutations.push_back({MutationKind::Added, tab});
     }
-    for (auto tab = g_tabs.installed.rbegin(); tab != g_tabs.installed.rend(); ++tab) {
+    for (auto tab = previousInstalled.rbegin();
+         tab != previousInstalled.rend(); ++tab) {
         if (Find(desired, tab->window) != nullptr) {
             continue;
         }
@@ -248,6 +306,7 @@ Status Reconcile(
         if (!status.ok()) {
             return fail(status);
         }
+        ForgetCallback(tab->window);
         mutations.push_back({MutationKind::Removed, *tab});
     }
 
@@ -338,16 +397,28 @@ Status RemoveAllTabSubclasses(const TabSubclassOperations& operations) {
     if (!operations.remove_subclass) {
         return Failure(ERROR_INVALID_PARAMETER);
     }
-    while (!g_tabs.installed.empty()) {
-        const InstalledTab tab = g_tabs.installed.back();
-        const Status status = operations.remove_subclass(tab.window, kTabSubclassId);
-        if (!status.ok()) {
-            return status;
+    Status firstFailure = Success();
+    const std::vector<InstalledTab> tracked = g_tabs.installed;
+    for (auto tab = tracked.rbegin(); tab != tracked.rend(); ++tab) {
+        const Status status = operations.remove_subclass(
+            tab->window, kTabSubclassId);
+        if (status.ok()) {
+            ForgetCallback(tab->window);
+        } else if (firstFailure.ok()) {
+            firstFailure = status;
         }
-        g_tabs.installed.pop_back();
+    }
+    if (!g_tabs.installed.empty()) {
+        g_tabs.lifetime_failed = true;
+        g_tabs.cleanup_blocked = true;
+        return firstFailure.ok() ? Failure() : firstFailure;
     }
     g_tabs = {};
-    return Success();
+    return firstFailure;
+}
+
+bool TabSubclassCleanupSafe() noexcept {
+    return !g_tabs.lifetime_failed && !g_tabs.cleanup_blocked;
 }
 
 TabSubclassOperations CreateProductionTabSubclassOperations() {
@@ -380,11 +451,10 @@ void NotifyTabSubclassMessage(const HWND window, const UINT message) noexcept {
     if (window == nullptr || message != WM_NCDESTROY) {
         return;
     }
-    const auto found = std::find_if(
-        g_tabs.installed.begin(), g_tabs.installed.end(),
-        [window](const InstalledTab& tab) { return tab.window == window; });
-    if (found != g_tabs.installed.end()) {
-        g_tabs.installed.erase(found);
+    ForgetCallback(window);
+    if (g_tabs.installed.empty()) {
+        g_tabs.lifetime_failed = false;
+        g_tabs.cleanup_blocked = false;
     }
 }
 
