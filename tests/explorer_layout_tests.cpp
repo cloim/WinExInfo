@@ -3,6 +3,9 @@
 #include "test_framework.h"
 
 #include <Windows.h>
+#include <objbase.h>
+#include <UIAutomation.h>
+#include <functional>
 #include <limits>
 
 namespace {
@@ -15,6 +18,31 @@ bool IsEmpty(const RECT& rectangle) {
 bool RectEquals(const RECT& left, const RECT& right) {
     return left.left == right.left && left.top == right.top &&
         left.right == right.right && left.bottom == right.bottom;
+}
+
+HWND Handle(const std::uintptr_t value) {
+    return reinterpret_cast<HWND>(value);
+}
+
+winexinfo::ExplorerLayoutCaptureEvidence ExactCaptureEvidence() {
+    return {
+        {winexinfo::ErrorCode::OK, S_OK, ERROR_SUCCESS},
+        true,
+        Handle(0x300),
+        {100, 100, 1100, 800},
+        96,
+        {
+            {winexinfo::ExplorerLayoutUiaScope::PaneSubtree,
+             L"DirectUI", UIA_StatusBarControlTypeId, L"StatusBarModuleInner",
+             L"StatusBarModuleInner", nullptr, {100, 760, 1100, 800}},
+            {winexinfo::ExplorerLayoutUiaScope::StatusBarChildren,
+             L"DirectUI", UIA_GroupControlTypeId, L"System.StatusBarViewItemCount",
+             L"Element", nullptr, {110, 760, 250, 800}},
+            {winexinfo::ExplorerLayoutUiaScope::StatusBarChildren,
+             L"DirectUI", UIA_GroupControlTypeId, L"ViewButtonsGroup",
+             L"SelectorNoDefault", nullptr, {900, 760, 1090, 800}},
+        },
+    };
 }
 
 }  // namespace
@@ -124,4 +152,228 @@ WXI_TEST(explorer_layout_rejects_invalid_arguments, "explorer_layout.invalid_arg
     WXI_REQUIRE_EQ(
         winexinfo::ComputeStatusPaneRect(zeroDpi, &output).code,
         winexinfo::ErrorCode::INVALID_ARGUMENT);
+}
+
+WXI_TEST(
+    explorer_layout_preserves_output_on_invalid_rectangles,
+    "explorer_layout.transactional_invalid") {
+    const RECT sentinel{11, 22, 33, 44};
+    RECT output = sentinel;
+    WXI_REQUIRE_EQ(
+        winexinfo::ComputeStatusPaneRect(
+            {{100, 0, 0, 100}, {0, 60, 100, 100}, {0, 60, 10, 100},
+             {90, 60, 100, 100}, 96},
+            &output).code,
+        winexinfo::ErrorCode::INVALID_ARGUMENT);
+    WXI_REQUIRE(RectEquals(output, sentinel));
+}
+
+WXI_TEST(explorer_layout_capture_exact_contract, "explorer_layout.capture_exact_contract") {
+    winexinfo::ExplorerLayoutMetrics metrics{};
+    HWND parent = nullptr;
+    WXI_REQUIRE(winexinfo::ValidateExplorerLayoutCapture(
+        ExactCaptureEvidence(), &metrics, &parent).ok());
+    WXI_REQUIRE_EQ(parent, Handle(0x300));
+    WXI_REQUIRE(RectEquals(metrics.parent_screen, RECT{100, 100, 1100, 800}));
+    WXI_REQUIRE(RectEquals(metrics.status_screen, RECT{100, 760, 1100, 800}));
+    WXI_REQUIRE(RectEquals(metrics.left_group_screen, RECT{110, 760, 250, 800}));
+    WXI_REQUIRE(RectEquals(metrics.right_group_screen, RECT{900, 760, 1090, 800}));
+    WXI_REQUIRE_EQ(metrics.dpi, UINT{96});
+}
+
+WXI_TEST(
+    explorer_layout_capture_rejects_cardinality_and_scope,
+    "explorer_layout.capture_selector_contract") {
+    const winexinfo::ExplorerLayoutMetrics sentinel{
+        {1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}, {13, 14, 15, 16}, 144};
+    const HWND sentinelParent = Handle(0x999);
+
+    auto duplicate = ExactCaptureEvidence();
+    duplicate.elements.push_back(duplicate.elements[0]);
+    winexinfo::ExplorerLayoutMetrics metrics = sentinel;
+    HWND parent = sentinelParent;
+    WXI_REQUIRE_EQ(
+        winexinfo::ValidateExplorerLayoutCapture(duplicate, &metrics, &parent).code,
+        winexinfo::ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH);
+    WXI_REQUIRE(RectEquals(metrics.parent_screen, sentinel.parent_screen));
+    WXI_REQUIRE_EQ(parent, sentinelParent);
+
+    auto wrongScope = ExactCaptureEvidence();
+    wrongScope.elements[1].scope = winexinfo::ExplorerLayoutUiaScope::PaneSubtree;
+    metrics = sentinel;
+    parent = sentinelParent;
+    WXI_REQUIRE_EQ(
+        winexinfo::ValidateExplorerLayoutCapture(wrongScope, &metrics, &parent).code,
+        winexinfo::ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH);
+    WXI_REQUIRE(RectEquals(metrics.parent_screen, sentinel.parent_screen));
+    WXI_REQUIRE_EQ(parent, sentinelParent);
+
+    auto alternateSelector = ExactCaptureEvidence();
+    alternateSelector.elements[0].automation_id = L"StatusBar";
+    metrics = sentinel;
+    parent = sentinelParent;
+    WXI_REQUIRE_EQ(
+        winexinfo::ValidateExplorerLayoutCapture(
+            alternateSelector, &metrics, &parent).code,
+        winexinfo::ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH);
+    WXI_REQUIRE(RectEquals(metrics.parent_screen, sentinel.parent_screen));
+    WXI_REQUIRE_EQ(parent, sentinelParent);
+
+    auto nativeGroup = ExactCaptureEvidence();
+    nativeGroup.elements[2].native_window_handle = Handle(0x444);
+    metrics = sentinel;
+    parent = sentinelParent;
+    WXI_REQUIRE_EQ(
+        winexinfo::ValidateExplorerLayoutCapture(nativeGroup, &metrics, &parent).code,
+        winexinfo::ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH);
+    WXI_REQUIRE(RectEquals(metrics.parent_screen, sentinel.parent_screen));
+    WXI_REQUIRE_EQ(parent, sentinelParent);
+}
+
+WXI_TEST(explorer_layout_capture_requires_mta, "explorer_layout.capture_requires_mta") {
+    auto evidence = ExactCaptureEvidence();
+    evidence.executed_in_mta = false;
+    winexinfo::ExplorerLayoutMetrics metrics{
+        {1, 2, 3, 4}, {}, {}, {}, 144};
+    HWND parent = Handle(0x999);
+    WXI_REQUIRE_EQ(
+        winexinfo::ValidateExplorerLayoutCapture(evidence, &metrics, &parent).code,
+        winexinfo::ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH);
+    WXI_REQUIRE(RectEquals(metrics.parent_screen, RECT{1, 2, 3, 4}));
+    WXI_REQUIRE_EQ(parent, Handle(0x999));
+}
+
+WXI_TEST(
+    explorer_layout_capture_runs_on_bounded_worker,
+    "explorer_layout.capture_bounded_worker") {
+    DWORD observedTimeout = 0;
+    winexinfo::ExplorerLayoutCaptureOperations operations{
+        [&](const HWND, winexinfo::ExplorerLayoutCaptureEvidence* const evidence) {
+            *evidence = ExactCaptureEvidence();
+            return winexinfo::Status{winexinfo::ErrorCode::OK, S_OK, ERROR_SUCCESS};
+        },
+        [&](winexinfo::ExplorerLayoutMtaTask task, const DWORD timeout) {
+            observedTimeout = timeout;
+            task({winexinfo::ErrorCode::OK, S_OK, ERROR_SUCCESS});
+            return winexinfo::Status{winexinfo::ErrorCode::OK, S_OK, ERROR_SUCCESS};
+        },
+    };
+    winexinfo::ExplorerLayoutMetrics metrics{};
+    HWND parent = nullptr;
+    WXI_REQUIRE(winexinfo::CaptureExplorerLayoutWithOperations(
+        Handle(0x100), &metrics, &parent, operations).ok());
+    WXI_REQUIRE_EQ(observedTimeout, winexinfo::kExplorerLayoutCaptureTimeoutMs);
+    WXI_REQUIRE_EQ(parent, Handle(0x300));
+}
+
+WXI_TEST(
+    explorer_layout_production_worker_is_mta,
+    "explorer_layout.capture_production_mta") {
+    const DWORD callerThread = GetCurrentThreadId();
+    DWORD captureThread = callerThread;
+    winexinfo::ExplorerLayoutCaptureOperations operations =
+        winexinfo::GetProductionExplorerLayoutCaptureOperations();
+    operations.capture_current_thread =
+        [&](const HWND, winexinfo::ExplorerLayoutCaptureEvidence* const evidence) {
+            captureThread = GetCurrentThreadId();
+            *evidence = ExactCaptureEvidence();
+            APTTYPE apartmentType = APTTYPE_CURRENT;
+            APTTYPEQUALIFIER qualifier = APTTYPEQUALIFIER_NONE;
+            evidence->executed_in_mta =
+                CoGetApartmentType(&apartmentType, &qualifier) == S_OK &&
+                apartmentType == APTTYPE_MTA;
+            return winexinfo::Status{
+                winexinfo::ErrorCode::OK, S_OK, ERROR_SUCCESS};
+        };
+
+    winexinfo::ExplorerLayoutMetrics metrics{};
+    HWND parent = nullptr;
+    WXI_REQUIRE(winexinfo::CaptureExplorerLayoutWithOperations(
+        Handle(0x100), &metrics, &parent, operations).ok());
+    WXI_REQUIRE(captureThread != callerThread);
+    WXI_REQUIRE_EQ(parent, Handle(0x300));
+}
+
+WXI_TEST(
+    explorer_layout_capture_timeout_is_transactional_and_heap_safe,
+    "explorer_layout.capture_timeout") {
+    winexinfo::ExplorerLayoutMtaTask delayedTask;
+    DWORD observedTimeout = 0;
+    winexinfo::ExplorerLayoutCaptureOperations operations{
+        [](const HWND, winexinfo::ExplorerLayoutCaptureEvidence* const evidence) {
+            *evidence = ExactCaptureEvidence();
+            return winexinfo::Status{winexinfo::ErrorCode::OK, S_OK, ERROR_SUCCESS};
+        },
+        [&](winexinfo::ExplorerLayoutMtaTask task, const DWORD timeout) {
+            observedTimeout = timeout;
+            delayedTask = std::move(task);
+            return winexinfo::Status{
+                winexinfo::ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH,
+                HRESULT_FROM_WIN32(ERROR_TIMEOUT),
+                ERROR_TIMEOUT};
+        },
+    };
+    const winexinfo::ExplorerLayoutMetrics sentinel{
+        {1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}, {13, 14, 15, 16}, 144};
+    winexinfo::ExplorerLayoutMetrics metrics = sentinel;
+    HWND parent = Handle(0x999);
+    const winexinfo::Status status = winexinfo::CaptureExplorerLayoutWithOperations(
+        Handle(0x100), &metrics, &parent, operations);
+    WXI_REQUIRE_EQ(status.win32, DWORD{ERROR_TIMEOUT});
+    WXI_REQUIRE_EQ(observedTimeout, winexinfo::kExplorerLayoutCaptureTimeoutMs);
+    WXI_REQUIRE(RectEquals(metrics.parent_screen, sentinel.parent_screen));
+    WXI_REQUIRE_EQ(parent, Handle(0x999));
+
+    WXI_REQUIRE(static_cast<bool>(delayedTask));
+    delayedTask({winexinfo::ErrorCode::OK, S_OK, ERROR_SUCCESS});
+    WXI_REQUIRE(RectEquals(metrics.parent_screen, sentinel.parent_screen));
+    WXI_REQUIRE_EQ(parent, Handle(0x999));
+}
+
+WXI_TEST(
+    explorer_layout_capture_failure_is_transactional,
+    "explorer_layout.capture_failure_transactional") {
+    winexinfo::ExplorerLayoutCaptureOperations operations{
+        [](const HWND, winexinfo::ExplorerLayoutCaptureEvidence*) {
+            return winexinfo::Status{
+                winexinfo::ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH,
+                static_cast<HRESULT>(UIA_E_ELEMENTNOTAVAILABLE),
+                ERROR_SUCCESS};
+        },
+        [](winexinfo::ExplorerLayoutMtaTask task, const DWORD) {
+            task({winexinfo::ErrorCode::OK, S_OK, ERROR_SUCCESS});
+            return winexinfo::Status{
+                winexinfo::ErrorCode::OK, S_OK, ERROR_SUCCESS};
+        },
+    };
+    const winexinfo::ExplorerLayoutMetrics sentinel{
+        {1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}, {13, 14, 15, 16}, 144};
+    winexinfo::ExplorerLayoutMetrics metrics = sentinel;
+    HWND parent = Handle(0x999);
+    const winexinfo::Status status = winexinfo::CaptureExplorerLayoutWithOperations(
+        Handle(0x100), &metrics, &parent, operations);
+    WXI_REQUIRE_EQ(status.hresult, static_cast<HRESULT>(UIA_E_ELEMENTNOTAVAILABLE));
+    WXI_REQUIRE(RectEquals(metrics.parent_screen, sentinel.parent_screen));
+    WXI_REQUIRE_EQ(parent, Handle(0x999));
+}
+
+WXI_TEST(
+    explorer_layout_preserves_output_on_client_overflow,
+    "explorer_layout.transactional_overflow") {
+    const RECT sentinel{11, 22, 33, 44};
+    RECT output = sentinel;
+    WXI_REQUIRE_EQ(
+        winexinfo::ComputeStatusPaneRect(
+            {{(std::numeric_limits<LONG>::min)(), 0,
+              (std::numeric_limits<LONG>::max)(), 100},
+             {(std::numeric_limits<LONG>::min)(), 60,
+              (std::numeric_limits<LONG>::max)(), 100},
+             {(std::numeric_limits<LONG>::min)(), 60,
+              (std::numeric_limits<LONG>::min)(), 100},
+             {(std::numeric_limits<LONG>::max)(), 60,
+              (std::numeric_limits<LONG>::max)(), 100},
+             96},
+            &output).code,
+        winexinfo::ErrorCode::INVALID_ARGUMENT);
+    WXI_REQUIRE(RectEquals(output, sentinel));
 }

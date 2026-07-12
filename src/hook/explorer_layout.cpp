@@ -9,8 +9,8 @@
 #include <cstdint>
 #include <limits>
 #include <new>
+#include <memory>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -240,7 +240,7 @@ Status ReadElementArray(
 Status CaptureUiaMetrics(
     IUIAutomation* const automation,
     const HWND paneParent,
-    ExplorerLayoutMetrics* const metrics) {
+    ExplorerLayoutCaptureEvidence* const evidence) {
     ComPtr<IUIAutomationCacheRequest> request;
     HRESULT hresult = automation->CreateCacheRequest(&request);
     Status status = RequireExactSuccess(hresult, request != nullptr);
@@ -298,6 +298,15 @@ Status CaptureUiaMetrics(
 
     std::vector<CachedElement*> statusMatches;
     for (CachedElement& element : statusElements) {
+        evidence->elements.push_back({
+            ExplorerLayoutUiaScope::PaneSubtree,
+            element.framework_id,
+            element.control_type,
+            element.automation_id,
+            element.class_name,
+            element.native_window_handle,
+            element.bounds,
+        });
         if (element.framework_id == L"DirectUI" &&
             element.control_type == UIA_StatusBarControlTypeId &&
             element.automation_id == L"StatusBarModuleInner" &&
@@ -307,7 +316,7 @@ Status CaptureUiaMetrics(
         }
     }
     if (statusMatches.size() != 1) {
-        return ContractMismatch(S_FALSE);
+        return {ErrorCode::OK, S_OK, ERROR_SUCCESS};
     }
 
     ComPtr<IUIAutomationElementArray> groupArray;
@@ -323,44 +332,33 @@ Status CaptureUiaMetrics(
         return status;
     }
 
-    std::vector<CachedElement*> leftMatches;
-    std::vector<CachedElement*> rightMatches;
     for (CachedElement& element : groups) {
-        if (element.control_type != UIA_GroupControlTypeId ||
-            element.native_window_handle != nullptr) {
-            continue;
-        }
-        if (element.automation_id == L"System.StatusBarViewItemCount") {
-            leftMatches.push_back(&element);
-        }
-        if (element.automation_id == L"ViewButtonsGroup") {
-            rightMatches.push_back(&element);
-        }
+        evidence->elements.push_back({
+            ExplorerLayoutUiaScope::StatusBarChildren,
+            element.framework_id,
+            element.control_type,
+            element.automation_id,
+            element.class_name,
+            element.native_window_handle,
+            element.bounds,
+        });
     }
-    if (leftMatches.size() != 1 || rightMatches.size() != 1) {
-        return ContractMismatch(S_FALSE);
-    }
-
-    metrics->status_screen = statusMatches[0]->bounds;
-    metrics->left_group_screen = leftMatches[0]->bounds;
-    metrics->right_group_screen = rightMatches[0]->bounds;
     return {ErrorCode::OK, S_OK, ERROR_SUCCESS};
 }
 
-Status CaptureExplorerLayoutOnMta(
+Status CaptureExplorerLayoutCurrentThread(
     const HWND topLevel,
-    ExplorerLayoutMetrics* const metrics,
-    HWND* const paneParent) {
-    const HRESULT initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    Status status = RequireExactSuccess(initialized);
+    ExplorerLayoutCaptureEvidence* const evidence) {
+    APTTYPE apartmentType = APTTYPE_CURRENT;
+    APTTYPEQUALIFIER qualifier = APTTYPEQUALIFIER_NONE;
+    Status status = RequireExactSuccess(CoGetApartmentType(&apartmentType, &qualifier));
     if (!status.ok()) {
         return status;
     }
-    struct ApartmentScope final {
-        ~ApartmentScope() {
-            CoUninitialize();
-        }
-    } apartmentScope;
+    if (apartmentType != APTTYPE_MTA) {
+        return ContractMismatch(RPC_E_WRONG_THREAD);
+    }
+    evidence->executed_in_mta = true;
 
     ComPtr<IUIAutomation> automation;
     const HRESULT created = CoCreateInstance(
@@ -370,9 +368,9 @@ Status CaptureExplorerLayoutOnMta(
         IID_PPV_ARGS(&automation));
     status = RequireExactSuccess(created, automation != nullptr);
     if (status.ok()) {
-        status = SelectPaneParent(topLevel, paneParent);
+        status = SelectPaneParent(topLevel, &evidence->pane_parent);
     }
-    if (status.ok() && !GetWindowRect(*paneParent, &metrics->parent_screen)) {
+    if (status.ok() && !GetWindowRect(evidence->pane_parent, &evidence->parent_screen)) {
         DWORD error = GetLastError();
         if (error == ERROR_SUCCESS) {
             error = ERROR_INVALID_WINDOW_HANDLE;
@@ -380,8 +378,8 @@ Status CaptureExplorerLayoutOnMta(
         status = Win32Mismatch(error);
     }
     if (status.ok()) {
-        metrics->dpi = GetDpiForWindow(*paneParent);
-        if (metrics->dpi == 0) {
+        evidence->dpi = GetDpiForWindow(evidence->pane_parent);
+        if (evidence->dpi == 0) {
             DWORD error = GetLastError();
             if (error == ERROR_SUCCESS) {
                 error = ERROR_INVALID_WINDOW_HANDLE;
@@ -390,9 +388,91 @@ Status CaptureExplorerLayoutOnMta(
         }
     }
     if (status.ok()) {
-        status = CaptureUiaMetrics(automation.Get(), *paneParent, metrics);
+        status = CaptureUiaMetrics(automation.Get(), evidence->pane_parent, evidence);
     }
     return status;
+}
+
+struct ProductionWorkerState final {
+    HANDLE completion = nullptr;
+    HMODULE module = nullptr;
+    ExplorerLayoutMtaTask task;
+
+    ~ProductionWorkerState() {
+        if (completion != nullptr) {
+            CloseHandle(completion);
+        }
+    }
+};
+
+DWORD WINAPI ProductionMtaThreadProc(void* const parameter) {
+    std::unique_ptr<std::shared_ptr<ProductionWorkerState>> holder{
+        static_cast<std::shared_ptr<ProductionWorkerState>*>(parameter)};
+    std::shared_ptr<ProductionWorkerState> state = *holder;
+    holder.reset();
+
+    const HRESULT initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const Status apartmentStatus = RequireExactSuccess(initialized);
+    try {
+        state->task(apartmentStatus);
+    } catch (...) {
+    }
+    if (apartmentStatus.ok()) {
+        CoUninitialize();
+    }
+    static_cast<void>(SetEvent(state->completion));
+
+    const HMODULE module = state->module;
+    state.reset();
+    FreeLibraryAndExitThread(module, 0);
+}
+
+Status RunProductionMtaWorker(ExplorerLayoutMtaTask task, const DWORD timeoutMs) {
+    std::shared_ptr<ProductionWorkerState> state;
+    try {
+        state = std::make_shared<ProductionWorkerState>();
+        state->task = std::move(task);
+    } catch (const std::bad_alloc&) {
+        return ContractMismatch(E_OUTOFMEMORY, ERROR_NOT_ENOUGH_MEMORY);
+    } catch (...) {
+        return ContractMismatch(E_FAIL);
+    }
+
+    state->completion = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (state->completion == nullptr) {
+        return Win32Mismatch(GetLastError());
+    }
+    if (!GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            reinterpret_cast<LPCWSTR>(&ProductionMtaThreadProc),
+            &state->module)) {
+        return Win32Mismatch(GetLastError());
+    }
+
+    auto* const parameter = new (std::nothrow) std::shared_ptr<ProductionWorkerState>{state};
+    if (parameter == nullptr) {
+        FreeLibrary(state->module);
+        return ContractMismatch(E_OUTOFMEMORY, ERROR_NOT_ENOUGH_MEMORY);
+    }
+    const HANDLE thread = CreateThread(
+        nullptr, 0, &ProductionMtaThreadProc, parameter, 0, nullptr);
+    if (thread == nullptr) {
+        const DWORD error = GetLastError();
+        delete parameter;
+        FreeLibrary(state->module);
+        return Win32Mismatch(error);
+    }
+    CloseHandle(thread);
+
+    const DWORD waitResult = WaitForSingleObject(state->completion, timeoutMs);
+    if (waitResult == WAIT_OBJECT_0) {
+        return {ErrorCode::OK, S_OK, ERROR_SUCCESS};
+    }
+    if (waitResult == WAIT_TIMEOUT) {
+        return ContractMismatch(HRESULT_FROM_WIN32(ERROR_TIMEOUT), ERROR_TIMEOUT);
+    }
+    const DWORD error = GetLastError();
+    return Win32Mismatch(error == ERROR_SUCCESS ? ERROR_INVALID_FUNCTION : error);
 }
 
 }  // namespace
@@ -403,8 +483,6 @@ Status ComputeStatusPaneRect(
     if (output == nullptr || metrics.dpi == 0) {
         return {ErrorCode::INVALID_ARGUMENT, E_INVALIDARG, ERROR_INVALID_PARAMETER};
     }
-    *output = {};
-
     const auto valid = [](const RECT& rectangle) {
         return rectangle.left <= rectangle.right && rectangle.top <= rectangle.bottom;
     };
@@ -427,6 +505,7 @@ Status ComputeStatusPaneRect(
     const std::int64_t screenBottom =
         std::min<std::int64_t>(metrics.parent_screen.bottom, metrics.status_screen.bottom);
     if (screenRight - screenLeft < minimumWidth || screenBottom <= screenTop) {
+        *output = {};
         return {ErrorCode::OK, S_OK, ERROR_SUCCESS};
     }
 
@@ -458,29 +537,121 @@ Status CaptureExplorerLayout(
         return ContractMismatch(E_INVALIDARG, ERROR_INVALID_PARAMETER);
     }
 
-    ExplorerLayoutMetrics captured{};
-    HWND capturedParent = nullptr;
-    Status status{ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH, E_FAIL, ERROR_SUCCESS};
-    try {
-        std::thread worker([&]() {
-            try {
-                status = CaptureExplorerLayoutOnMta(topLevel, &captured, &capturedParent);
-            } catch (const std::bad_alloc&) {
-                status = ContractMismatch(E_OUTOFMEMORY, ERROR_NOT_ENOUGH_MEMORY);
-            } catch (...) {
-                status = ContractMismatch(E_FAIL);
-            }
-        });
-        worker.join();
-    } catch (...) {
-        return ContractMismatch(E_OUTOFMEMORY, ERROR_NOT_ENOUGH_MEMORY);
+    const ExplorerLayoutCaptureOperations operations =
+        GetProductionExplorerLayoutCaptureOperations();
+    return CaptureExplorerLayoutWithOperations(topLevel, metrics, paneParent, operations);
+}
+
+ExplorerLayoutCaptureOperations GetProductionExplorerLayoutCaptureOperations() {
+    return {
+        &CaptureExplorerLayoutCurrentThread,
+        &RunProductionMtaWorker,
+    };
+}
+
+Status ValidateExplorerLayoutCapture(
+    const ExplorerLayoutCaptureEvidence& evidence,
+    ExplorerLayoutMetrics* const metrics,
+    HWND* const paneParent) {
+    if (metrics == nullptr || paneParent == nullptr) {
+        return ContractMismatch(E_INVALIDARG, ERROR_INVALID_PARAMETER);
     }
-    if (!status.ok()) {
-        return status;
+    if (!evidence.capture_status.ok()) {
+        return evidence.capture_status;
     }
+    if (!evidence.executed_in_mta || evidence.pane_parent == nullptr || evidence.dpi == 0) {
+        return ContractMismatch(S_FALSE);
+    }
+
+    std::vector<const ExplorerLayoutUiaElementEvidence*> statusMatches;
+    std::vector<const ExplorerLayoutUiaElementEvidence*> leftMatches;
+    std::vector<const ExplorerLayoutUiaElementEvidence*> rightMatches;
+    for (const ExplorerLayoutUiaElementEvidence& element : evidence.elements) {
+        if (element.scope == ExplorerLayoutUiaScope::PaneSubtree &&
+            element.framework_id == L"DirectUI" &&
+            element.control_type == UIA_StatusBarControlTypeId &&
+            element.automation_id == L"StatusBarModuleInner" &&
+            element.class_name == L"StatusBarModuleInner" &&
+            element.native_window_handle == nullptr) {
+            statusMatches.push_back(&element);
+        }
+        if (element.scope == ExplorerLayoutUiaScope::StatusBarChildren &&
+            element.control_type == UIA_GroupControlTypeId &&
+            element.automation_id == L"System.StatusBarViewItemCount" &&
+            element.native_window_handle == nullptr) {
+            leftMatches.push_back(&element);
+        }
+        if (element.scope == ExplorerLayoutUiaScope::StatusBarChildren &&
+            element.control_type == UIA_GroupControlTypeId &&
+            element.automation_id == L"ViewButtonsGroup" &&
+            element.native_window_handle == nullptr) {
+            rightMatches.push_back(&element);
+        }
+    }
+    if (statusMatches.size() != 1 || leftMatches.size() != 1 || rightMatches.size() != 1) {
+        return ContractMismatch(S_FALSE);
+    }
+
+    ExplorerLayoutMetrics captured{
+        evidence.parent_screen,
+        statusMatches[0]->bounds,
+        leftMatches[0]->bounds,
+        rightMatches[0]->bounds,
+        evidence.dpi,
+    };
     *metrics = captured;
-    *paneParent = capturedParent;
-    return status;
+    *paneParent = evidence.pane_parent;
+    return {ErrorCode::OK, S_OK, ERROR_SUCCESS};
+}
+
+Status CaptureExplorerLayoutWithOperations(
+    const HWND topLevel,
+    ExplorerLayoutMetrics* const metrics,
+    HWND* const paneParent,
+    const ExplorerLayoutCaptureOperations& operations) {
+    if (topLevel == nullptr || metrics == nullptr || paneParent == nullptr ||
+        !operations.capture_current_thread || !operations.run_mta_worker) {
+        return ContractMismatch(E_INVALIDARG, ERROR_INVALID_PARAMETER);
+    }
+
+    std::shared_ptr<ExplorerLayoutCaptureEvidence> evidence;
+    try {
+        evidence = std::make_shared<ExplorerLayoutCaptureEvidence>(
+            ExplorerLayoutCaptureEvidence{
+                {ErrorCode::EXPLORER_UI_CONTRACT_MISMATCH, E_FAIL, ERROR_SUCCESS},
+                false,
+                nullptr,
+                {},
+                0,
+                {},
+            });
+        const auto capture = operations.capture_current_thread;
+        const ExplorerLayoutMtaTask task = [evidence, capture, topLevel](
+                                               const Status apartmentStatus) {
+            if (!apartmentStatus.ok()) {
+                evidence->capture_status = apartmentStatus;
+                return;
+            }
+            try {
+                evidence->capture_status = capture(topLevel, evidence.get());
+            } catch (const std::bad_alloc&) {
+                evidence->capture_status =
+                    ContractMismatch(E_OUTOFMEMORY, ERROR_NOT_ENOUGH_MEMORY);
+            } catch (...) {
+                evidence->capture_status = ContractMismatch(E_FAIL);
+            }
+        };
+        const Status waitStatus = operations.run_mta_worker(
+            task, kExplorerLayoutCaptureTimeoutMs);
+        if (!waitStatus.ok()) {
+            return waitStatus;
+        }
+    } catch (const std::bad_alloc&) {
+        return ContractMismatch(E_OUTOFMEMORY, ERROR_NOT_ENOUGH_MEMORY);
+    } catch (...) {
+        return ContractMismatch(E_FAIL);
+    }
+    return ValidateExplorerLayoutCapture(*evidence, metrics, paneParent);
 }
 
 }  // namespace winexinfo

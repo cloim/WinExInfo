@@ -4,6 +4,10 @@
 
 #include <Windows.h>
 
+#include <functional>
+#include <string>
+#include <vector>
+
 namespace winexinfo {
 
 struct ExplorerLayoutMetrics final {
@@ -14,6 +18,39 @@ struct ExplorerLayoutMetrics final {
     UINT dpi = 96;
 };
 
+enum class ExplorerLayoutUiaScope {
+    PaneSubtree,
+    StatusBarChildren,
+};
+
+struct ExplorerLayoutUiaElementEvidence final {
+    ExplorerLayoutUiaScope scope;
+    std::wstring framework_id;
+    LONG control_type;
+    std::wstring automation_id;
+    std::wstring class_name;
+    void* native_window_handle;
+    RECT bounds;
+};
+
+struct ExplorerLayoutCaptureEvidence final {
+    Status capture_status;
+    bool executed_in_mta;
+    HWND pane_parent;
+    RECT parent_screen;
+    UINT dpi;
+    std::vector<ExplorerLayoutUiaElementEvidence> elements;
+};
+
+using ExplorerLayoutMtaTask = std::function<void(Status)>;
+
+struct ExplorerLayoutCaptureOperations final {
+    std::function<Status(HWND, ExplorerLayoutCaptureEvidence*)> capture_current_thread;
+    std::function<Status(ExplorerLayoutMtaTask, DWORD)> run_mta_worker;
+};
+
+inline constexpr DWORD kExplorerLayoutCaptureTimeoutMs = 5000;
+
 [[nodiscard]] Status ComputeStatusPaneRect(
     const ExplorerLayoutMetrics& metrics,
     RECT* output) noexcept;
@@ -21,5 +58,15 @@ struct ExplorerLayoutMetrics final {
     HWND topLevel,
     ExplorerLayoutMetrics* metrics,
     HWND* paneParent);
+[[nodiscard]] Status ValidateExplorerLayoutCapture(
+    const ExplorerLayoutCaptureEvidence& evidence,
+    ExplorerLayoutMetrics* metrics,
+    HWND* paneParent);
+[[nodiscard]] Status CaptureExplorerLayoutWithOperations(
+    HWND topLevel,
+    ExplorerLayoutMetrics* metrics,
+    HWND* paneParent,
+    const ExplorerLayoutCaptureOperations& operations);
+[[nodiscard]] ExplorerLayoutCaptureOperations GetProductionExplorerLayoutCaptureOperations();
 
 }  // namespace winexinfo
