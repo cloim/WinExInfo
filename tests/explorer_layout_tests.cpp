@@ -7,6 +7,7 @@
 #include <UIAutomation.h>
 #include <functional>
 #include <limits>
+#include <atomic>
 
 namespace {
 
@@ -355,6 +356,105 @@ WXI_TEST(
     WXI_REQUIRE_EQ(status.hresult, static_cast<HRESULT>(UIA_E_ELEMENTNOTAVAILABLE));
     WXI_REQUIRE(RectEquals(metrics.parent_screen, sentinel.parent_screen));
     WXI_REQUIRE_EQ(parent, Handle(0x999));
+}
+
+WXI_TEST(
+    explorer_layout_worker_module_release_paths,
+    "explorer_layout.worker_module_paths") {
+    const HMODULE executable = reinterpret_cast<HMODULE>(0x1000);
+    const HMODULE library = reinterpret_cast<HMODULE>(0x2000);
+    WXI_REQUIRE_EQ(
+        winexinfo::ClassifyExplorerLayoutWorkerModule(executable, executable),
+        winexinfo::ExplorerLayoutWorkerModuleKind::Executable);
+    WXI_REQUIRE_EQ(
+        winexinfo::GetExplorerLayoutWorkerReleasePath(
+            winexinfo::ExplorerLayoutWorkerModuleKind::Executable),
+        winexinfo::ExplorerLayoutWorkerReleasePath::FreeLibraryThenExitThread);
+    WXI_REQUIRE_EQ(
+        winexinfo::ClassifyExplorerLayoutWorkerModule(library, executable),
+        winexinfo::ExplorerLayoutWorkerModuleKind::DynamicLibrary);
+    WXI_REQUIRE_EQ(
+        winexinfo::GetExplorerLayoutWorkerReleasePath(
+            winexinfo::ExplorerLayoutWorkerModuleKind::DynamicLibrary),
+        winexinfo::ExplorerLayoutWorkerReleasePath::FreeLibraryAndExitThread);
+}
+
+WXI_TEST(
+    explorer_layout_worker_balances_delayed_timeout_retention,
+    "explorer_layout.worker_timeout_balances_module") {
+    for (const winexinfo::ExplorerLayoutWorkerModuleKind kind : {
+             winexinfo::ExplorerLayoutWorkerModuleKind::Executable,
+             winexinfo::ExplorerLayoutWorkerModuleKind::DynamicLibrary}) {
+        struct LifetimeState final {
+            HANDLE release_gate;
+            HANDLE released;
+            std::atomic<int> retains{0};
+            std::atomic<int> ordinary_releases{0};
+            std::atomic<int> releases{0};
+            std::atomic<bool> apartment_ok{false};
+            winexinfo::ExplorerLayoutWorkerModuleKind requested_kind{};
+            winexinfo::ExplorerLayoutWorkerModuleKind retained_kind{};
+            winexinfo::ExplorerLayoutWorkerModuleKind released_kind{};
+        } state{
+            CreateEventW(nullptr, TRUE, FALSE, nullptr),
+            CreateEventW(nullptr, TRUE, FALSE, nullptr),
+        };
+        WXI_REQUIRE(state.release_gate != nullptr);
+        WXI_REQUIRE(state.released != nullptr);
+
+        const winexinfo::ExplorerLayoutWorkerModuleOperations operations{
+            &state,
+            [](void* const context,
+               winexinfo::ExplorerLayoutWorkerModuleRetention* const retention) {
+                auto* const state = static_cast<LifetimeState*>(context);
+                ++state->retains;
+                state->retained_kind = state->requested_kind;
+                *retention = {
+                    reinterpret_cast<HMODULE>(0x1234),
+                    state->retained_kind,
+                };
+                return winexinfo::Status{
+                    winexinfo::ErrorCode::OK, S_OK, ERROR_SUCCESS};
+            },
+            [](void* const context,
+               const winexinfo::ExplorerLayoutWorkerModuleRetention) {
+                auto* const state = static_cast<LifetimeState*>(context);
+                ++state->ordinary_releases;
+            },
+            [](void* const context,
+               const winexinfo::ExplorerLayoutWorkerModuleRetention retention) {
+                auto* const state = static_cast<LifetimeState*>(context);
+                ++state->releases;
+                state->released_kind = retention.kind;
+                static_cast<void>(SetEvent(state->released));
+                ExitThread(0);
+            },
+        };
+        state.requested_kind = kind;
+
+        const winexinfo::Status timeout =
+            winexinfo::RunExplorerLayoutMtaWorkerWithOperations(
+                [&state](const winexinfo::Status apartmentStatus) {
+                    state.apartment_ok = apartmentStatus.ok();
+                    static_cast<void>(WaitForSingleObject(state.release_gate, 5000));
+                },
+                1,
+                operations);
+        WXI_REQUIRE_EQ(timeout.win32, DWORD{ERROR_TIMEOUT});
+        WXI_REQUIRE(state.apartment_ok.load());
+        WXI_REQUIRE_EQ(state.retains.load(), 1);
+        WXI_REQUIRE_EQ(state.ordinary_releases.load(), 0);
+        WXI_REQUIRE_EQ(state.releases.load(), 0);
+
+        WXI_REQUIRE(SetEvent(state.release_gate) != FALSE);
+        WXI_REQUIRE_EQ(WaitForSingleObject(state.released, 5000), DWORD{WAIT_OBJECT_0});
+        WXI_REQUIRE_EQ(state.releases.load(), 1);
+        WXI_REQUIRE_EQ(state.ordinary_releases.load(), 0);
+        WXI_REQUIRE_EQ(state.retained_kind, kind);
+        WXI_REQUIRE_EQ(state.released_kind, kind);
+        CloseHandle(state.released);
+        CloseHandle(state.release_gate);
+    }
 }
 
 WXI_TEST(

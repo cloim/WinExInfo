@@ -49,6 +49,28 @@ struct ExplorerLayoutCaptureOperations final {
     std::function<Status(ExplorerLayoutMtaTask, DWORD)> run_mta_worker;
 };
 
+enum class ExplorerLayoutWorkerModuleKind {
+    Executable,
+    DynamicLibrary,
+};
+
+enum class ExplorerLayoutWorkerReleasePath {
+    FreeLibraryThenExitThread,
+    FreeLibraryAndExitThread,
+};
+
+struct ExplorerLayoutWorkerModuleRetention final {
+    HMODULE module;
+    ExplorerLayoutWorkerModuleKind kind;
+};
+
+struct ExplorerLayoutWorkerModuleOperations final {
+    void* context;
+    Status (*retain)(void*, ExplorerLayoutWorkerModuleRetention*);
+    void (*release)(void*, ExplorerLayoutWorkerModuleRetention);
+    void (*release_and_exit)(void*, ExplorerLayoutWorkerModuleRetention);
+};
+
 inline constexpr DWORD kExplorerLayoutCaptureTimeoutMs = 5000;
 
 [[nodiscard]] Status ComputeStatusPaneRect(
@@ -68,5 +90,14 @@ inline constexpr DWORD kExplorerLayoutCaptureTimeoutMs = 5000;
     HWND* paneParent,
     const ExplorerLayoutCaptureOperations& operations);
 [[nodiscard]] ExplorerLayoutCaptureOperations GetProductionExplorerLayoutCaptureOperations();
+[[nodiscard]] ExplorerLayoutWorkerModuleKind ClassifyExplorerLayoutWorkerModule(
+    HMODULE retainedModule,
+    HMODULE executableModule) noexcept;
+[[nodiscard]] ExplorerLayoutWorkerReleasePath GetExplorerLayoutWorkerReleasePath(
+    ExplorerLayoutWorkerModuleKind kind) noexcept;
+[[nodiscard]] Status RunExplorerLayoutMtaWorkerWithOperations(
+    ExplorerLayoutMtaTask task,
+    DWORD timeoutMs,
+    const ExplorerLayoutWorkerModuleOperations& moduleOperations);
 
 }  // namespace winexinfo

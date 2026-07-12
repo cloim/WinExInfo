@@ -395,7 +395,8 @@ Status CaptureExplorerLayoutCurrentThread(
 
 struct ProductionWorkerState final {
     HANDLE completion = nullptr;
-    HMODULE module = nullptr;
+    ExplorerLayoutWorkerModuleRetention retention{};
+    ExplorerLayoutWorkerModuleOperations module_operations{};
     ExplorerLayoutMtaTask task;
 
     ~ProductionWorkerState() {
@@ -422,16 +423,27 @@ DWORD WINAPI ProductionMtaThreadProc(void* const parameter) {
     }
     static_cast<void>(SetEvent(state->completion));
 
-    const HMODULE module = state->module;
+    const ExplorerLayoutWorkerModuleRetention retention = state->retention;
+    const ExplorerLayoutWorkerModuleOperations moduleOperations =
+        state->module_operations;
     state.reset();
-    FreeLibraryAndExitThread(module, 0);
+    moduleOperations.release_and_exit(moduleOperations.context, retention);
+    ExitThread(ERROR_INVALID_FUNCTION);
 }
 
-Status RunProductionMtaWorker(ExplorerLayoutMtaTask task, const DWORD timeoutMs) {
+Status RunMtaWorkerWithModuleOperations(
+    ExplorerLayoutMtaTask task,
+    const DWORD timeoutMs,
+    const ExplorerLayoutWorkerModuleOperations& moduleOperations) {
+    if (moduleOperations.retain == nullptr || moduleOperations.release == nullptr ||
+        moduleOperations.release_and_exit == nullptr) {
+        return ContractMismatch(E_INVALIDARG, ERROR_INVALID_PARAMETER);
+    }
     std::shared_ptr<ProductionWorkerState> state;
     try {
         state = std::make_shared<ProductionWorkerState>();
         state->task = std::move(task);
+        state->module_operations = moduleOperations;
     } catch (const std::bad_alloc&) {
         return ContractMismatch(E_OUTOFMEMORY, ERROR_NOT_ENOUGH_MEMORY);
     } catch (...) {
@@ -442,16 +454,15 @@ Status RunProductionMtaWorker(ExplorerLayoutMtaTask task, const DWORD timeoutMs)
     if (state->completion == nullptr) {
         return Win32Mismatch(GetLastError());
     }
-    if (!GetModuleHandleExW(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-            reinterpret_cast<LPCWSTR>(&ProductionMtaThreadProc),
-            &state->module)) {
-        return Win32Mismatch(GetLastError());
+    const Status retentionStatus = moduleOperations.retain(
+        moduleOperations.context, &state->retention);
+    if (!retentionStatus.ok()) {
+        return retentionStatus;
     }
 
     auto* const parameter = new (std::nothrow) std::shared_ptr<ProductionWorkerState>{state};
     if (parameter == nullptr) {
-        FreeLibrary(state->module);
+        moduleOperations.release(moduleOperations.context, state->retention);
         return ContractMismatch(E_OUTOFMEMORY, ERROR_NOT_ENOUGH_MEMORY);
     }
     const HANDLE thread = CreateThread(
@@ -459,7 +470,7 @@ Status RunProductionMtaWorker(ExplorerLayoutMtaTask task, const DWORD timeoutMs)
     if (thread == nullptr) {
         const DWORD error = GetLastError();
         delete parameter;
-        FreeLibrary(state->module);
+        moduleOperations.release(moduleOperations.context, state->retention);
         return Win32Mismatch(error);
     }
     CloseHandle(thread);
@@ -475,7 +486,84 @@ Status RunProductionMtaWorker(ExplorerLayoutMtaTask task, const DWORD timeoutMs)
     return Win32Mismatch(error == ERROR_SUCCESS ? ERROR_INVALID_FUNCTION : error);
 }
 
+Status RetainProductionWorkerModule(
+    void*,
+    ExplorerLayoutWorkerModuleRetention* const retention) {
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            reinterpret_cast<LPCWSTR>(&ProductionMtaThreadProc),
+            &module)) {
+        return Win32Mismatch(GetLastError());
+    }
+    const HMODULE executable = GetModuleHandleW(nullptr);
+    if (executable == nullptr) {
+        const DWORD error = GetLastError();
+        FreeLibrary(module);
+        return Win32Mismatch(error == ERROR_SUCCESS ? ERROR_MOD_NOT_FOUND : error);
+    }
+    *retention = {
+        module,
+        ClassifyExplorerLayoutWorkerModule(module, executable),
+    };
+    return {ErrorCode::OK, S_OK, ERROR_SUCCESS};
+}
+
+void ReleaseProductionWorkerModule(
+    void*,
+    const ExplorerLayoutWorkerModuleRetention retention) {
+    static_cast<void>(FreeLibrary(retention.module));
+}
+
+void ReleaseAndExitProductionWorkerModule(
+    void*,
+    const ExplorerLayoutWorkerModuleRetention retention) {
+    if (GetExplorerLayoutWorkerReleasePath(retention.kind) ==
+        ExplorerLayoutWorkerReleasePath::FreeLibraryAndExitThread) {
+        FreeLibraryAndExitThread(retention.module, 0);
+    }
+    static_cast<void>(FreeLibrary(retention.module));
+    ExitThread(0);
+}
+
+ExplorerLayoutWorkerModuleOperations GetProductionWorkerModuleOperations() {
+    return {
+        nullptr,
+        &RetainProductionWorkerModule,
+        &ReleaseProductionWorkerModule,
+        &ReleaseAndExitProductionWorkerModule,
+    };
+}
+
+Status RunProductionMtaWorker(ExplorerLayoutMtaTask task, const DWORD timeoutMs) {
+    return RunMtaWorkerWithModuleOperations(
+        std::move(task), timeoutMs, GetProductionWorkerModuleOperations());
+}
+
 }  // namespace
+
+ExplorerLayoutWorkerModuleKind ClassifyExplorerLayoutWorkerModule(
+    const HMODULE retainedModule,
+    const HMODULE executableModule) noexcept {
+    return retainedModule == executableModule
+        ? ExplorerLayoutWorkerModuleKind::Executable
+        : ExplorerLayoutWorkerModuleKind::DynamicLibrary;
+}
+
+ExplorerLayoutWorkerReleasePath GetExplorerLayoutWorkerReleasePath(
+    const ExplorerLayoutWorkerModuleKind kind) noexcept {
+    return kind == ExplorerLayoutWorkerModuleKind::DynamicLibrary
+        ? ExplorerLayoutWorkerReleasePath::FreeLibraryAndExitThread
+        : ExplorerLayoutWorkerReleasePath::FreeLibraryThenExitThread;
+}
+
+Status RunExplorerLayoutMtaWorkerWithOperations(
+    ExplorerLayoutMtaTask task,
+    const DWORD timeoutMs,
+    const ExplorerLayoutWorkerModuleOperations& moduleOperations) {
+    return RunMtaWorkerWithModuleOperations(
+        std::move(task), timeoutMs, moduleOperations);
+}
 
 Status ComputeStatusPaneRect(
     const ExplorerLayoutMetrics& metrics,
