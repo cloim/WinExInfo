@@ -35,6 +35,21 @@ bool ReceiptMatches(
         receipt.result == 0;
 }
 
+Status ExactValidationFailure(const Status& status) noexcept {
+    return status.ok()
+        ? Failure(ErrorCode::TARGET_VALIDATION_FAILED)
+        : status;
+}
+
+bool AllHooksGone(const auto& target) noexcept {
+    for (std::size_t index = 0; index < target.lease_count; ++index) {
+        if (target.leases[index].hook != nullptr) {
+            return false;
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
 ThreadHookInjector::ThreadHookInjector(
@@ -119,7 +134,7 @@ Status ThreadHookInjector::Attach(
         const Status validated = operations_.before_set_hook();
         if (!ExactSuccess(validated)) {
             closeReleaseEvent();
-            return validated;
+            return ExactValidationFailure(validated);
         }
     }
     HHOOK hook = nullptr;
@@ -155,9 +170,11 @@ Status ThreadHookInjector::Attach(
     }
 
     if (primary.ok()) {
-        retained_targets_.emplace(
-            target.explorer_pid,
-            RetainedTarget{hook, releaseEvent.handle, false});
+        RetainedTarget retained{};
+        retained.leases[0] = {target.ui_thread_id, hook};
+        retained.lease_count = 1;
+        retained.release_event = releaseEvent.handle;
+        retained_targets_.emplace(target.explorer_pid, retained);
         releaseEvent.handle = nullptr;
         output->unload_authorized = true;
         return primary;
@@ -166,9 +183,12 @@ Status ThreadHookInjector::Attach(
     bool unhooked = false;
     const Status released = operations_.unhook(hook, &unhooked);
     if (!ExactSuccess(released) || !unhooked) {
-        retained_targets_.emplace(
-            target.explorer_pid,
-            RetainedTarget{hook, releaseEvent.handle, false});
+        RetainedTarget retained{};
+        retained.leases[0] = {target.ui_thread_id, hook};
+        retained.lease_count = 1;
+        retained.release_event = releaseEvent.handle;
+        retained.release_started = true;
+        retained_targets_.emplace(target.explorer_pid, retained);
         releaseEvent.handle = nullptr;
         return Failure(ErrorCode::HOOK_RELEASE_FAILED);
     }
@@ -177,9 +197,10 @@ Status ThreadHookInjector::Attach(
     bool signaled = false;
     const Status eventSet = operations_.set_event(releaseEvent.handle, &signaled);
     if (!ExactSuccess(eventSet) || !signaled) {
-        retained_targets_.emplace(
-            target.explorer_pid,
-            RetainedTarget{nullptr, releaseEvent.handle, false});
+        RetainedTarget retained{};
+        retained.release_event = releaseEvent.handle;
+        retained.release_started = true;
+        retained_targets_.emplace(target.explorer_pid, retained);
         releaseEvent.handle = nullptr;
         return Failure(ErrorCode::HOOK_RELEASE_FAILED);
     }
@@ -189,12 +210,60 @@ Status ThreadHookInjector::Attach(
         closeReleaseEvent();
         return primary;
     }
-    retained_targets_.emplace(
-        target.explorer_pid,
-        RetainedTarget{nullptr, releaseEvent.handle, true});
+    RetainedTarget retained{};
+    retained.release_event = releaseEvent.handle;
+    retained.release_event_signaled = true;
+    retained.release_started = true;
+    retained_targets_.emplace(target.explorer_pid, retained);
     releaseEvent.handle = nullptr;
     output->unload_authorized = primary.ok();
     return primary;
+}
+
+Status ThreadHookInjector::EnsureThreadHookLease(
+    const HookTarget& target,
+    const std::function<Status()>& finalValidate) {
+    if (target.explorer_pid == 0 || target.ui_thread_id == 0 ||
+        target.top_level_hwnd == nullptr || !finalValidate ||
+        !operations_.resolve_hook_export || !operations_.set_hook) {
+        return {ErrorCode::INVALID_ARGUMENT, E_INVALIDARG, ERROR_INVALID_PARAMETER};
+    }
+    const auto found = retained_targets_.find(target.explorer_pid);
+    if (found == retained_targets_.end() || found->second.release_started) {
+        return Failure(ErrorCode::HOOK_INSTALL_FAILED);
+    }
+    RetainedTarget& retained = found->second;
+    for (std::size_t index = 0; index < retained.lease_count; ++index) {
+        if (retained.leases[index].ui_thread_id == target.ui_thread_id) {
+            const Status validated = finalValidate();
+            return ExactSuccess(validated)
+                ? Success()
+                : ExactValidationFailure(validated);
+        }
+    }
+    if (retained.lease_count >= kMaximumThreadHookLeases) {
+        return Failure(ErrorCode::HOOK_INSTALL_FAILED);
+    }
+
+    HMODULE module = nullptr;
+    HOOKPROC procedure = nullptr;
+    const Status resolved = operations_.resolve_hook_export(
+        kHookExportName, &module, &procedure);
+    if (!ExactSuccess(resolved) || module == nullptr || procedure == nullptr) {
+        return Failure(ErrorCode::HOOK_INSTALL_FAILED);
+    }
+    const Status validated = finalValidate();
+    if (!ExactSuccess(validated)) {
+        return ExactValidationFailure(validated);
+    }
+    HHOOK hook = nullptr;
+    const Status installed = operations_.set_hook(
+        WH_CALLWNDPROC, procedure, module, target.ui_thread_id, &hook);
+    if (!ExactSuccess(installed) || hook == nullptr) {
+        return Failure(ErrorCode::HOOK_INSTALL_FAILED);
+    }
+    retained.leases[retained.lease_count++] = {target.ui_thread_id, hook};
+    return Success();
 }
 
 Status ThreadHookInjector::ReleaseHookForDetach(
@@ -205,13 +274,31 @@ Status ThreadHookInjector::ReleaseHookForDetach(
         return {ErrorCode::INVALID_ARGUMENT, E_INVALIDARG, ERROR_INVALID_PARAMETER};
     }
     RetainedTarget& target = found->second;
-    if (target.hook != nullptr) {
-        bool unhooked = false;
-        const Status released = operations_.unhook(target.hook, &unhooked);
-        if (!ExactSuccess(released) || !unhooked) {
-            return Failure(ErrorCode::HOOK_RELEASE_FAILED);
+    target.release_started = true;
+    Status firstError = Success();
+    bool hasFirstError = false;
+    for (std::size_t index = target.lease_count; index > 0; --index) {
+        ThreadHookLease& lease = target.leases[index - 1];
+        if (lease.hook == nullptr) {
+            continue;
         }
-        target.hook = nullptr;
+        bool unhooked = false;
+        const Status released = operations_.unhook(lease.hook, &unhooked);
+        if (!ExactSuccess(released) || !unhooked) {
+            if (!hasFirstError) {
+                firstError = released.ok()
+                    ? Failure(ErrorCode::HOOK_RELEASE_FAILED)
+                    : released;
+                hasFirstError = true;
+            }
+            continue;
+        }
+        lease.hook = nullptr;
+    }
+    if (hasFirstError || !AllHooksGone(target)) {
+        return hasFirstError
+            ? firstError
+            : Failure(ErrorCode::HOOK_RELEASE_FAILED);
     }
     if (!target.release_event_signaled) {
         bool signaled = false;
@@ -229,6 +316,10 @@ Status ThreadHookInjector::ConfirmTargetGone(const DWORD explorerPid) noexcept {
     if (explorerPid == 0 || found == retained_targets_.end() ||
         !operations_.close_event) {
         return {ErrorCode::INVALID_ARGUMENT, E_INVALIDARG, ERROR_INVALID_PARAMETER};
+    }
+    if (!AllHooksGone(found->second) ||
+        !found->second.release_event_signaled) {
+        return Failure(ErrorCode::HOOK_RELEASE_FAILED);
     }
     operations_.close_event(found->second.release_event);
     retained_targets_.erase(found);

@@ -4,7 +4,9 @@
 
 #include <Windows.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -31,6 +33,8 @@ struct FakeState final {
     bool receipt_available = true;
     bool unhook_succeeds = true;
     bool set_event_succeeds = true;
+    std::vector<int> failing_unhook_calls;
+    std::vector<winexinfo::Status> unhook_statuses;
     winexinfo::injection::HookAttachReceipt receipt{
         true,
         1,
@@ -55,6 +59,8 @@ struct FakeState final {
     int unhook_calls = 0;
     int set_event_calls = 0;
     int close_event_calls = 0;
+    std::vector<HHOOK> installed_hooks;
+    std::vector<HHOOK> unhooked_hooks;
     std::vector<std::string> install_order;
 };
 
@@ -100,7 +106,9 @@ winexinfo::injection::HookPlatformOperations Operations(FakeState* const state) 
             if (!state->set_hook_succeeds) {
                 return Failure(winexinfo::ErrorCode::HOOK_INSTALL_FAILED);
             }
-            *output = reinterpret_cast<HHOOK>(std::uintptr_t{0x400});
+            *output = reinterpret_cast<HHOOK>(
+                std::uintptr_t{0x400 + state->installed_hooks.size()});
+            state->installed_hooks.push_back(*output);
             return Success();
         },
         [state](
@@ -132,10 +140,20 @@ winexinfo::injection::HookPlatformOperations Operations(FakeState* const state) 
             output->available = state->receipt_available;
             return Success();
         },
-        [state](const HHOOK, bool* const output) {
+        [state](const HHOOK hook, bool* const output) {
             ++state->unhook_calls;
+            state->unhooked_hooks.push_back(hook);
             state->install_order.push_back("unhook");
-            *output = state->unhook_succeeds;
+            *output = state->unhook_succeeds &&
+                std::find(
+                    state->failing_unhook_calls.begin(),
+                    state->failing_unhook_calls.end(),
+                    state->unhook_calls) == state->failing_unhook_calls.end();
+            if (static_cast<std::size_t>(state->unhook_calls) <=
+                state->unhook_statuses.size()) {
+                return state->unhook_statuses[
+                    static_cast<std::size_t>(state->unhook_calls - 1)];
+            }
             return Success();
         },
         [state](const HANDLE, bool* const output) {
@@ -146,6 +164,13 @@ winexinfo::injection::HookPlatformOperations Operations(FakeState* const state) 
         },
         [state](const HANDLE) { ++state->close_event_calls; },
     };
+}
+
+winexinfo::Status EnsureLease(
+    winexinfo::injection::ThreadHookInjector* const injector,
+    const winexinfo::injection::HookTarget& target,
+    std::function<winexinfo::Status()> finalValidate = [] { return Success(); }) {
+    return injector->EnsureThreadHookLease(target, std::move(finalValidate));
 }
 
 winexinfo::injection::HookTarget Target();
@@ -220,6 +245,281 @@ WXI_TEST(hook_injector_uses_exact_event_hook_and_trigger, "hook_injector.exact_c
     WXI_REQUIRE(state.install_order.size() >= 2);
     WXI_REQUIRE_EQ(state.install_order[state.install_order.size() - 2], "unhook");
     WXI_REQUIRE_EQ(state.install_order.back(), "signal");
+}
+
+WXI_TEST(hook_injector_adds_and_deduplicates_thread_leases,
+         "hook_injector.thread_lease_deduplication") {
+    FakeState state;
+    winexinfo::injection::ThreadHookInjector injector{Operations(&state)};
+    winexinfo::injection::HookAttachOutcome outcome{};
+    WXI_REQUIRE(injector.Attach(Target(), &outcome).ok());
+
+    const auto second = winexinfo::injection::HookTarget{
+        100, 201, reinterpret_cast<HWND>(std::uintptr_t{0x301})};
+    WXI_REQUIRE(EnsureLease(&injector, second).ok());
+    WXI_REQUIRE_EQ(state.hook_threads, (std::vector<DWORD>{200, 201}));
+    WXI_REQUIRE_EQ(state.event_names.size(), std::size_t{1});
+    WXI_REQUIRE_EQ(state.trigger_messages.size(), std::size_t{1});
+    WXI_REQUIRE_EQ(state.waited_ids.size(), std::size_t{1});
+
+    int validations = 0;
+    const auto sameThreadOtherWindow = winexinfo::injection::HookTarget{
+        100, 201, reinterpret_cast<HWND>(std::uintptr_t{0x302})};
+    WXI_REQUIRE(EnsureLease(&injector, sameThreadOtherWindow, [&] {
+                    ++validations;
+                    return Success();
+                }).ok());
+    WXI_REQUIRE_EQ(validations, 1);
+    WXI_REQUIRE_EQ(state.hook_threads, (std::vector<DWORD>{200, 201}));
+}
+
+WXI_TEST(hook_injector_rejects_invalid_or_unretained_thread_lease_targets,
+         "hook_injector.thread_lease_identity") {
+    FakeState state;
+    winexinfo::injection::ThreadHookInjector injector{Operations(&state)};
+    winexinfo::injection::HookAttachOutcome outcome{};
+    WXI_REQUIRE(injector.Attach(Target(), &outcome).ok());
+
+    const std::vector<winexinfo::injection::HookTarget> rejected{
+        {0, 201, reinterpret_cast<HWND>(std::uintptr_t{0x301})},
+        {100, 0, reinterpret_cast<HWND>(std::uintptr_t{0x301})},
+        {100, 201, nullptr},
+        {101, 201, reinterpret_cast<HWND>(std::uintptr_t{0x301})},
+    };
+    for (const auto& target : rejected) {
+        WXI_REQUIRE(!EnsureLease(&injector, target).ok());
+    }
+    WXI_REQUIRE_EQ(state.hook_threads, std::vector<DWORD>{200});
+}
+
+WXI_TEST(hook_injector_validates_each_lease_immediately_before_install,
+         "hook_injector.thread_lease_final_validation") {
+    FakeState state;
+    winexinfo::injection::ThreadHookInjector injector{Operations(&state)};
+    winexinfo::injection::HookAttachOutcome outcome{};
+    WXI_REQUIRE(injector.Attach(Target(), &outcome).ok());
+    state.install_order.clear();
+
+    const auto second = winexinfo::injection::HookTarget{
+        100, 201, reinterpret_cast<HWND>(std::uintptr_t{0x301})};
+    WXI_REQUIRE(EnsureLease(&injector, second, [&] {
+                    state.install_order.push_back("target_validate");
+                    return Success();
+                }).ok());
+    WXI_REQUIRE_EQ(
+        state.install_order,
+        (std::vector<std::string>{"target_validate", "set_hook"}));
+
+    const auto rejected = winexinfo::injection::HookTarget{
+        100, 202, reinterpret_cast<HWND>(std::uintptr_t{0x302})};
+    RequireStatus(
+        EnsureLease(&injector, rejected, [] {
+            return Failure(winexinfo::ErrorCode::TARGET_VALIDATION_FAILED);
+        }),
+        winexinfo::ErrorCode::TARGET_VALIDATION_FAILED);
+    WXI_REQUIRE_EQ(state.hook_threads, (std::vector<DWORD>{200, 201}));
+}
+
+WXI_TEST(hook_injector_rejects_nonexact_validation_for_new_and_existing_tid,
+         "hook_injector.thread_lease_exact_validation") {
+    FakeState state;
+    winexinfo::injection::ThreadHookInjector injector{Operations(&state)};
+    winexinfo::injection::HookAttachOutcome outcome{};
+    WXI_REQUIRE(injector.Attach(Target(), &outcome).ok());
+    const auto nonexact = [] {
+        return winexinfo::Status{winexinfo::ErrorCode::OK, S_FALSE, ERROR_BUSY};
+    };
+
+    WXI_REQUIRE(!EnsureLease(&injector, Target(), nonexact).ok());
+    WXI_REQUIRE(!EnsureLease(
+                    &injector,
+                    {100, 201, reinterpret_cast<HWND>(std::uintptr_t{0x301})},
+                    nonexact)
+                    .ok());
+    WXI_REQUIRE_EQ(state.hook_threads, std::vector<DWORD>{200});
+}
+
+WXI_TEST(hook_injector_failure_retention_is_not_an_attachable_session,
+         "hook_injector.thread_lease_failure_session") {
+    const auto requireRejected = [](FakeState state) {
+        winexinfo::injection::ThreadHookInjector injector{Operations(&state)};
+        winexinfo::injection::HookAttachOutcome outcome{};
+        WXI_REQUIRE(!injector.Attach(Target(), &outcome).ok());
+        int validations = 0;
+        WXI_REQUIRE(!EnsureLease(
+                        &injector,
+                        {100,
+                         201,
+                         reinterpret_cast<HWND>(std::uintptr_t{0x301})},
+                        [&] {
+                            ++validations;
+                            return Success();
+                        })
+                        .ok());
+        WXI_REQUIRE_EQ(validations, 0);
+        WXI_REQUIRE_EQ(state.hook_threads, std::vector<DWORD>{200});
+    };
+
+    FakeState uncertainHook;
+    uncertainHook.trigger_succeeds = false;
+    uncertainHook.unhook_succeeds = false;
+    requireRejected(uncertainHook);
+
+    FakeState unsignaledEvent;
+    unsignaledEvent.trigger_succeeds = false;
+    unsignaledEvent.set_event_succeeds = false;
+    requireRejected(unsignaledEvent);
+}
+
+WXI_TEST(hook_injector_caps_thread_leases_at_64,
+         "hook_injector.thread_lease_capacity") {
+    FakeState state;
+    winexinfo::injection::ThreadHookInjector injector{Operations(&state)};
+    winexinfo::injection::HookAttachOutcome outcome{};
+    WXI_REQUIRE(injector.Attach(Target(), &outcome).ok());
+    for (DWORD offset = 1; offset < 64; ++offset) {
+        WXI_REQUIRE(EnsureLease(
+                        &injector,
+                        {100,
+                         200 + offset,
+                         reinterpret_cast<HWND>(
+                             std::uintptr_t{0x300 + offset})})
+                        .ok());
+    }
+    WXI_REQUIRE_EQ(state.hook_threads.size(), std::size_t{64});
+    WXI_REQUIRE(!EnsureLease(
+                    &injector,
+                    {100, 264, reinterpret_cast<HWND>(std::uintptr_t{0x340})})
+                    .ok());
+    WXI_REQUIRE_EQ(state.hook_threads.size(), std::size_t{64});
+}
+
+WXI_TEST(hook_injector_releases_all_thread_leases_in_reverse_order,
+         "hook_injector.thread_lease_reverse_release") {
+    FakeState state;
+    winexinfo::injection::ThreadHookInjector injector{Operations(&state)};
+    winexinfo::injection::HookAttachOutcome outcome{};
+    WXI_REQUIRE(injector.Attach(Target(), &outcome).ok());
+    WXI_REQUIRE(EnsureLease(
+                    &injector,
+                    {100, 201, reinterpret_cast<HWND>(std::uintptr_t{0x301})})
+                    .ok());
+    WXI_REQUIRE(EnsureLease(
+                    &injector,
+                    {100, 202, reinterpret_cast<HWND>(std::uintptr_t{0x302})})
+                    .ok());
+    WXI_REQUIRE(injector.ReleaseHookForDetach(100).ok());
+    WXI_REQUIRE_EQ(
+        state.unhooked_hooks,
+        (std::vector<HHOOK>{state.installed_hooks[2],
+                            state.installed_hooks[1],
+                            state.installed_hooks[0]}));
+    WXI_REQUIRE_EQ(state.set_event_calls, 1);
+    WXI_REQUIRE(injector.ReleaseHookForDetach(100).ok());
+    WXI_REQUIRE_EQ(state.unhook_calls, 3);
+    WXI_REQUIRE_EQ(state.set_event_calls, 1);
+}
+
+WXI_TEST(hook_injector_exhausts_release_and_retries_only_failed_leases,
+         "hook_injector.thread_lease_partial_release") {
+    FakeState state;
+    winexinfo::injection::ThreadHookInjector injector{Operations(&state)};
+    winexinfo::injection::HookAttachOutcome outcome{};
+    WXI_REQUIRE(injector.Attach(Target(), &outcome).ok());
+    WXI_REQUIRE(EnsureLease(
+                    &injector,
+                    {100, 201, reinterpret_cast<HWND>(std::uintptr_t{0x301})})
+                    .ok());
+    WXI_REQUIRE(EnsureLease(
+                    &injector,
+                    {100, 202, reinterpret_cast<HWND>(std::uintptr_t{0x302})})
+                    .ok());
+    state.failing_unhook_calls = {2};
+    RequireStatus(
+        injector.ReleaseHookForDetach(100),
+        winexinfo::ErrorCode::HOOK_RELEASE_FAILED);
+    WXI_REQUIRE_EQ(state.unhook_calls, 3);
+    WXI_REQUIRE_EQ(state.set_event_calls, 0);
+
+    state.failing_unhook_calls.clear();
+    WXI_REQUIRE(injector.ReleaseHookForDetach(100).ok());
+    WXI_REQUIRE_EQ(state.unhook_calls, 4);
+    WXI_REQUIRE_EQ(state.unhooked_hooks.back(), state.installed_hooks[1]);
+    WXI_REQUIRE_EQ(state.set_event_calls, 1);
+}
+
+WXI_TEST(hook_injector_preserves_first_nonexact_release_status,
+         "hook_injector.thread_lease_first_release_error") {
+    FakeState state;
+    winexinfo::injection::ThreadHookInjector injector{Operations(&state)};
+    winexinfo::injection::HookAttachOutcome outcome{};
+    WXI_REQUIRE(injector.Attach(Target(), &outcome).ok());
+    WXI_REQUIRE(EnsureLease(
+                    &injector,
+                    {100, 201, reinterpret_cast<HWND>(std::uintptr_t{0x301})})
+                    .ok());
+    state.unhook_statuses = {
+        {winexinfo::ErrorCode::OK, S_FALSE, ERROR_BUSY},
+        {winexinfo::ErrorCode::TARGET_VALIDATION_FAILED,
+         E_ACCESSDENIED,
+         ERROR_ACCESS_DENIED},
+    };
+
+    const winexinfo::Status released = injector.ReleaseHookForDetach(100);
+    WXI_REQUIRE_EQ(released.code, winexinfo::ErrorCode::HOOK_RELEASE_FAILED);
+    WXI_REQUIRE_EQ(released.hresult, S_FALSE);
+    WXI_REQUIRE_EQ(released.win32, DWORD{ERROR_SUCCESS});
+    WXI_REQUIRE_EQ(state.unhook_calls, 2);
+    WXI_REQUIRE_EQ(state.set_event_calls, 0);
+}
+
+WXI_TEST(hook_injector_retries_signal_without_double_unhook,
+         "hook_injector.thread_lease_signal_retry") {
+    FakeState state;
+    winexinfo::injection::ThreadHookInjector injector{Operations(&state)};
+    winexinfo::injection::HookAttachOutcome outcome{};
+    WXI_REQUIRE(injector.Attach(Target(), &outcome).ok());
+    state.set_event_succeeds = false;
+    WXI_REQUIRE(!injector.ReleaseHookForDetach(100).ok());
+    WXI_REQUIRE_EQ(state.unhook_calls, 1);
+    WXI_REQUIRE_EQ(state.set_event_calls, 1);
+    WXI_REQUIRE(!injector.ConfirmTargetGone(100).ok());
+
+    state.set_event_succeeds = true;
+    WXI_REQUIRE(injector.ReleaseHookForDetach(100).ok());
+    WXI_REQUIRE_EQ(state.unhook_calls, 1);
+    WXI_REQUIRE_EQ(state.set_event_calls, 2);
+    WXI_REQUIRE(injector.ConfirmTargetGone(100).ok());
+}
+
+WXI_TEST(hook_injector_rejects_confirmation_while_any_lease_is_active,
+         "hook_injector.thread_lease_confirm_guard") {
+    FakeState state;
+    winexinfo::injection::ThreadHookInjector injector{Operations(&state)};
+    winexinfo::injection::HookAttachOutcome outcome{};
+    WXI_REQUIRE(injector.Attach(Target(), &outcome).ok());
+    WXI_REQUIRE(!injector.ConfirmTargetGone(100).ok());
+    WXI_REQUIRE_EQ(state.close_event_calls, 0);
+    WXI_REQUIRE_EQ(injector.retained_target_count(), std::size_t{1});
+}
+
+WXI_TEST(hook_injector_destructor_does_not_release_retained_thread_leases,
+         "hook_injector.thread_lease_destructor_retention") {
+    FakeState state;
+    {
+        winexinfo::injection::ThreadHookInjector injector{Operations(&state)};
+        winexinfo::injection::HookAttachOutcome outcome{};
+        WXI_REQUIRE(injector.Attach(Target(), &outcome).ok());
+        WXI_REQUIRE(EnsureLease(
+                        &injector,
+                        {100,
+                         201,
+                         reinterpret_cast<HWND>(std::uintptr_t{0x301})})
+                        .ok());
+    }
+    WXI_REQUIRE_EQ(state.unhook_calls, 0);
+    WXI_REQUIRE_EQ(state.set_event_calls, 0);
+    WXI_REQUIRE_EQ(state.close_event_calls, 1);
 }
 
 WXI_TEST(hook_injector_retains_active_hook_until_detach_release, "hook_injector.active_retention") {

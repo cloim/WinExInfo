@@ -5,8 +5,10 @@
 
 #include <Windows.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <optional>
 #include <string>
@@ -45,15 +47,27 @@ public:
     [[nodiscard]] Status Attach(
         const HookTarget& target,
         HookAttachOutcome* output);
+    [[nodiscard]] Status EnsureThreadHookLease(
+        const HookTarget& target,
+        const std::function<Status()>& finalValidate);
     [[nodiscard]] Status ReleaseHookForDetach(DWORD explorerPid) noexcept;
     [[nodiscard]] Status ConfirmTargetGone(DWORD explorerPid) noexcept;
     [[nodiscard]] std::size_t retained_target_count() const noexcept;
 
 private:
+    static constexpr std::size_t kMaximumThreadHookLeases = 64;
+
+    struct ThreadHookLease final {
+        DWORD ui_thread_id = 0;
+        HHOOK hook = nullptr;
+    };
+
     struct RetainedTarget final {
-        HHOOK hook;
-        HANDLE release_event;
-        bool release_event_signaled;
+        std::array<ThreadHookLease, kMaximumThreadHookLeases> leases{};
+        std::size_t lease_count = 0;
+        HANDLE release_event = nullptr;
+        bool release_event_signaled = false;
+        bool release_started = false;
     };
 
     HookPlatformOperations operations_;
