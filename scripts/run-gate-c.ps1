@@ -13,6 +13,8 @@ $hostExecutable = Join-Path $binaryDirectory 'WinExInfoHost.exe'
 $hookDll = Join-Path $binaryDirectory 'WinExInfoHook.dll'
 $stdoutPath = Join-Path $env:TEMP "winexinfo-gate-c-$Configuration-$PID.stdout"
 $stderrPath = Join-Path $env:TEMP "winexinfo-gate-c-$Configuration-$PID.stderr"
+$hostDurationMs = 15000
+$hostCleanupBudgetMs = 10000
 
 if (-not (Test-Path -LiteralPath $hostExecutable -PathType Leaf) -or
     -not (Test-Path -LiteralPath $hookDll -PathType Leaf)) {
@@ -481,6 +483,7 @@ $controlled = $null
 $script:controlledCandidate = $null
 $originalPlacement = $null
 $hostProcess = $null
+$hostStartedAt = $null
 $tabAdded = $false
 $failure = $null
 $cleanupDiagnostics = @()
@@ -499,7 +502,8 @@ try {
     Write-Output "SAFETY stage=before explorer_windows=$($before.ExplorerWindows) explorer_pids=$($before.ExplorerPids) run=$($before.RunCount) service=$($before.ServiceCount) task=$($before.TaskCount) processes=$($before.WinExInfoProcessCount) tcp=$($before.TcpCount)"
 
     $hwndText = '0x' + $controlled.Hwnd.ToString('X16')
-    $hostProcess = Start-Process -FilePath $hostExecutable -ArgumentList @('--gate-c-place','--hwnd',$hwndText,'--duration-ms','15000') -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -WindowStyle Hidden -PassThru
+    $hostStartedAt = [Diagnostics.Stopwatch]::StartNew()
+    $hostProcess = Start-Process -FilePath $hostExecutable -ArgumentList @('--gate-c-place','--hwnd',$hwndText,'--duration-ms',[string]$hostDurationMs) -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -WindowStyle Hidden -PassThru
     $initial = Wait-Until -TimeoutMs 5000 -Failure 'Pane did not reach exact initial state within 5000ms.' -Condition {
         try { $value=[GateCHelper]::Capture($controlled.Hwnd); $script:lastLayoutDiagnostic='none'; $value } catch { $script:lastLayoutDiagnostic=$_.Exception.Message; $null }
     }
@@ -540,7 +544,12 @@ try {
     Assert-RectEqual $restored.Pane $initial.Pane 'restore_pane_rectangle'
     Assert-RectEqual $restored.Expected $initial.Expected 'restore_expected_rectangle'
 
-    if (-not $hostProcess.WaitForExit(10000)) { throw 'Host exceeded its bounded completion wait.' }
+    $hostElapsedMs = [int][Math]::Min([int]::MaxValue, $hostStartedAt.ElapsedMilliseconds)
+    $hostRemainingMs = [Math]::Max(0, $hostDurationMs - $hostElapsedMs)
+    $hostWaitBudgetMs = $hostRemainingMs + $hostCleanupBudgetMs
+    if (-not $hostProcess.WaitForExit($hostWaitBudgetMs)) {
+        throw "Host exceeded its bounded completion wait. elapsed_ms=$hostElapsedMs remaining_ms=$hostRemainingMs cleanup_budget_ms=$hostCleanupBudgetMs wait_budget_ms=$hostWaitBudgetMs"
+    }
     $hostExit = $hostProcess.ExitCode
     $hostOut = @(Get-Content -LiteralPath $stdoutPath -ErrorAction SilentlyContinue)
     $hostErr = @(Get-Content -LiteralPath $stderrPath -ErrorAction SilentlyContinue)
