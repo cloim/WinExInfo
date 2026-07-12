@@ -1,24 +1,114 @@
 # WinExInfo Gate C Evidence
 
-Gate C: PASS
+Gate C: FAIL
 
 Captured on 2026-07-12 KST against the approved Windows 11 Explorer target.
 
 ## Decision
 
-Fresh Debug and Release live runs at review-approved product head `3612965`
-both passed the complete contract. The same pane HWND survived resize, moved
-to the newly selected tab's exact active `DUIViewWndClassName`, moved back to
-the restored original view after the added tab closed, and returned to its
-original rectangle. Both Hosts exited normally, pane and exact module cleanup
-completed within bounds, only the controlled window was closed, and safety
-state remained clean. The earlier failures are retained below as superseded
-diagnostic history.
+The strict harness review invalidated the prior PASS as insufficient evidence.
+A fresh strict Debug run at head `3612965` passed all lifecycle, observed
+selection, continuity, cleanup, and controlled-window checks. After rebuilding
+Release, the strict Release run failed before Host launch because the new
+controlled window appeared between its two stable Shell samples. No Release
+product result was obtained. Per the stop condition, Gate C is FAIL for this
+run. Earlier commands and outcomes are retained below as explicitly
+superseded diagnostic history.
 
-No fallback selector, overlay, network access, persistence, service, scheduled
-task, Run-key mutation, or existing Explorer-window targeting was used.
+No fallback selector, overlay, persistence, service, scheduled task, Run-key
+mutation, existing Explorer-window targeting, or network command was used.
 
-## Final passing runs at head 3612965
+The harness contains no network command. TCP count zero was observed only at
+the recorded before/after safety samples; it is not treated as continuous
+network monitoring.
+
+## Final strict run
+
+### Strict Debug: PASS
+
+```text
+CONTROLLED hwnd=0x0000000002990372 pid=39008 tid=25744 class=CabinetWClass url=file:///D:/PROJECTS/WinExInfo
+SAFETY stage=before explorer_windows=1 explorer_pids=1 run=0 service=0 task=0 processes=0 tcp=0
+```
+
+Canonical continuity and exact rectangles:
+
+```text
+initial      active_tab=0x00000000000810A8 pane=0x0000000001000D78 parent=0x0000000000C90BB8 rect=262,960,1604,984
+resized      active_tab=0x00000000000810A8 pane=0x0000000001000D78 parent=0x0000000000C90BB8 rect=262,870,1444,894
+tab_switched active_tab=0x00000000001D0E08 pane=0x0000000001000D78 parent=0x00000000000B1004 rect=255,870,1444,894
+restored     active_tab=0x00000000000810A8 pane=0x0000000001000D78 parent=0x0000000000C90BB8 rect=262,960,1604,984
+```
+
+Every rectangle equaled its expected rectangle and overlap was false. Resize
+retained pane/tab/parent and changed the rectangle. Switching retained pane
+HWND while changing active tab and parent. Restore retained pane HWND,
+returned to the exact original tab/parent, and returned pane and expected
+rectangles to the initial values. Exact UIA runtime identities and observed
+selection states were:
+
+```text
+original_identity=42.2953076.4.11
+added_identity=42.2953076.4.101
+selected_original=true selected_added=true
+```
+
+The restored direct tab count was exactly one and its runtime identity equaled
+the original identity. The controlled Shell identity was revalidated before
+close.
+
+```text
+HOST_STDOUT TARGET_ACCEPTED protocol=1 pid=39008 tid=25744 hwnd=0x0000000002990372
+CLEANUP pane_absent=true exact_module_count=0 host_exit=0
+SAFETY stage=after explorer_windows=1 explorer_pids=2 run=0 service=0 task=0 processes=0 tcp=0
+GATE_C_PASS configuration=Debug pane_owner=explorer overlap=false cleanup=true
+```
+
+### Strict Release: FAIL before Host launch
+
+Release build command returned exit 0:
+
+```text
+pwsh -NoProfile -File .\scripts\build.ps1 -Configuration Release
+```
+
+The live command returned exit 1 before Host launch:
+
+```text
+pwsh -NoProfile -File .\scripts\run-gate-c.ps1 -Configuration Release
+```
+
+Exact failure:
+
+```text
+GATE_C_FAIL configuration=Release reason=Shell_window_snapshot_was_not_stable
+first=593076|15836|24460|CabinetWClass|file:///D:/MySetting/Downloads
+second=593076|15836|24460|CabinetWClass|file:///D:/MySetting/Downloads;9244760|20152|13516|CabinetWClass|file:///D:/PROJECTS/WinExInfo
+HOST_STDOUT <not-created>
+HOST_STDERR <not-created>
+```
+
+The exact new controlled window was separately revalidated and closed after
+the fail-closed rejection:
+
+```text
+CONTROLLED_CLEANUP hwnd=0x00000000008D1058 identity=CabinetWClass|20152|13516 url=file:///D:/PROJECTS/WinExInfo closed=true
+```
+
+The harness was subsequently hardened to require two identical candidate
+samples while retaining an exact discovered candidate for cleanup; it still
+propagates all COM/native identity errors and ambiguous deltas. This change
+was not followed by another live run under the mandatory Release-failure stop
+condition.
+
+Final read-only safety state after the separately revalidated controlled close:
+
+```text
+explorer_windows=1 explorer_pids=1 processes=0
+pid=15836 hook_count=0
+```
+
+## Superseded non-strict passing runs at head 3612965
 
 ### Debug
 
@@ -195,7 +285,7 @@ its own. Final state was one Shell window, only Explorer PID 15836 with Hook
 count zero, and zero WinExInfo processes. This eventual process exit does not
 replace the failed bounded module-cleanup result.
 
-## Commands and exits
+## Superseded earlier commands and exits
 
 Release was built before the live runs:
 
@@ -345,7 +435,7 @@ Run/service/task/WinExInfo-process/TCP counts were zero.
 
 ```text
 GATE_C_PASS configuration=Debug pane_owner=explorer overlap=false cleanup=true
-GATE_C_PASS configuration=Release pane_owner=explorer overlap=false cleanup=true
+GATE_C_FAIL configuration=Release reason=Shell_window_snapshot_was_not_stable
 ```
 
-Gate C: PASS. This evidence does not itself authorize downstream product work.
+Gate C: FAIL. No downstream product work is authorized.

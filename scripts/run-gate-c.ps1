@@ -67,6 +67,14 @@ public sealed class GateCLayout {
     public bool Overlap;
 }
 
+public sealed class GateCTabTransition {
+    public int Count;
+    public string OriginalIdentity;
+    public string AddedIdentity;
+    public bool OriginalSelectedObserved;
+    public bool AddedSelectedObserved;
+}
+
 public static class GateCHelper {
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
     [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
@@ -164,14 +172,29 @@ public static class GateCHelper {
     public static bool Exists(long value) { return IsWindow(new IntPtr(value)); }
     public static int ExactPaneCount(long value) {
         int count = 0;
+        string failure = null;
         EnumWindowsProc callback = delegate(IntPtr child, IntPtr unused) {
-            try { if (ClassOf(child) == "WinExInfo.StatusPane") count++; } catch { }
+            try { if (ClassOf(child) == "WinExInfo.StatusPane") count++; }
+            catch(Exception error) { failure=error.Message; return false; }
             return true;
         };
-        if (!EnumChildWindows(new IntPtr(value), callback, IntPtr.Zero))
-            throw new InvalidOperationException("EnumChildWindows failed");
+        bool enumerated=EnumChildWindows(new IntPtr(value), callback, IntPtr.Zero);
         GC.KeepAlive(callback);
+        if(failure!=null) throw new InvalidOperationException("pane_class_query_failed="+failure);
+        if (!enumerated)
+            throw new InvalidOperationException("EnumChildWindows failed");
         return count;
+    }
+
+    private static string RuntimeIdentity(AutomationElement element) {
+        int[] value=element.GetRuntimeId();
+        if(value==null||value.Length==0) throw new InvalidOperationException("tab_runtime_identity_missing");
+        StringBuilder result=new StringBuilder();
+        for(int index=0;index<value.Length;index++) {
+            if(index!=0) result.Append('.');
+            result.Append(value[index]);
+        }
+        return result.ToString();
     }
 
     private static string DirectChildZOrder(IntPtr top) {
@@ -259,7 +282,7 @@ public static class GateCHelper {
             Expected=expected, Dpi=dpi, Overlap=Intersects(paneRect,leftRect)||Intersects(paneRect,rightRect)
         };
     }
-    public static int AddAndSwitchTab(long topValue) {
+    public static GateCTabTransition AddAndSwitchTab(long topValue) {
         AutomationElement root = AutomationElement.FromHandle(new IntPtr(topValue));
         AutomationElement tabView = Exact("tab_view",root, TreeScope.Descendants,
             Property(AutomationElement.FrameworkIdProperty,"XAML"),
@@ -277,6 +300,7 @@ public static class GateCHelper {
             Property(AutomationElement.ClassNameProperty,"ListViewItem"));
         AutomationElementCollection before = list.FindAll(TreeScope.Children,itemCondition);
         if (before.Count != 1) throw new InvalidOperationException("Controlled window did not begin with exactly one tab");
+        string originalIdentity=RuntimeIdentity(before[0]);
         AutomationElement add = Exact("add_button",root, TreeScope.Descendants,
             Property(AutomationElement.FrameworkIdProperty,"XAML"),
             Property(AutomationElement.ControlTypeProperty,ControlType.Button),
@@ -287,13 +311,24 @@ public static class GateCHelper {
         AutomationElementCollection after;
         do { Sleep(25); after=list.FindAll(TreeScope.Children,itemCondition); } while(after.Count!=2 && wait.ElapsedMilliseconds<3000);
         if (after.Count != 2) throw new InvalidOperationException("Tab add did not produce exactly two direct tab items");
-        ((SelectionItemPattern)after[0].GetCurrentPattern(SelectionItemPattern.Pattern)).Select();
+        string firstIdentity=RuntimeIdentity(after[0]);
+        string secondIdentity=RuntimeIdentity(after[1]);
+        if(firstIdentity!=originalIdentity||secondIdentity==originalIdentity) throw new InvalidOperationException("tab_runtime_identity_transition_invalid");
+        SelectionItemPattern original=(SelectionItemPattern)after[0].GetCurrentPattern(SelectionItemPattern.Pattern);
+        SelectionItemPattern added=(SelectionItemPattern)after[1].GetCurrentPattern(SelectionItemPattern.Pattern);
+        original.Select();
         Sleep(250);
-        ((SelectionItemPattern)after[1].GetCurrentPattern(SelectionItemPattern.Pattern)).Select();
+        bool originalSelected=original.Current.IsSelected;
+        if(!originalSelected) throw new InvalidOperationException("original_tab_selection_not_observed");
+        added.Select();
         Sleep(250);
-        return after.Count;
+        bool addedSelected=added.Current.IsSelected;
+        if(!addedSelected) throw new InvalidOperationException("added_tab_selection_not_observed");
+        return new GateCTabTransition { Count=after.Count, OriginalIdentity=originalIdentity,
+            AddedIdentity=secondIdentity, OriginalSelectedObserved=originalSelected,
+            AddedSelectedObserved=addedSelected };
     }
-    public static void RestoreSingleTab(long topValue) {
+    public static string RestoreSingleTab(long topValue) {
         AutomationElement root = AutomationElement.FromHandle(new IntPtr(topValue));
         AutomationElement tabView = Exact("tab_view",root, TreeScope.Descendants,
             Property(AutomationElement.ControlTypeProperty,ControlType.Tab), Property(AutomationElement.AutomationIdProperty,"TabView"),
@@ -312,6 +347,9 @@ public static class GateCHelper {
         Stopwatch wait=Stopwatch.StartNew();
         do { Sleep(25); items=list.FindAll(TreeScope.Children,itemCondition); } while(items.Count!=1 && wait.ElapsedMilliseconds<3000);
         if(items.Count!=1) throw new InvalidOperationException("Tab restore did not return to one tab");
+        SelectionItemPattern remaining=(SelectionItemPattern)items[0].GetCurrentPattern(SelectionItemPattern.Pattern);
+        if(!remaining.Current.IsSelected) throw new InvalidOperationException("restored_tab_selection_not_observed");
+        return RuntimeIdentity(items[0]);
     }
 }
 '@
@@ -320,17 +358,58 @@ function Get-ShellWindows {
     $shell = New-Object -ComObject Shell.Application
     try {
         @($shell.Windows() | ForEach-Object {
-            try {
-                $hwnd = [long]$_.HWND
-                $identity = [GateCHelper]::Identity($hwnd)
-                if ($identity.ClassName -ceq 'CabinetWClass') {
-                    [pscustomobject]@{ Hwnd=$hwnd; Pid=$identity.Pid; Tid=$identity.Tid; LocationUrl=[string]$_.LocationURL }
-                }
+            $hwnd = [long]$_.HWND
+            $identity = [GateCHelper]::Identity($hwnd)
+            $url = [string]$_.LocationURL
+            if ($identity.ClassName -ceq 'CabinetWClass') {
+                [pscustomobject]@{ Hwnd=$hwnd; Pid=$identity.Pid; Tid=$identity.Tid; ClassName=$identity.ClassName; LocationUrl=$url }
             }
-            catch { }
         })
     }
     finally { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell) }
+}
+
+function Get-StableShellWindows {
+    $first = @(Get-ShellWindows | Sort-Object Hwnd)
+    Start-Sleep -Milliseconds 100
+    $second = @(Get-ShellWindows | Sort-Object Hwnd)
+    $firstSignature = @($first | ForEach-Object { "$($_.Hwnd)|$($_.Pid)|$($_.Tid)|$($_.ClassName)|$($_.LocationUrl)" }) -join ';'
+    $secondSignature = @($second | ForEach-Object { "$($_.Hwnd)|$($_.Pid)|$($_.Tid)|$($_.ClassName)|$($_.LocationUrl)" }) -join ';'
+    if ($firstSignature -cne $secondSignature) { throw "Shell window snapshot was not stable: first=$firstSignature second=$secondSignature" }
+    return $second
+}
+
+function Assert-ControlledShellWindow($Expected) {
+    $matches = @(Get-StableShellWindows | Where-Object Hwnd -EQ $Expected.Hwnd)
+    if ($matches.Count -ne 1 -or $matches[0].Pid -ne $Expected.Pid -or
+        $matches[0].Tid -ne $Expected.Tid -or $matches[0].ClassName -cne 'CabinetWClass' -or
+        $matches[0].LocationUrl -cne 'file:///D:/PROJECTS/WinExInfo') {
+        throw 'Controlled Shell window failed exact pre-close revalidation.'
+    }
+}
+
+function Wait-ControlledShellWindow($Before, [int]$TimeoutMs) {
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+    $previousCandidateSignature = $null
+    do {
+        $now = @(Get-ShellWindows | Sort-Object Hwnd)
+        foreach ($existing in $Before) {
+            $same = @($now | Where-Object { $_.Hwnd -eq $existing.Hwnd -and $_.Pid -eq $existing.Pid -and $_.Tid -eq $existing.Tid -and $_.ClassName -ceq $existing.ClassName -and $_.LocationUrl -ceq $existing.LocationUrl })
+            if ($same.Count -ne 1) { throw "Before Shell identity set changed for hwnd=0x$($existing.Hwnd.ToString('X16'))" }
+        }
+        $delta = @($now | Where-Object { $candidate=$_; -not ($Before | Where-Object Hwnd -EQ $candidate.Hwnd) })
+        if ($delta.Count -gt 1) { throw "Ambiguous controlled Explorer delta count=$($delta.Count)" }
+        if ($delta.Count -eq 1) {
+            if ($delta[0].ClassName -cne 'CabinetWClass' -or $delta[0].LocationUrl -cne 'file:///D:/PROJECTS/WinExInfo') { throw 'New Shell delta did not have the exact controlled identity.' }
+            $script:controlledCandidate = $delta[0]
+            $signature = "$($delta[0].Hwnd)|$($delta[0].Pid)|$($delta[0].Tid)|$($delta[0].ClassName)|$($delta[0].LocationUrl)"
+            if ($signature -ceq $previousCandidateSignature) { return $delta[0] }
+            $previousCandidateSignature = $signature
+        }
+        else { $previousCandidateSignature = $null }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw 'Exactly one stable controlled Explorer window was not created.'
 }
 
 function Get-SafetyState {
@@ -345,7 +424,13 @@ function Get-SafetyState {
         $ids = @($hostProcesses.Id)
         $tcpCount = @(Get-NetTCPConnection -ErrorAction SilentlyContinue | Where-Object { $ids -contains $_.OwningProcess }).Count
     }
-    [pscustomobject]@{ ExplorerWindows=@(Get-ShellWindows).Count; ExplorerPids=@(Get-Process explorer -ErrorAction SilentlyContinue).Count; RunCount=[int]($null -ne $runValue); ServiceCount=$serviceCount; TaskCount=$taskCount; WinExInfoProcessCount=$hostProcesses.Count; TcpCount=$tcpCount }
+    [pscustomobject]@{ ExplorerWindows=@(Get-StableShellWindows).Count; ExplorerPids=@(Get-Process explorer -ErrorAction SilentlyContinue).Count; RunCount=[int]($null -ne $runValue); ServiceCount=$serviceCount; TaskCount=$taskCount; WinExInfoProcessCount=$hostProcesses.Count; TcpCount=$tcpCount }
+}
+
+function Get-ExactModuleCount([int]$ProcessId) {
+    $process = Get-Process -Id $ProcessId -ErrorAction Stop
+    $modules = @($process.Modules)
+    return @($modules | Where-Object { $_.FileName -ceq $hookDll }).Count
 }
 
 function Wait-Until([scriptblock]$Condition, [int]$TimeoutMs, [string]$Failure) {
@@ -368,23 +453,31 @@ function Assert-Layout([GateCLayout]$Layout, [GateCWindowIdentity]$Target, [stri
     Write-Output "LAYOUT stage=$Stage active_tab_hwnd=0x$($Layout.ActiveTabHwnd.ToString('X16')) pane_hwnd=0x$($Layout.PaneHwnd.ToString('X16')) parent_hwnd=0x$($Layout.ParentHwnd.ToString('X16')) pid=$($Layout.PanePid) tid=$($Layout.PaneTid) class=$($Layout.PaneClass) text=$($Layout.PaneText -replace ' ','_') dpi=$($Layout.Dpi) parent=$($Layout.Parent) status=$($Layout.Status) left=$($Layout.LeftGroup) right=$($Layout.RightGroup) pane=$($Layout.Pane) expected=$($Layout.Expected) overlap=$($Layout.Overlap.ToString().ToLowerInvariant())"
 }
 
+function Assert-Equal([long]$Actual, [long]$Expected, [string]$Contract) {
+    if ($Actual -ne $Expected) { throw "$Contract actual=0x$($Actual.ToString('X16')) expected=0x$($Expected.ToString('X16'))" }
+}
+
+function Assert-RectEqual($Actual, $Expected, [string]$Contract) {
+    if ($Actual.ToString() -cne $Expected.ToString()) { throw "$Contract actual=$Actual expected=$Expected" }
+}
+
 $before = Get-SafetyState
-$beforeWindows = @(Get-ShellWindows)
+$beforeWindows = @(Get-StableShellWindows)
 $controlled = $null
+$script:controlledCandidate = $null
 $originalPlacement = $null
 $hostProcess = $null
 $tabAdded = $false
 $failure = $null
+$cleanupDiagnostics = @()
+$hostLogsEmitted = $false
 $script:lastLayoutDiagnostic = 'none'
 Remove-Item -LiteralPath $stdoutPath,$stderrPath -ErrorAction SilentlyContinue
 
 try {
     Start-Process -FilePath "$env:WINDIR\explorer.exe" -ArgumentList @('/n,', $root)
-    $controlled = Wait-Until -TimeoutMs 5000 -Failure 'Exactly one controlled Explorer window was not created.' -Condition {
-        $now = @(Get-ShellWindows)
-        $delta = @($now | Where-Object { $candidate=$_; -not ($beforeWindows | Where-Object Hwnd -EQ $candidate.Hwnd) })
-        if ($delta.Count -eq 1 -and $delta[0].LocationUrl -ceq 'file:///D:/PROJECTS/WinExInfo') { $delta[0] }
-    }
+    Start-Sleep -Milliseconds 500
+    $controlled = Wait-ControlledShellWindow $beforeWindows 5000
     $target = [GateCHelper]::Identity($controlled.Hwnd)
     if ($target.ClassName -cne 'CabinetWClass' -or $target.Pid -ne $controlled.Pid -or $target.Tid -ne $controlled.Tid) { throw 'Controlled target identity changed.' }
     $originalPlacement = [GateCHelper]::Placement($controlled.Hwnd)
@@ -403,27 +496,43 @@ try {
         try { $value=[GateCHelper]::Capture($controlled.Hwnd); $script:lastLayoutDiagnostic='none'; if ($value.Pane.ToString() -ne $initial.Pane.ToString()) { $value } } catch { $script:lastLayoutDiagnostic=$_.Exception.Message; $null }
     }
     Assert-Layout $resized $target 'resized'
+    Assert-Equal $resized.PaneHwnd $initial.PaneHwnd 'resize_pane_continuity'
+    Assert-Equal $resized.ActiveTabHwnd $initial.ActiveTabHwnd 'resize_active_tab_continuity'
+    Assert-Equal $resized.ParentHwnd $initial.ParentHwnd 'resize_parent_continuity'
+    if ($resized.Pane.ToString() -ceq $initial.Pane.ToString()) { throw 'Resize did not change pane rectangle.' }
 
-    $tabCount = [GateCHelper]::AddAndSwitchTab($controlled.Hwnd)
+    $tabTransition = [GateCHelper]::AddAndSwitchTab($controlled.Hwnd)
     $tabAdded = $true
     $switched = Wait-Until -TimeoutMs 3000 -Failure 'Pane did not reach exact state after tab switch within 3000ms.' -Condition {
         try { $value=[GateCHelper]::Capture($controlled.Hwnd); $script:lastLayoutDiagnostic='none'; $value } catch { $script:lastLayoutDiagnostic=$_.Exception.Message; $null }
     }
     Assert-Layout $switched $target 'tab_switched'
-    Write-Output "TAB_TRANSITION before=1 after_add=$tabCount selected_original=true selected_added=true"
+    Assert-Equal $switched.PaneHwnd $initial.PaneHwnd 'switch_pane_continuity'
+    if ($switched.ActiveTabHwnd -eq $initial.ActiveTabHwnd -or $switched.ParentHwnd -eq $initial.ParentHwnd) { throw 'Tab switch did not change exact active tab and parent.' }
+    if (-not $tabTransition.OriginalSelectedObserved -or -not $tabTransition.AddedSelectedObserved) { throw 'Tab selection state was not observed.' }
+    Write-Output "TAB_TRANSITION before=1 after_add=$($tabTransition.Count) original_identity=$($tabTransition.OriginalIdentity) added_identity=$($tabTransition.AddedIdentity) selected_original=$($tabTransition.OriginalSelectedObserved.ToString().ToLowerInvariant()) selected_added=$($tabTransition.AddedSelectedObserved.ToString().ToLowerInvariant())"
 
-    [GateCHelper]::RestoreSingleTab($controlled.Hwnd)
+    $restoredTabIdentity = [GateCHelper]::RestoreSingleTab($controlled.Hwnd)
     $tabAdded = $false
+    if ($restoredTabIdentity -cne $tabTransition.OriginalIdentity) { throw "Restored tab identity mismatch actual=$restoredTabIdentity expected=$($tabTransition.OriginalIdentity)" }
     [GateCHelper]::Restore($controlled.Hwnd, $originalPlacement)
     $restored = Wait-Until -TimeoutMs 3000 -Failure 'Pane did not reach exact restored state within 3000ms.' -Condition {
         try { $value=[GateCHelper]::Capture($controlled.Hwnd); $script:lastLayoutDiagnostic='none'; $value } catch { $script:lastLayoutDiagnostic=$_.Exception.Message; $null }
     }
     Assert-Layout $restored $target 'restored'
+    Assert-Equal $restored.PaneHwnd $initial.PaneHwnd 'restore_pane_continuity'
+    Assert-Equal $restored.ActiveTabHwnd $initial.ActiveTabHwnd 'restore_active_tab_continuity'
+    Assert-Equal $restored.ParentHwnd $initial.ParentHwnd 'restore_parent_continuity'
+    Assert-RectEqual $restored.Pane $initial.Pane 'restore_pane_rectangle'
+    Assert-RectEqual $restored.Expected $initial.Expected 'restore_expected_rectangle'
 
     if (-not $hostProcess.WaitForExit(10000)) { throw 'Host exceeded its bounded completion wait.' }
     $hostExit = $hostProcess.ExitCode
     $hostOut = @(Get-Content -LiteralPath $stdoutPath -ErrorAction SilentlyContinue)
     $hostErr = @(Get-Content -LiteralPath $stderrPath -ErrorAction SilentlyContinue)
+    $hostOut | ForEach-Object { Write-Output "HOST_STDOUT $_" }
+    $hostErr | ForEach-Object { Write-Output "HOST_STDERR $_" }
+    $hostLogsEmitted = $true
     $accepted = "TARGET_ACCEPTED protocol=1 pid=$($target.Pid) tid=$($target.Tid) hwnd=$hwndText"
     if ($hostExit -ne 0 -or @($hostOut | Where-Object { $_ -ceq $accepted }).Count -ne 1 -or $hostErr.Count -ne 0) {
         throw "Host contract failed: exit=$hostExit stdout=$($hostOut -join '|') stderr=$($hostErr -join '|')"
@@ -431,7 +540,13 @@ try {
     $paneAbsent = Wait-Until -TimeoutMs 5000 -Failure 'Pane cleanup was not observed within 5000ms.' -Condition {
         ([GateCHelper]::ExactPaneCount($controlled.Hwnd) -eq 0)
     }
-    $moduleCount = @(Get-Process -Id $target.Pid -ErrorAction Stop | Select-Object -ExpandProperty Modules | Where-Object { $_.FileName -ceq $hookDll }).Count
+    [void](Wait-Until -TimeoutMs 5000 -Failure 'Exact module cleanup was not observed within 5000ms.' -Condition {
+        $count = Get-ExactModuleCount $target.Pid
+        if ($count -eq 0) { return 'zero' }
+        $script:lastLayoutDiagnostic = "exact_module_count=$count"
+        return $false
+    })
+    $moduleCount = 0
     if (-not $paneAbsent -or $moduleCount -ne 0) { throw "Cleanup contract failed: pane_absent=$paneAbsent module_count=$moduleCount" }
     Write-Output $accepted
     Write-Output "CLEANUP pane_absent=true exact_module_count=$moduleCount host_exit=$hostExit"
@@ -441,29 +556,48 @@ catch {
 }
 finally {
     if ($tabAdded -and $null -ne $controlled -and [GateCHelper]::Exists($controlled.Hwnd)) {
-        try { [GateCHelper]::RestoreSingleTab($controlled.Hwnd) } catch { }
+        try { [void][GateCHelper]::RestoreSingleTab($controlled.Hwnd) } catch { $cleanupDiagnostics += "restore_tab=$($_.Exception.Message)" }
     }
     if ($null -ne $originalPlacement -and $null -ne $controlled -and [GateCHelper]::Exists($controlled.Hwnd)) {
-        try { [GateCHelper]::Restore($controlled.Hwnd, $originalPlacement) } catch { }
+        try { [GateCHelper]::Restore($controlled.Hwnd, $originalPlacement) } catch { $cleanupDiagnostics += "restore_placement=$($_.Exception.Message)" }
     }
     if ($null -ne $hostProcess -and -not $hostProcess.HasExited) {
-        Stop-Process -Id $hostProcess.Id -Force -ErrorAction SilentlyContinue
-        [void]$hostProcess.WaitForExit(5000)
+        try { [void]$hostProcess.WaitForExit(10000) } catch { $cleanupDiagnostics += "host_normal_wait=$($_.Exception.Message)" }
     }
+    if ($null -ne $hostProcess -and -not $hostProcess.HasExited) {
+        try { Stop-Process -Id $hostProcess.Id -Force -ErrorAction Stop } catch { $cleanupDiagnostics += "host_force_stop=$($_.Exception.Message)" }
+        try { [void]$hostProcess.WaitForExit(5000) } catch { $cleanupDiagnostics += "host_force_wait=$($_.Exception.Message)" }
+    }
+    if (-not $hostLogsEmitted) {
+        if (Test-Path -LiteralPath $stdoutPath -PathType Leaf) { try { @(Get-Content -LiteralPath $stdoutPath -ErrorAction Stop) | ForEach-Object { Write-Output "HOST_STDOUT $_" } } catch { $cleanupDiagnostics += "host_stdout=$($_.Exception.Message)" } } else { Write-Output 'HOST_STDOUT <not-created>' }
+        if (Test-Path -LiteralPath $stderrPath -PathType Leaf) { try { @(Get-Content -LiteralPath $stderrPath -ErrorAction Stop) | ForEach-Object { Write-Output "HOST_STDERR $_" } } catch { $cleanupDiagnostics += "host_stderr=$($_.Exception.Message)" } } else { Write-Output 'HOST_STDERR <not-created>' }
+    }
+    if ($null -eq $controlled -and $null -ne $script:controlledCandidate) { $controlled = $script:controlledCandidate }
+    $closeAuthorized = $false
     if ($null -ne $controlled -and [GateCHelper]::Exists($controlled.Hwnd)) {
-        [GateCHelper]::Close($controlled.Hwnd)
-        try { [void](Wait-Until -TimeoutMs 5000 -Failure 'Controlled Explorer window did not close within 5000ms.' -Condition { -not [GateCHelper]::Exists($controlled.Hwnd) }) } catch { if ($null -eq $failure) { throw } }
+        try { Assert-ControlledShellWindow $controlled; $closeAuthorized=$true } catch { $cleanupDiagnostics += "close_revalidation=$($_.Exception.Message)" }
     }
-    Remove-Item -LiteralPath $stdoutPath,$stderrPath -ErrorAction SilentlyContinue
+    if ($closeAuthorized) {
+        try { [GateCHelper]::Close($controlled.Hwnd) } catch { $cleanupDiagnostics += "close=$($_.Exception.Message)" }
+        try { [void](Wait-Until -TimeoutMs 5000 -Failure 'Controlled Explorer window did not close within 5000ms.' -Condition { -not [GateCHelper]::Exists($controlled.Hwnd) }) } catch { $cleanupDiagnostics += "close_wait=$($_.Exception.Message)" }
+    }
+    try { Remove-Item -LiteralPath $stdoutPath,$stderrPath -ErrorAction Stop } catch { if ((Test-Path -LiteralPath $stdoutPath) -or (Test-Path -LiteralPath $stderrPath)) { $cleanupDiagnostics += "temp_remove=$($_.Exception.Message)" } }
 }
 
-$after = Get-SafetyState
-Write-Output "SAFETY stage=after explorer_windows=$($after.ExplorerWindows) explorer_pids=$($after.ExplorerPids) run=$($after.RunCount) service=$($after.ServiceCount) task=$($after.TaskCount) processes=$($after.WinExInfoProcessCount) tcp=$($after.TcpCount)"
+$after = $null
+try { $after = Get-SafetyState } catch { $cleanupDiagnostics += "after_safety=$($_.Exception.Message)" }
+if ($null -ne $after) { Write-Output "SAFETY stage=after explorer_windows=$($after.ExplorerWindows) explorer_pids=$($after.ExplorerPids) run=$($after.RunCount) service=$($after.ServiceCount) task=$($after.TaskCount) processes=$($after.WinExInfoProcessCount) tcp=$($after.TcpCount)" }
 if ($null -ne $failure) {
+    if ($cleanupDiagnostics.Count -ne 0) { Write-Output "CLEANUP_DIAGNOSTIC $($cleanupDiagnostics -join '|')" }
     Write-Output "GATE_C_FAIL configuration=$Configuration reason=$($failure.Exception.Message -replace ' ','_')"
     throw $failure
 }
-if ($after.ExplorerWindows -ne $before.ExplorerWindows -or $after.RunCount -ne $before.RunCount -or
+if ($cleanupDiagnostics.Count -ne 0) {
+    Write-Output "CLEANUP_DIAGNOSTIC $($cleanupDiagnostics -join '|')"
+    Write-Output "GATE_C_FAIL configuration=$Configuration reason=cleanup_diagnostic"
+    throw "Cleanup failed: $($cleanupDiagnostics -join '|')"
+}
+if ($null -eq $after -or $after.ExplorerWindows -ne $before.ExplorerWindows -or $after.RunCount -ne $before.RunCount -or
     $after.ServiceCount -ne $before.ServiceCount -or $after.TaskCount -ne $before.TaskCount -or
     $after.WinExInfoProcessCount -ne $before.WinExInfoProcessCount -or $after.TcpCount -ne $before.TcpCount) {
     Write-Output "GATE_C_FAIL configuration=$Configuration reason=safety_state_mismatch"
