@@ -56,6 +56,7 @@ add_executable(WinExInfoTests
   tests/hook_target_mode.cpp
   tests/hook_test_modes.cpp
   tests/ipc_protocol_tests.cpp
+  tests/ipc_production_tests.cpp
   tests/observer_runtime_tests.cpp
   tests/observer_runtime_contract_tests.cpp
   tests/observer_shell_reconcile_tests.cpp
