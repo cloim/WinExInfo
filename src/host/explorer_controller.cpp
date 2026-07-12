@@ -57,6 +57,8 @@ bool IsExactTargetWindow(
 
 HostExitCode OpenFileIdentity(
     const std::wstring_view path,
+    const DWORD desiredAccess,
+    const DWORD shareMode,
     UniqueHandle* const file,
     ExplorerControllerFileIdentity* const output) {
     if (file == nullptr || *file || output == nullptr || path.empty() ||
@@ -64,8 +66,8 @@ HostExitCode OpenFileIdentity(
         return HostExitCode::Win32ComFailure;
     }
     UniqueHandle candidateFile{CreateFileW(
-        std::wstring{path}.c_str(), FILE_READ_ATTRIBUTES,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        std::wstring{path}.c_str(), desiredAccess,
+        shareMode,
         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr)};
     if (!candidateFile) {
         return HostExitCode::Win32ComFailure;
@@ -98,6 +100,7 @@ HostExitCode DosPathFromMappedDevicePath(
     if (length == 0 || length >= 512) {
         return HostExitCode::Win32ComFailure;
     }
+    std::vector<ExplorerControllerDeviceMapping> mappings;
     for (const wchar_t* drive = drives; *drive != L'\0';
          drive += std::wcslen(drive) + 1) {
         const std::wstring driveName{drive, 2};
@@ -105,16 +108,9 @@ HostExitCode DosPathFromMappedDevicePath(
         if (QueryDosDeviceW(driveName.c_str(), device, 32768) == 0) {
             return HostExitCode::Win32ComFailure;
         }
-        const std::wstring_view deviceName{device};
-        if (devicePath.size() >= deviceName.size() &&
-            _wcsnicmp(
-                devicePath.data(), deviceName.data(), deviceName.size()) == 0) {
-            *output = driveName;
-            output->append(devicePath.substr(deviceName.size()));
-            return HostExitCode::Pass;
-        }
+        mappings.push_back({device, driveName});
     }
-    return HostExitCode::Win32ComFailure;
+    return SelectExplorerControllerDosPath(devicePath, mappings, output);
 }
 
 enum class ModulePresence { Present, Absent, Error };
@@ -229,10 +225,8 @@ bool WaitForPipeFrame(const HANDLE pipe, const DWORD timeoutMs) {
 
 struct ProductionControllerState final {
     UniqueHandle pipe;
-    UniqueHandle hook_identity_file;
+    ExplorerControllerFileIdentityLock hook_identity_lock;
     std::unique_ptr<injection::ThreadHookInjector> injector;
-    ExplorerControllerFileIdentity hook_identity{};
-    bool hook_identity_captured = false;
     std::uint64_t detach_id = 0;
 };
 
@@ -337,14 +331,12 @@ ExplorerControllerOperations ProductionOperations(
                 return HostExitCode::Win32ComFailure;
             }
             *contextMayLive = false;
-            HostExitCode identityResult = OpenFileIdentity(
+            HostExitCode identityResult = AcquireExplorerControllerFileIdentityLock(
                 hookDllPath,
-                &state->hook_identity_file,
-                &state->hook_identity);
+                &state->hook_identity_lock);
             if (identityResult != HostExitCode::Pass) {
                 return identityResult;
             }
-            state->hook_identity_captured = true;
             std::wstring pipeName;
             Status status = ipc::BuildCurrentUserPipeName(&pipeName);
             if (status.ok()) {
@@ -426,7 +418,7 @@ ExplorerControllerOperations ProductionOperations(
                     ExplorerControllerFileIdentity loadedIdentity{};
                     if (CaptureExplorerControllerFileIdentity(
                             modulePath, &loadedIdentity) != HostExitCode::Pass ||
-                        !(loadedIdentity == state->hook_identity)) {
+                        !(loadedIdentity == state->hook_identity_lock.identity)) {
                         return Status{ErrorCode::TARGET_VALIDATION_FAILED,
                                       S_FALSE, ERROR_FILE_INVALID};
                     }
@@ -538,7 +530,7 @@ ExplorerControllerOperations ProductionOperations(
             return HostExitCode::Pass;
         },
         [state](const DWORD processId, bool* const absent) {
-            if (absent == nullptr || !state->hook_identity_captured) {
+            if (absent == nullptr || !state->hook_identity_lock.file) {
                 return HostExitCode::Win32ComFailure;
             }
             const auto deadline = std::chrono::steady_clock::now() +
@@ -546,7 +538,7 @@ ExplorerControllerOperations ProductionOperations(
             do {
                 ModulePresence presence = ModulePresence::Error;
                 const HostExitCode queried = QueryExactModulePresence(
-                    processId, state->hook_identity, &presence);
+                    processId, state->hook_identity_lock.identity, &presence);
                 if (queried != HostExitCode::Pass) {
                     return queried;
                 }
@@ -577,7 +569,12 @@ HostExitCode CaptureExplorerControllerFileIdentity(
     const std::wstring_view path,
     ExplorerControllerFileIdentity* const output) {
     UniqueHandle file;
-    return OpenFileIdentity(path, &file, output);
+    return OpenFileIdentity(
+        path,
+        FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        &file,
+        output);
 }
 
 HostExitCode CheckExplorerControllerFileIdentity(
@@ -594,6 +591,59 @@ HostExitCode CheckExplorerControllerFileIdentity(
         return captured;
     }
     *matches = candidate == expected;
+    return HostExitCode::Pass;
+}
+
+HostExitCode AcquireExplorerControllerFileIdentityLock(
+    const std::wstring_view path,
+    ExplorerControllerFileIdentityLock* const output) {
+    if (output == nullptr || output->file) {
+        return HostExitCode::Win32ComFailure;
+    }
+    ExplorerControllerFileIdentityLock candidate{};
+    const HostExitCode opened = OpenFileIdentity(
+        path, GENERIC_READ, FILE_SHARE_READ,
+        &candidate.file, &candidate.identity);
+    if (opened != HostExitCode::Pass) {
+        return opened;
+    }
+    *output = std::move(candidate);
+    return HostExitCode::Pass;
+}
+
+HostExitCode SelectExplorerControllerDosPath(
+    const std::wstring_view devicePath,
+    const std::span<const ExplorerControllerDeviceMapping> mappings,
+    std::wstring* const output) {
+    if (devicePath.empty() || mappings.empty() || output == nullptr) {
+        return HostExitCode::Win32ComFailure;
+    }
+    const ExplorerControllerDeviceMapping* selected = nullptr;
+    bool ambiguous = false;
+    for (const auto& mapping : mappings) {
+        const std::wstring_view prefix{mapping.device_prefix};
+        if (prefix.empty() || mapping.drive.empty() ||
+            devicePath.size() < prefix.size() ||
+            _wcsnicmp(devicePath.data(), prefix.data(), prefix.size()) != 0 ||
+            (devicePath.size() != prefix.size() &&
+             devicePath[prefix.size()] != L'\\')) {
+            continue;
+        }
+        if (selected == nullptr ||
+            mapping.device_prefix.size() > selected->device_prefix.size()) {
+            selected = &mapping;
+            ambiguous = false;
+        } else if (
+            mapping.device_prefix.size() == selected->device_prefix.size() &&
+            _wcsicmp(mapping.drive.c_str(), selected->drive.c_str()) != 0) {
+            ambiguous = true;
+        }
+    }
+    if (selected == nullptr || ambiguous) {
+        return HostExitCode::Win32ComFailure;
+    }
+    *output = selected->drive;
+    output->append(devicePath.substr(selected->device_prefix.size()));
     return HostExitCode::Pass;
 }
 

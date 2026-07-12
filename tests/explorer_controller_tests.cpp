@@ -279,6 +279,76 @@ WXI_TEST(explorer_controller_file_identity_survives_path_replacement,
     std::filesystem::remove_all(directory);
 }
 
+WXI_TEST(explorer_controller_identity_lock_blocks_path_mutation_until_release,
+         "explorer_controller.identity_lock") {
+    const auto directory = std::filesystem::temp_directory_path() /
+        L"WinExInfo.ControllerIdentityLock";
+    std::filesystem::remove_all(directory);
+    std::filesystem::create_directories(directory);
+    const auto target = directory / L"WinExInfoHook.dll";
+    const auto replacement = directory / L"Replacement.dll";
+    const auto renamed = directory / L"Renamed.dll";
+    { std::ofstream file(target, std::ios::binary); file << "original"; }
+    { std::ofstream file(replacement, std::ios::binary); file << "replacement"; }
+
+    ExplorerControllerFileIdentityLock lock{};
+    WXI_REQUIRE_EQ(
+        AcquireExplorerControllerFileIdentityLock(target.wstring(), &lock),
+        HostExitCode::Pass);
+    WXI_REQUIRE(MoveFileExW(target.c_str(), renamed.c_str(), 0) == FALSE);
+    WXI_REQUIRE_EQ(GetLastError(), static_cast<DWORD>(ERROR_SHARING_VIOLATION));
+    WXI_REQUIRE(DeleteFileW(target.c_str()) == FALSE);
+    WXI_REQUIRE_EQ(GetLastError(), static_cast<DWORD>(ERROR_SHARING_VIOLATION));
+    WXI_REQUIRE(ReplaceFileW(
+        target.c_str(), replacement.c_str(), nullptr, 0, nullptr, nullptr) == FALSE);
+    WXI_REQUIRE_EQ(GetLastError(), static_cast<DWORD>(ERROR_SHARING_VIOLATION));
+    UniqueHandle writer{CreateFileW(
+        target.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr)};
+    WXI_REQUIRE(!writer);
+    WXI_REQUIRE_EQ(GetLastError(), static_cast<DWORD>(ERROR_SHARING_VIOLATION));
+
+    lock.file.reset();
+    WXI_REQUIRE(ReplaceFileW(
+        target.c_str(), replacement.c_str(), nullptr, 0, nullptr, nullptr) != FALSE);
+    WXI_REQUIRE(MoveFileExW(target.c_str(), renamed.c_str(), 0) != FALSE);
+    WXI_REQUIRE(DeleteFileW(renamed.c_str()) != FALSE);
+    std::filesystem::remove_all(directory);
+}
+
+WXI_TEST(explorer_controller_device_path_uses_longest_component_prefix,
+         "explorer_controller.device_path_prefix") {
+    const std::vector<ExplorerControllerDeviceMapping> mappings{
+        {L"\\Device\\HarddiskVolume1", L"C:"},
+        {L"\\Device\\HarddiskVolume10", L"D:"},
+        {L"\\Device\\HarddiskVolume", L"Z:"},
+    };
+    std::wstring converted;
+    WXI_REQUIRE_EQ(
+        SelectExplorerControllerDosPath(
+            L"\\Device\\HarddiskVolume10\\apps\\WinExInfoHook.dll",
+            mappings,
+            &converted),
+        HostExitCode::Pass);
+    WXI_REQUIRE_EQ(converted, std::wstring{L"D:\\apps\\WinExInfoHook.dll"});
+    WXI_REQUIRE_EQ(
+        SelectExplorerControllerDosPath(
+            L"\\Device\\HarddiskVolume100\\apps\\WinExInfoHook.dll",
+            mappings,
+            &converted),
+        HostExitCode::Win32ComFailure);
+    const std::vector<ExplorerControllerDeviceMapping> ambiguous{
+        {L"\\Device\\HarddiskVolume10", L"D:"},
+        {L"\\Device\\HarddiskVolume10", L"E:"},
+    };
+    WXI_REQUIRE_EQ(
+        SelectExplorerControllerDosPath(
+            L"\\Device\\HarddiskVolume10\\apps\\WinExInfoHook.dll",
+            ambiguous,
+            &converted),
+        HostExitCode::Win32ComFailure);
+}
+
 WXI_TEST(explorer_controller_requires_exact_module_disappearance,
          "explorer_controller.module_disappearance") {
     Recorder recorder;

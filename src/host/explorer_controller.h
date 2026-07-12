@@ -1,5 +1,6 @@
 #pragma once
 
+#include "common/win32_handle.h"
 #include "host/command_line.h"
 
 #include <Windows.h>
@@ -8,6 +9,8 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <span>
+#include <string>
 #include <string_view>
 
 namespace winexinfo {
@@ -23,6 +26,16 @@ struct ExplorerControllerFileIdentity final {
     std::array<std::uint8_t, 16> file_id{};
 
     bool operator==(const ExplorerControllerFileIdentity&) const = default;
+};
+
+struct ExplorerControllerFileIdentityLock final {
+    UniqueHandle file;
+    ExplorerControllerFileIdentity identity{};
+};
+
+struct ExplorerControllerDeviceMapping final {
+    std::wstring device_prefix;
+    std::wstring drive;
 };
 
 struct ExplorerControllerOperations final {
@@ -50,6 +63,13 @@ struct ExplorerControllerOperations final {
     std::wstring_view path,
     const ExplorerControllerFileIdentity& expected,
     bool* matches);
+[[nodiscard]] HostExitCode AcquireExplorerControllerFileIdentityLock(
+    std::wstring_view path,
+    ExplorerControllerFileIdentityLock* output);
+[[nodiscard]] HostExitCode SelectExplorerControllerDosPath(
+    std::wstring_view devicePath,
+    std::span<const ExplorerControllerDeviceMapping> mappings,
+    std::wstring* output);
 
 [[nodiscard]] HostExitCode RunGateCPlacementWithOperations(
     HWND target,
