@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common/status.h"
+#include "common/win32_handle.h"
 #include "host/command_line.h"
 #include "host/explorer_session.h"
 #include "probe/tab_identity.h"
@@ -20,6 +21,11 @@ namespace winexinfo {
 
 inline constexpr std::wstring_view kBackgroundMutexName =
     L"Local\\WinExInfo.Host.v1";
+
+[[nodiscard]] Status BuildBackgroundStopEventName(
+    DWORD processId, std::wstring* output);
+[[nodiscard]] Status CreateBackgroundStopEvent(
+    DWORD processId, UniqueHandle* output);
 
 struct ExplorerProcessSnapshot final {
     DWORD process_id = 0;

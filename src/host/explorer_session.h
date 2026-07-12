@@ -8,6 +8,8 @@
 
 #include <cstdint>
 #include <functional>
+#include <iosfwd>
+#include <memory>
 #include <span>
 #include <string>
 #include <mutex>
@@ -21,6 +23,22 @@ struct SessionWindowSnapshot final {
     std::vector<ipc::TabDescriptor> tabs;
 
     bool operator==(const SessionWindowSnapshot&) const = default;
+};
+
+class LifecycleDiagnosticJournal final {
+public:
+    explicit LifecycleDiagnosticJournal(std::size_t capacity = 4096);
+    ~LifecycleDiagnosticJournal();
+    LifecycleDiagnosticJournal(const LifecycleDiagnosticJournal&) = delete;
+    LifecycleDiagnosticJournal& operator=(const LifecycleDiagnosticJournal&) = delete;
+    [[nodiscard]] bool TryAppend(
+        std::string dedupKey, std::string line) noexcept;
+    [[nodiscard]] bool incomplete() const noexcept;
+    [[nodiscard]] std::vector<std::string> Snapshot() const;
+    void Flush(std::ostream& output) const;
+private:
+    class Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 struct ExplorerSessionOperations final {
@@ -38,6 +56,7 @@ struct ExplorerSessionOperations final {
     std::function<Status(DWORD)> release_hooks;
     std::function<Status(DWORD, DWORD, bool*)> wait_exact_module_absent;
     std::function<Status(DWORD)> confirm_target_gone;
+    std::shared_ptr<LifecycleDiagnosticJournal> diagnostic_journal;
 };
 
 class ExplorerSession final {
@@ -58,6 +77,7 @@ private:
     [[nodiscard]] Status NextRequestId(std::uint64_t* output) noexcept;
     [[nodiscard]] Status SendUpdate(const SessionWindowSnapshot& snapshot);
     [[nodiscard]] Status SendRemoval(const WindowState& window);
+    void RecordDiagnostic(std::string key, std::string line) noexcept;
 
     DWORD process_id_ = 0;
     std::mutex mutex_;
@@ -70,6 +90,9 @@ private:
     bool release_complete_ = false;
     bool detach_complete_ = false;
     bool stopped_ = false;
+    ipc::DetachResult last_detach_result_{};
+    std::uint64_t last_detach_request_id_ = 0;
+    bool has_detach_result_ = false;
 };
 
 [[nodiscard]] std::string FormatLifecycleAttachDiagnostic(
@@ -81,10 +104,12 @@ private:
     DWORD processId, std::uint64_t requestId,
     const ipc::WindowRemoveRequest&, const ipc::WindowRemoveResult&);
 [[nodiscard]] std::string FormatLifecycleDetachDiagnostic(
-    DWORD processId, std::uint64_t requestId, const ipc::DetachResult&);
+    DWORD processId, std::uint64_t requestId, const ipc::DetachResult&,
+    std::uint32_t finalResult);
 
 [[nodiscard]] ExplorerSessionOperations CreateProductionExplorerSessionOperations(
     DWORD processId,
-    std::wstring hookDllPath);
+    std::wstring hookDllPath,
+    std::shared_ptr<LifecycleDiagnosticJournal> diagnosticJournal = {});
 
 }  // namespace winexinfo

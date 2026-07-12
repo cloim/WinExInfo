@@ -7,6 +7,8 @@
 
 #include <cstdint>
 #include <atomic>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <thread>
 #include <mutex>
@@ -48,6 +50,10 @@ struct Recorder final {
     bool mismatch_generation = false;
     bool fail_unhook = false;
     bool module_absent = true;
+    Status module_status = Ok();
+    DWORD detach_pid = 0;
+    std::shared_ptr<winexinfo::LifecycleDiagnosticJournal> journal =
+        std::make_shared<winexinfo::LifecycleDiagnosticJournal>();
     unsigned drift_after_validation = 0;
     unsigned validation_count = 0;
     unsigned attach_count = 0;
@@ -144,7 +150,7 @@ ExplorerSessionOperations Recorder::Operations() {
             } else if (request.message_type ==
                        winexinfo::ipc::MessageType::DetachRequest) {
                 status = winexinfo::ipc::EncodeDetachResult(
-                    response_id, {pid, 0, {}}, &encoded);
+                    response_id, {detach_pid == 0 ? pid : detach_pid, 0, {}}, &encoded);
             } else {
                 return Fail(winexinfo::ErrorCode::IPC_PROTOCOL_ERROR);
             }
@@ -159,12 +165,13 @@ ExplorerSessionOperations Recorder::Operations() {
             Event("module_absent:" + std::to_string(process_id));
             WXI_REQUIRE_EQ(timeout, DWORD{5000});
             if (absent != nullptr) *absent = module_absent;
-            return Ok();
+            return module_status;
         },
         [this](const DWORD process_id) {
             Event("confirm_gone:" + std::to_string(process_id));
             return Ok();
         },
+        journal,
     };
 }
 
@@ -199,8 +206,51 @@ WXI_TEST(explorer_session_formats_machine_parseable_authoritative_diagnostics,
         std::string{"LIFECYCLE_EVENT event=remove pid=41 request=4 hwnd=0x0000000000001000 top_generation=7 result=0"});
     WXI_REQUIRE_EQ(
         winexinfo::FormatLifecycleDetachDiagnostic(
-            41, 5, {41, 0, {}, {0, 0, 0, 0, 0}}),
-        std::string{"LIFECYCLE_EVENT event=stop pid=41 request=5 result=0 pane=0 tab_subclass=0 parent_subclass=0 refresh_worker=0 callback=0"});
+            41, 5, {41, 0, {}, {0, 0, 0, 0, 0}}, 0),
+        std::string{"LIFECYCLE_EVENT event=stop pid=41 ack_pid=41 request=5 result=0 ack_result=0 pane=0 tab_subclass=0 parent_subclass=0 refresh_worker=0 callback=0"});
+}
+
+WXI_TEST(explorer_session_journal_deduplicates_and_marks_overflow,
+         "explorer_session.lifecycle_journal") {
+    winexinfo::LifecycleDiagnosticJournal journal{2};
+    WXI_REQUIRE(journal.TryAppend("update:1", "one"));
+    WXI_REQUIRE(journal.TryAppend("update:1", "one"));
+    WXI_REQUIRE(journal.TryAppend({}, "two"));
+    WXI_REQUIRE(!journal.TryAppend({}, "three"));
+    WXI_REQUIRE(journal.incomplete());
+    WXI_REQUIRE_EQ(journal.Snapshot(), (std::vector<std::string>{"one", "two"}));
+}
+
+WXI_TEST(explorer_session_transport_never_writes_or_flushes_stdout,
+         "explorer_session.lifecycle_diagnostics_nonblocking") {
+    const std::filesystem::path source =
+        std::filesystem::path{__FILE__}.parent_path().parent_path() /
+        "src" / "host" / "explorer_session.cpp";
+    std::ifstream stream{source, std::ios::binary};
+    WXI_REQUIRE(stream.good());
+    const std::string text{
+        std::istreambuf_iterator<char>{stream},
+        std::istreambuf_iterator<char>{}};
+    const std::size_t begin = text.find(
+        "ExplorerSessionOperations CreateProductionExplorerSessionOperations");
+    WXI_REQUIRE(begin != std::string::npos);
+    const std::string body = text.substr(begin);
+    WXI_REQUIRE(body.find("std::cout") == std::string::npos);
+    WXI_REQUIRE(body.find(".Flush(") == std::string::npos);
+}
+
+WXI_TEST(explorer_session_stop_diagnostic_exposes_mismatched_ack_pid,
+         "explorer_session.stop_diagnostic_ack_pid") {
+    Recorder recorder;
+    recorder.detach_pid = 99;
+    ExplorerSession session{recorder.pid, recorder.Operations()};
+    const std::vector windows{Window(0x1000, 1, 11)};
+    WXI_REQUIRE(session.Reconcile(windows).ok());
+    WXI_REQUIRE(!session.Stop().ok());
+    const auto lines = recorder.journal->Snapshot();
+    WXI_REQUIRE(!lines.empty());
+    WXI_REQUIRE(lines.back().find("pid=41 ack_pid=99") != std::string::npos);
+    WXI_REQUIRE(lines.back().find(" result=0 ") == std::string::npos);
 }
 
 WXI_TEST(explorer_session_shared_tid_deduplicates_lease,
@@ -361,12 +411,31 @@ WXI_TEST(explorer_session_module_absence_can_be_rechecked_without_redetach,
     WXI_REQUIRE(session.Reconcile(std::vector{Window(0x1000, 1, 11)}).ok());
     recorder.module_absent = false;
     WXI_REQUIRE(!session.Stop().ok());
+    auto diagnosticLines = recorder.journal->Snapshot();
+    WXI_REQUIRE(diagnosticLines.back().find(" result=0 ") == std::string::npos);
     recorder.module_absent = true;
     recorder.events.clear();
     WXI_REQUIRE(session.Stop().ok());
     WXI_REQUIRE_EQ(recorder.events.size(), 2u);
     WXI_REQUIRE_EQ(recorder.events[0], "module_absent:41");
     WXI_REQUIRE_EQ(recorder.events[1], "confirm_gone:41");
+    diagnosticLines = recorder.journal->Snapshot();
+    WXI_REQUIRE(diagnosticLines.back().find(" result=0 ") != std::string::npos);
+}
+
+WXI_TEST(explorer_session_stop_diagnostic_preserves_module_check_failure,
+         "explorer_session.stop_diagnostic_module_failure") {
+    Recorder recorder;
+    recorder.module_status = Fail(winexinfo::ErrorCode::PIPE_DISCONNECTED);
+    ExplorerSession session{recorder.pid, recorder.Operations()};
+    WXI_REQUIRE(session.Reconcile(std::vector{Window(0x1000, 1, 11)}).ok());
+    WXI_REQUIRE(!session.Stop().ok());
+    const auto lines = recorder.journal->Snapshot();
+    WXI_REQUIRE(!lines.empty());
+    WXI_REQUIRE(lines.back().find(
+        " result=" + std::to_string(static_cast<std::uint32_t>(
+            winexinfo::ErrorCode::PIPE_DISCONNECTED)) + " ") !=
+        std::string::npos);
 }
 
 WXI_TEST(explorer_session_serializes_reconcile_calls,

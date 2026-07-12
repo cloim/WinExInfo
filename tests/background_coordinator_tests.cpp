@@ -6,8 +6,11 @@
 #include "probe/win32_probe.h"
 
 #include <algorithm>
+#include <Aclapi.h>
 #include <objbase.h>
 #include <deque>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <vector>
@@ -119,6 +122,66 @@ WXI_TEST(background_single_instance_mutex,
         winexinfo::RunBackgroundCoordinator(recorder.Operations()),
         HostExitCode::Win32ComFailure);
     WXI_REQUIRE_EQ(recorder.events.size(), 1u);
+}
+
+WXI_TEST(background_stop_event_is_exact_per_host_pid,
+         "background_coordinator.stop_event_name") {
+    std::wstring name;
+    WXI_REQUIRE(winexinfo::BuildBackgroundStopEventName(4321, &name).ok());
+    WXI_REQUIRE_EQ(name, std::wstring{L"Local\\WinExInfo.Host.Stop.v1.4321"});
+    WXI_REQUIRE(!winexinfo::BuildBackgroundStopEventName(0, &name).ok());
+    winexinfo::UniqueHandle first;
+    winexinfo::UniqueHandle collision;
+    WXI_REQUIRE(winexinfo::CreateBackgroundStopEvent(GetCurrentProcessId(), &first).ok());
+    PACL dacl = nullptr;
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    WXI_REQUIRE_EQ(GetSecurityInfo(
+        first.get(), SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION,
+        nullptr, nullptr, &dacl, nullptr, &descriptor), DWORD{ERROR_SUCCESS});
+    WXI_REQUIRE(dacl != nullptr);
+    WXI_REQUIRE_EQ(dacl->AceCount, WORD{1});
+    void* rawAce = nullptr;
+    WXI_REQUIRE(GetAce(dacl, 0, &rawAce) != FALSE);
+    const auto* ace = static_cast<const ACCESS_ALLOWED_ACE*>(rawAce);
+    WXI_REQUIRE_EQ(ace->Header.AceType, BYTE{ACCESS_ALLOWED_ACE_TYPE});
+    WXI_REQUIRE_EQ(ace->Mask, DWORD{EVENT_MODIFY_STATE | SYNCHRONIZE});
+    HANDLE rawToken = nullptr;
+    WXI_REQUIRE(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &rawToken) != FALSE);
+    winexinfo::UniqueHandle token{rawToken};
+    DWORD tokenBytes = 0;
+    WXI_REQUIRE(GetTokenInformation(
+        token.get(), TokenUser, nullptr, 0, &tokenBytes) == FALSE);
+    WXI_REQUIRE_EQ(GetLastError(), DWORD{ERROR_INSUFFICIENT_BUFFER});
+    std::vector<std::uint8_t> tokenBuffer(tokenBytes);
+    WXI_REQUIRE(GetTokenInformation(
+        token.get(), TokenUser, tokenBuffer.data(), tokenBytes,
+        &tokenBytes) != FALSE);
+    const auto* user = reinterpret_cast<const TOKEN_USER*>(tokenBuffer.data());
+    const auto* aceSid = reinterpret_cast<const SID*>(&ace->SidStart);
+    WXI_REQUIRE(EqualSid(user->User.Sid, const_cast<SID*>(aceSid)) != FALSE);
+    LocalFree(descriptor);
+    WXI_REQUIRE(!winexinfo::CreateBackgroundStopEvent(
+        GetCurrentProcessId(), &collision).ok());
+    first.reset();
+    WXI_REQUIRE(winexinfo::CreateBackgroundStopEvent(
+        GetCurrentProcessId(), &collision).ok());
+}
+
+WXI_TEST(background_flushes_lifecycle_journal_only_after_all_sessions_stop,
+         "background_coordinator.lifecycle_flush_order") {
+    const std::filesystem::path source =
+        std::filesystem::path{__FILE__}.parent_path().parent_path() /
+        "src" / "host" / "background_coordinator.cpp";
+    std::ifstream stream{source, std::ios::binary};
+    WXI_REQUIRE(stream.good());
+    const std::string text{
+        std::istreambuf_iterator<char>{stream},
+        std::istreambuf_iterator<char>{}};
+    const std::size_t run = text.find(
+        "const HostExitCode result = RunBackgroundCoordinator(operations)");
+    const std::size_t flush = text.find("diagnostic_journal->Flush", run);
+    WXI_REQUIRE(run != std::string::npos && flush != std::string::npos);
+    WXI_REQUIRE(run < flush);
 }
 
 WXI_TEST(background_existing_multi_window_one_session,

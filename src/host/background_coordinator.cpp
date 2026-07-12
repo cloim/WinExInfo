@@ -6,10 +6,12 @@
 #include "probe/uia_probe.h"
 
 #include <algorithm>
+#include <Aclapi.h>
 #include <atomic>
 #include <condition_variable>
 #include <ExDisp.h>
 #include <limits>
+#include <iostream>
 #include <map>
 #include <mutex>
 #include <new>
@@ -25,6 +27,42 @@ namespace {
 bool ExactSuccess(const Status& status) noexcept {
     return status.code == ErrorCode::OK && status.hresult == S_OK &&
         status.win32 == ERROR_SUCCESS;
+}
+
+Status BackgroundFailure(const DWORD error) noexcept {
+    return {ErrorCode::PIPE_DISCONNECTED, HRESULT_FROM_WIN32(error), error};
+}
+
+Status CaptureCurrentUserSid(std::vector<std::uint8_t>* const output) {
+    if (output == nullptr) return BackgroundFailure(ERROR_INVALID_PARAMETER);
+    HANDLE rawToken = nullptr;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &rawToken) == FALSE) {
+        return BackgroundFailure(GetLastError());
+    }
+    UniqueHandle token{rawToken};
+    DWORD size = 0;
+    if (GetTokenInformation(token.get(), TokenUser, nullptr, 0, &size) != FALSE ||
+        GetLastError() != ERROR_INSUFFICIENT_BUFFER || size == 0) {
+        return BackgroundFailure(GetLastError());
+    }
+    try {
+        std::vector<std::uint8_t> buffer(size);
+        if (GetTokenInformation(
+                token.get(), TokenUser, buffer.data(), size, &size) == FALSE) {
+            return BackgroundFailure(GetLastError());
+        }
+        const auto* user = reinterpret_cast<const TOKEN_USER*>(buffer.data());
+        const DWORD sidSize = GetLengthSid(user->User.Sid);
+        std::vector<std::uint8_t> sid(sidSize);
+        if (sidSize == 0 ||
+            CopySid(sidSize, sid.data(), user->User.Sid) == FALSE) {
+            return BackgroundFailure(GetLastError());
+        }
+        *output = std::move(sid);
+        return {ErrorCode::OK, S_OK, ERROR_SUCCESS};
+    } catch (const std::bad_alloc&) {
+        return {ErrorCode::PIPE_DISCONNECTED, E_OUTOFMEMORY, ERROR_SUCCESS};
+    }
 }
 
 bool ValidSnapshot(const BackgroundSnapshot& snapshot) {
@@ -353,13 +391,15 @@ private:
 
 struct ProductionBackgroundState final {
     explicit ProductionBackgroundState(std::wstring path)
-        : hook_dll_path(std::move(path)) {}
+        : hook_dll_path(std::move(path)),
+          diagnostic_journal(std::make_shared<LifecycleDiagnosticJournal>()) {}
     std::wstring hook_dll_path;
     UniqueHandle mutex;
     UniqueHandle stop_event;
     ProductionBackgroundObserver observer;
     std::uint64_t sequence = 0;
     bool console_handler = false;
+    std::shared_ptr<LifecycleDiagnosticJournal> diagnostic_journal;
 };
 
 std::vector<std::unique_ptr<BackgroundSession>>& RetainedProductionSessions() {
@@ -369,6 +409,66 @@ std::vector<std::unique_ptr<BackgroundSession>>& RetainedProductionSessions() {
 }
 
 }  // namespace
+
+Status BuildBackgroundStopEventName(
+    const DWORD processId, std::wstring* const output) {
+    if (processId == 0 || output == nullptr) {
+        return BackgroundFailure(ERROR_INVALID_PARAMETER);
+    }
+    try {
+        *output = L"Local\\WinExInfo.Host.Stop.v1." +
+            std::to_wstring(processId);
+        return {ErrorCode::OK, S_OK, ERROR_SUCCESS};
+    } catch (const std::bad_alloc&) {
+        return {ErrorCode::PIPE_DISCONNECTED, E_OUTOFMEMORY, ERROR_SUCCESS};
+    }
+}
+
+Status CreateBackgroundStopEvent(
+    const DWORD processId, UniqueHandle* const output) {
+    if (processId == 0 || output == nullptr || *output) {
+        return BackgroundFailure(ERROR_INVALID_PARAMETER);
+    }
+    std::wstring name;
+    Status status = BuildBackgroundStopEventName(processId, &name);
+    std::vector<std::uint8_t> sid;
+    if (status.ok()) status = CaptureCurrentUserSid(&sid);
+    if (!status.ok()) return status;
+    EXPLICIT_ACCESSW access{};
+    access.grfAccessPermissions = EVENT_MODIFY_STATE | SYNCHRONIZE;
+    access.grfAccessMode = SET_ACCESS;
+    access.grfInheritance = NO_INHERITANCE;
+    access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    access.Trustee.TrusteeType = TRUSTEE_IS_USER;
+    access.Trustee.ptstrName = reinterpret_cast<LPWSTR>(sid.data());
+    PACL acl = nullptr;
+    const DWORD aclStatus = SetEntriesInAclW(1, &access, nullptr, &acl);
+    if (aclStatus != ERROR_SUCCESS || acl == nullptr) {
+        return BackgroundFailure(aclStatus);
+    }
+    SECURITY_DESCRIPTOR descriptor{};
+    if (InitializeSecurityDescriptor(
+            &descriptor, SECURITY_DESCRIPTOR_REVISION) == FALSE ||
+        SetSecurityDescriptorDacl(&descriptor, TRUE, acl, FALSE) == FALSE) {
+        const DWORD error = GetLastError();
+        LocalFree(acl);
+        return BackgroundFailure(error);
+    }
+    SECURITY_ATTRIBUTES attributes{
+        sizeof(SECURITY_ATTRIBUTES), &descriptor, FALSE};
+    SetLastError(ERROR_SUCCESS);
+    const HANDLE event = CreateEventW(
+        &attributes, TRUE, FALSE, name.c_str());
+    const DWORD error = GetLastError();
+    LocalFree(acl);
+    if (event == nullptr) return BackgroundFailure(error);
+    if (error == ERROR_ALREADY_EXISTS) {
+        CloseHandle(event);
+        return BackgroundFailure(ERROR_ALREADY_EXISTS);
+    }
+    output->reset(event);
+    return {ErrorCode::OK, S_OK, ERROR_SUCCESS};
+}
 
 Status BackgroundObserverTracker::Reconcile(
     const std::uint64_t sequence,
@@ -633,13 +733,12 @@ HostExitCode RunProductionBackgroundCoordinator(const std::wstring& hookDllPath)
                               HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS),
                               ERROR_ALREADY_EXISTS};
             }
-            state->stop_event.reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
-            if (!state->stop_event) {
-                const DWORD error = GetLastError();
+            const Status stopEvent = CreateBackgroundStopEvent(
+                GetCurrentProcessId(), &state->stop_event);
+            if (!stopEvent.ok()) {
                 ReleaseMutex(state->mutex.get());
                 state->mutex.reset();
-                return Status{ErrorCode::PIPE_DISCONNECTED,
-                              HRESULT_FROM_WIN32(error), error};
+                return stopEvent;
             }
             const Status observer = state->observer.Start();
             if (!observer.ok()) {
@@ -708,7 +807,8 @@ HostExitCode RunProductionBackgroundCoordinator(const std::wstring& hookDllPath)
                 *output = std::make_unique<ProductionBackgroundSession>(
                     pid,
                     CreateProductionExplorerSessionOperations(
-                        pid, state->hook_dll_path));
+                        pid, state->hook_dll_path,
+                        state->diagnostic_journal));
                 return Status{ErrorCode::OK, S_OK, ERROR_SUCCESS};
             } catch (const std::bad_alloc&) {
                 return Status{ErrorCode::PIPE_DISCONNECTED,
@@ -719,7 +819,14 @@ HostExitCode RunProductionBackgroundCoordinator(const std::wstring& hookDllPath)
             if (session) RetainedProductionSessions().push_back(std::move(session));
         },
     };
-    return RunBackgroundCoordinator(operations);
+    const HostExitCode result = RunBackgroundCoordinator(operations);
+    if (result == HostExitCode::Pass) {
+        state->diagnostic_journal->Flush(std::cout);
+        if (state->diagnostic_journal->incomplete() || !std::cout.good()) {
+            return HostExitCode::Win32ComFailure;
+        }
+    }
+    return result;
 }
 
 }  // namespace winexinfo

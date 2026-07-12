@@ -10,15 +10,17 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <limits>
 #include <iomanip>
-#include <iostream>
 #include <memory>
 #include <new>
+#include <ostream>
 #include <sstream>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 
 namespace winexinfo {
@@ -50,52 +52,6 @@ std::string HexHwnd(const std::uint64_t value) {
     output << "0x" << std::uppercase << std::hex << std::setw(16)
            << std::setfill('0') << value;
     return output.str();
-}
-
-void EmitLifecycleDiagnostic(const std::string& line) {
-    static std::mutex mutex;
-    std::scoped_lock lock{mutex};
-    std::cout << line << '\n' << std::flush;
-}
-
-void EmitExchangeDiagnostic(
-    const DWORD processId,
-    const ipc::DecodedFrame& request,
-    const ipc::DecodedFrame& response) noexcept {
-    try {
-        if (request.message_type == ipc::MessageType::TabSetUpdate) {
-            ipc::TabSetUpdate update{};
-            ipc::TabSetResult result{};
-            if (ipc::DecodeTabSetUpdate(request, &update).ok() &&
-                ipc::DecodeTabSetResult(
-                    response, request.request_id,
-                    update.top_level_generation, &result).ok()) {
-                EmitLifecycleDiagnostic(FormatLifecycleUpdateDiagnostic(
-                    processId, request.request_id, update, result));
-            }
-        } else if (request.message_type ==
-                   ipc::MessageType::WindowRemoveRequest) {
-            ipc::WindowRemoveRequest removal{};
-            ipc::WindowRemoveResult result{};
-            if (ipc::DecodeWindowRemoveRequest(request, &removal).ok() &&
-                ipc::DecodeWindowRemoveResult(
-                    response, request.request_id,
-                    removal.top_level_generation, &result).ok()) {
-                EmitLifecycleDiagnostic(FormatLifecycleRemoveDiagnostic(
-                    processId, request.request_id, removal, result));
-            }
-        } else if (request.message_type == ipc::MessageType::DetachRequest) {
-            ipc::DetachResult result{};
-            if (ipc::DecodeDetachRequest(request).ok() &&
-                ipc::DecodeDetachResult(
-                    response, request.request_id, &result).ok()) {
-                EmitLifecycleDiagnostic(FormatLifecycleDetachDiagnostic(
-                    processId, request.request_id, result));
-            }
-        }
-    } catch (...) {
-        // Diagnostics never alter the transport or cleanup contract.
-    }
 }
 
 constexpr DWORD kSessionWaitMilliseconds = 5000;
@@ -226,6 +182,75 @@ struct ProductionSessionState final {
 
 }  // namespace
 
+class LifecycleDiagnosticJournal::Impl final {
+public:
+    explicit Impl(const std::size_t requestedCapacity)
+        : capacity(requestedCapacity) {}
+    const std::size_t capacity;
+    mutable std::mutex mutex;
+    std::vector<std::string> lines;
+    std::unordered_map<std::string, std::string> last_by_key;
+    std::atomic<bool> incomplete{false};
+};
+
+LifecycleDiagnosticJournal::LifecycleDiagnosticJournal(const std::size_t capacity)
+    : impl_(std::make_unique<Impl>(capacity)) {}
+
+LifecycleDiagnosticJournal::~LifecycleDiagnosticJournal() = default;
+
+bool LifecycleDiagnosticJournal::TryAppend(
+    std::string dedupKey, std::string line) noexcept {
+    if (!impl_) return false;
+    if (impl_->capacity == 0) {
+        impl_->incomplete.store(true, std::memory_order_release);
+        return false;
+    }
+    std::unique_lock lock{impl_->mutex, std::try_to_lock};
+    if (!lock.owns_lock()) {
+        impl_->incomplete.store(true, std::memory_order_release);
+        return false;
+    }
+    try {
+        if (!dedupKey.empty()) {
+            const auto prior = impl_->last_by_key.find(dedupKey);
+            if (prior != impl_->last_by_key.end() && prior->second == line) {
+                return true;
+            }
+        }
+        if (impl_->lines.size() == impl_->capacity) {
+            impl_->incomplete.store(true, std::memory_order_release);
+            return false;
+        }
+        impl_->lines.push_back(line);
+        if (!dedupKey.empty()) {
+            impl_->last_by_key.insert_or_assign(
+                std::move(dedupKey), std::move(line));
+        }
+        return true;
+    } catch (...) {
+        impl_->incomplete.store(true, std::memory_order_release);
+        return false;
+    }
+}
+
+bool LifecycleDiagnosticJournal::incomplete() const noexcept {
+    return !impl_ || impl_->incomplete.load(std::memory_order_acquire);
+}
+
+std::vector<std::string> LifecycleDiagnosticJournal::Snapshot() const {
+    std::scoped_lock lock{impl_->mutex};
+    return impl_->lines;
+}
+
+void LifecycleDiagnosticJournal::Flush(std::ostream& output) const {
+    std::scoped_lock lock{impl_->mutex};
+    for (const std::string& line : impl_->lines) output << line << '\n';
+    if (impl_->incomplete.load(std::memory_order_acquire)) {
+        output << "LIFECYCLE_EVENT event=journal status=incomplete\n";
+    }
+    output.flush();
+}
+
 std::string FormatLifecycleAttachDiagnostic(
     const DWORD processId, const DWORD threadId, const HWND topLevel,
     const std::uint32_t result) {
@@ -265,9 +290,11 @@ std::string FormatLifecycleRemoveDiagnostic(
 
 std::string FormatLifecycleDetachDiagnostic(
     const DWORD processId, const std::uint64_t requestId,
-    const ipc::DetachResult& result) {
+    const ipc::DetachResult& result, const std::uint32_t finalResult) {
     return "LIFECYCLE_EVENT event=stop pid=" + std::to_string(processId) +
+        " ack_pid=" + std::to_string(result.explorer_pid) +
         " request=" + std::to_string(requestId) + " result=" +
+        std::to_string(finalResult) + " ack_result=" +
         std::to_string(result.result) + " pane=" +
         std::to_string(result.cleanup.pane_count) + " tab_subclass=" +
         std::to_string(result.cleanup.tab_subclass_count) +
@@ -282,6 +309,14 @@ ExplorerSession::ExplorerSession(
     const DWORD processId,
     ExplorerSessionOperations operations)
     : process_id_(processId), operations_(std::move(operations)) {}
+
+void ExplorerSession::RecordDiagnostic(
+    std::string key, std::string line) noexcept {
+    if (operations_.diagnostic_journal) {
+        static_cast<void>(operations_.diagnostic_journal->TryAppend(
+            std::move(key), std::move(line)));
+    }
+}
 
 Status ExplorerSession::NextRequestId(std::uint64_t* const output) noexcept {
     if (output == nullptr ||
@@ -318,6 +353,20 @@ Status ExplorerSession::SendUpdate(const SessionWindowSnapshot& snapshot) {
             ? Failed(ErrorCode::WINDOW_ATTACH_FAILED, result.result)
             : status;
     }
+    const auto prior = std::find_if(
+        windows_.begin(), windows_.end(), [&snapshot](const WindowState& state) {
+            return state.snapshot.top_level == snapshot.top_level;
+        });
+    if (prior == windows_.end() || prior->snapshot != snapshot) {
+        RecordDiagnostic(
+            "update:" + std::to_string(process_id_) + ":" +
+                std::to_string(reinterpret_cast<std::uintptr_t>(snapshot.top_level)),
+            FormatLifecycleUpdateDiagnostic(
+                process_id_, requestId,
+                {reinterpret_cast<std::uint64_t>(snapshot.top_level),
+                 snapshot.top_level_generation, snapshot.tabs},
+                result));
+    }
     return Ok();
 }
 
@@ -345,6 +394,11 @@ Status ExplorerSession::SendRemoval(const WindowState& window) {
             ? Failed(ErrorCode::WINDOW_ATTACH_FAILED, result.result)
             : status;
     }
+    RecordDiagnostic({}, FormatLifecycleRemoveDiagnostic(
+        process_id_, requestId,
+        {reinterpret_cast<std::uint64_t>(window.snapshot.top_level),
+         window.snapshot.top_level_generation},
+        result));
     return Ok();
 }
 
@@ -433,6 +487,9 @@ Status ExplorerSession::Reconcile(
             }
             attached_ = true;
             candidateThreads.push_back(first.ui_thread_id);
+            RecordDiagnostic({}, FormatLifecycleAttachDiagnostic(
+                process_id_, first.ui_thread_id,
+                first.snapshot.top_level, 0));
         }
 
         for (const WindowState& window : candidate) {
@@ -511,8 +568,18 @@ Status ExplorerSession::Stop() {
         if (status.ok()) status = operations_.exchange(request, &response);
         ipc::DetachResult result{};
         if (status.ok()) status = ipc::DecodeDetachResult(response, requestId, &result);
+        if (status.ok()) {
+            last_detach_result_ = result;
+            last_detach_request_id_ = requestId;
+            has_detach_result_ = true;
+        }
         if (!status.ok() || result.explorer_pid != process_id_ || result.result != 0) {
             uncertain_ = true;
+            if (status.ok()) {
+                RecordDiagnostic({}, FormatLifecycleDetachDiagnostic(
+                    process_id_, requestId, result,
+                    static_cast<std::uint32_t>(ErrorCode::DLL_UNLOAD_TIMEOUT)));
+            }
             return status.ok()
                 ? Failed(ErrorCode::DLL_UNLOAD_TIMEOUT, result.result)
                 : status;
@@ -523,22 +590,40 @@ Status ExplorerSession::Stop() {
     Status status = operations_.wait_exact_module_absent(
         process_id_, kSessionWaitMilliseconds, &absent);
     if (!ExactSuccess(status) || !absent) {
+        if (has_detach_result_) {
+            const std::uint32_t finalResult = status.ok()
+                ? static_cast<std::uint32_t>(ErrorCode::DLL_UNLOAD_TIMEOUT)
+                : static_cast<std::uint32_t>(status.code);
+            RecordDiagnostic({}, FormatLifecycleDetachDiagnostic(
+                process_id_, last_detach_request_id_, last_detach_result_,
+                finalResult));
+        }
         return status.ok()
             ? Failed(ErrorCode::DLL_UNLOAD_TIMEOUT, ERROR_TIMEOUT)
             : status;
     }
     status = operations_.confirm_target_gone(process_id_);
-    if (!ExactSuccess(status)) return status;
+    if (!ExactSuccess(status)) {
+        if (has_detach_result_) {
+            RecordDiagnostic({}, FormatLifecycleDetachDiagnostic(
+                process_id_, last_detach_request_id_, last_detach_result_,
+                static_cast<std::uint32_t>(status.code)));
+        }
+        return status;
+    }
     windows_.clear();
     installed_thread_ids_.clear();
     attached_ = false;
     stopped_ = true;
+    RecordDiagnostic({}, FormatLifecycleDetachDiagnostic(
+        process_id_, last_detach_request_id_, last_detach_result_, 0));
     return Ok();
 }
 
 ExplorerSessionOperations CreateProductionExplorerSessionOperations(
     const DWORD processId,
-    std::wstring hookDllPath) {
+    std::wstring hookDllPath,
+    std::shared_ptr<LifecycleDiagnosticJournal> diagnosticJournal) {
     auto state = std::make_shared<ProductionSessionState>(std::move(hookDllPath));
     state->process_id = processId;
     return {
@@ -620,11 +705,6 @@ ExplorerSessionOperations CreateProductionExplorerSessionOperations(
                 std::make_unique<injection::ThreadHookInjector>(std::move(platform));
             status = state->injector->Attach(target, output);
             state->pending_attach_validation = {};
-            EmitLifecycleDiagnostic(FormatLifecycleAttachDiagnostic(
-                target.explorer_pid,
-                target.ui_thread_id,
-                target.top_level_hwnd,
-                status.ok() ? 0u : static_cast<std::uint32_t>(status.code)));
             return status;
         },
         [state](const injection::HookTarget& target,
@@ -636,20 +716,12 @@ ExplorerSessionOperations CreateProductionExplorerSessionOperations(
         [state](const std::vector<std::uint8_t>& request,
                 ipc::DecodedFrame* const response) {
             if (!state->pipe || response == nullptr) return Invalid();
-            ipc::DecodedFrame decodedRequest{};
-            Status status = ipc::DecodeFrame(request, &decodedRequest);
-            if (status.ok()) {
-                status = ipc::WriteFrame(state->pipe.get(), request);
-            }
+            Status status = ipc::WriteFrame(state->pipe.get(), request);
             if (!status.ok()) return status;
             if (!WaitForPipeFrame(state->pipe.get(), kSessionWaitMilliseconds)) {
                 return Failed(ErrorCode::PIPE_DISCONNECTED, ERROR_TIMEOUT);
             }
             status = ipc::ReadFrame(&state->pipe, response);
-            if (status.ok()) {
-                EmitExchangeDiagnostic(
-                    state->process_id, decodedRequest, *response);
-            }
             return status;
         },
         [state](const DWORD processId) {
@@ -711,6 +783,7 @@ ExplorerSessionOperations CreateProductionExplorerSessionOperations(
                 ? state->injector->ConfirmTargetGone(processId)
                 : Failed(ErrorCode::HOOK_RELEASE_FAILED);
         },
+        std::move(diagnosticJournal),
     };
 }
 
