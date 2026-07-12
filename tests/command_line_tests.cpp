@@ -50,6 +50,18 @@ WXI_TEST(command_line_observe_exact, "command_line.observe_exact") {
     WXI_REQUIRE_EQ(parsed.duration_ms, std::uint32_t{12345});
 }
 
+WXI_TEST(command_line_background_exact, "command_line.background_exact") {
+    constexpr std::string_view arguments[] = {"--background"};
+    winexinfo::ParsedCommand parsed{};
+
+    const winexinfo::Status status = winexinfo::ParseCommandLine(arguments, &parsed);
+
+    WXI_REQUIRE(status.ok());
+    WXI_REQUIRE_EQ(parsed.command, winexinfo::HostCommand::Background);
+    WXI_REQUIRE_EQ(parsed.duration_ms, std::uint32_t{0});
+    WXI_REQUIRE_EQ(parsed.target_hwnd, std::uint64_t{0});
+}
+
 WXI_TEST(command_line_gate_c_exact, "command_line.gate_c") {
     constexpr std::string_view arguments[] = {
         "--gate-c-place",

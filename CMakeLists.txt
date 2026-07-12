@@ -20,6 +20,7 @@ enable_testing()
 add_executable(WinExInfoTests
   src/common/utf8.cpp
   src/host/command_line.cpp
+  src/host/background_coordinator.cpp
   src/host/explorer_controller.cpp
   src/host/explorer_session.cpp
   src/hook/dll_main.cpp
@@ -46,6 +47,7 @@ add_executable(WinExInfoTests
   src/probe/uia_observer_worker.cpp
   src/probe/win32_probe.cpp
   tests/active_view_tests.cpp
+  tests/background_coordinator_tests.cpp
   tests/com_apartment_tests.cpp
   tests/command_line_tests.cpp
   tests/contracts_tests.cpp
@@ -170,6 +172,7 @@ set_target_properties(WinExInfoHook PROPERTIES
 add_executable(WinExInfoHost
   src/common/utf8.cpp
   src/host/command_line.cpp
+  src/host/background_coordinator.cpp
   src/host/explorer_controller.cpp
   src/host/explorer_session.cpp
   src/host/main.cpp

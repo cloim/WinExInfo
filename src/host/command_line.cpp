@@ -60,6 +60,11 @@ Status ParseCommandLine(
         return Status{ErrorCode::OK, S_OK, ERROR_SUCCESS};
     }
 
+    if (arguments.size() == 1 && arguments[0] == "--background") {
+        *output = ParsedCommand{HostCommand::Background, 0, 0};
+        return Status{ErrorCode::OK, S_OK, ERROR_SUCCESS};
+    }
+
     if (arguments.size() == 5 && arguments[0] == "--gate-c-place" &&
         arguments[1] == "--hwnd" && arguments[3] == "--duration-ms") {
         const std::string_view hwndText = arguments[2];

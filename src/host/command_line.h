@@ -12,6 +12,7 @@ enum class HostCommand {
     ProbeSnapshot,
     ProbeObserve,
     GateCPlace,
+    Background,
 };
 
 enum class HostExitCode : int {
