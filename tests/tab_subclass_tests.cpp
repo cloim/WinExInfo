@@ -17,6 +17,7 @@ namespace {
 using winexinfo::ErrorCode;
 using winexinfo::Status;
 using winexinfo::hook::TabSubclassOperations;
+using winexinfo::hook::TabSubclassSet;
 using winexinfo::ipc::TabSetResult;
 using winexinfo::ipc::TabSetUpdate;
 
@@ -29,6 +30,7 @@ HWND Window(const std::uintptr_t value) {
 }
 
 struct Recorder final {
+    TabSubclassSet tabs;
     HWND top = Window(0x100);
     DWORD process = 71;
     DWORD thread = 73;
@@ -53,9 +55,9 @@ struct Recorder final {
 
     TabSetUpdate Update(
         const std::uint64_t topGeneration,
-        std::vector<std::pair<HWND, std::uint64_t>> tabs) const {
+        std::vector<std::pair<HWND, std::uint64_t>> entries) const {
         TabSetUpdate update{reinterpret_cast<std::uint64_t>(top), topGeneration, {}};
-        for (const auto& [tab, generation] : tabs) {
+        for (const auto& [tab, generation] : entries) {
             update.tabs.push_back(
                 {reinterpret_cast<std::uint64_t>(tab), generation, thread});
         }
@@ -118,7 +120,7 @@ struct Recorder final {
 void Reset(Recorder& recorder) {
     recorder.fail_remove = nullptr;
     recorder.fail_remove_attempts.clear();
-    WXI_REQUIRE(winexinfo::hook::RemoveAllTabSubclasses(recorder.Operations()).ok());
+    WXI_REQUIRE(recorder.tabs.RemoveAll(recorder.Operations()).ok());
     recorder.calls.clear();
 }
 
@@ -139,14 +141,14 @@ WXI_TEST(tab_subclass_applies_exact_order_and_duplicate_is_idempotent,
     const auto update = recorder.Update(
         10, {{recorder.order[0], 20}, {recorder.order[1], 21}});
     TabSetResult result{};
-    WXI_REQUIRE(winexinfo::hook::ApplyTabSetUpdate(
+    WXI_REQUIRE(recorder.tabs.Apply(
                     recorder.top, update, recorder.Operations(), &result).ok());
     WXI_REQUIRE_EQ(
         recorder.calls,
         (std::vector<std::string>{"add:513:20", "add:514:21", "refresh"}));
     WXI_REQUIRE_EQ(result, (TabSetResult{10, 0, {}}));
     recorder.calls.clear();
-    WXI_REQUIRE(winexinfo::hook::ApplyTabSetUpdate(
+    WXI_REQUIRE(recorder.tabs.Apply(
                     recorder.top, update, recorder.Operations(), &result).ok());
     WXI_REQUIRE(recorder.calls.empty());
 }
@@ -160,7 +162,7 @@ WXI_TEST(tab_subclass_rejects_wrong_thread_class_parent_and_zorder,
     const auto reject = [&](TabSubclassOperations operations) {
         TabSetResult result{};
         RequireFailureAck(
-            winexinfo::hook::ApplyTabSetUpdate(
+            recorder.tabs.Apply(
                 recorder.top, update, operations, &result), result, 10);
         WXI_REQUIRE(recorder.calls.empty());
     };
@@ -188,7 +190,7 @@ WXI_TEST(tab_subclass_rejects_stale_generations_and_wrong_same_generation_ack,
     recorder.order.resize(1);
     TabSetResult result{};
     const auto initial = recorder.Update(10, {{recorder.order[0], 20}});
-    WXI_REQUIRE(winexinfo::hook::ApplyTabSetUpdate(
+    WXI_REQUIRE(recorder.tabs.Apply(
                     recorder.top, initial, recorder.Operations(), &result).ok());
     recorder.calls.clear();
     for (const auto& stale : {
@@ -196,7 +198,7 @@ WXI_TEST(tab_subclass_rejects_stale_generations_and_wrong_same_generation_ack,
              recorder.Update(11, {{recorder.order[0], 19}}),
              recorder.Update(10, {{recorder.order[0], 21}})}) {
         RequireFailureAck(
-            winexinfo::hook::ApplyTabSetUpdate(
+            recorder.tabs.Apply(
                 recorder.top, stale, recorder.Operations(), &result),
             result, stale.top_level_generation);
         WXI_REQUIRE(recorder.calls.empty());
@@ -209,12 +211,12 @@ WXI_TEST(tab_subclass_hwnd_reuse_removes_before_reinstall,
     Reset(recorder);
     recorder.order.resize(1);
     TabSetResult result{};
-    WXI_REQUIRE(winexinfo::hook::ApplyTabSetUpdate(
+    WXI_REQUIRE(recorder.tabs.Apply(
                     recorder.top,
                     recorder.Update(10, {{recorder.order[0], 20}}),
                     recorder.Operations(), &result).ok());
     recorder.calls.clear();
-    WXI_REQUIRE(winexinfo::hook::ApplyTabSetUpdate(
+    WXI_REQUIRE(recorder.tabs.Apply(
                     recorder.top,
                     recorder.Update(11, {{recorder.order[0], 21}}),
                     recorder.Operations(), &result).ok());
@@ -228,13 +230,13 @@ WXI_TEST(tab_subclass_rejects_stale_generation_when_removed_hwnd_reappears,
     Recorder recorder;
     Reset(recorder);
     TabSetResult result{};
-    WXI_REQUIRE(winexinfo::hook::ApplyTabSetUpdate(
+    WXI_REQUIRE(recorder.tabs.Apply(
                     recorder.top,
                     recorder.Update(10, {{recorder.order[0], 20},
                                          {recorder.order[1], 21}}),
                     recorder.Operations(), &result).ok());
     recorder.order.resize(1);
-    WXI_REQUIRE(winexinfo::hook::ApplyTabSetUpdate(
+    WXI_REQUIRE(recorder.tabs.Apply(
                     recorder.top,
                     recorder.Update(11, {{recorder.order[0], 20}}),
                     recorder.Operations(), &result).ok());
@@ -243,7 +245,7 @@ WXI_TEST(tab_subclass_rejects_stale_generation_when_removed_hwnd_reappears,
     const auto stale = recorder.Update(
         12, {{recorder.order[0], 20}, {recorder.order[1], 19}});
     RequireFailureAck(
-        winexinfo::hook::ApplyTabSetUpdate(
+            recorder.tabs.Apply(
             recorder.top, stale, recorder.Operations(), &result),
         result, 12);
     WXI_REQUIRE(recorder.calls.empty());
@@ -254,13 +256,13 @@ WXI_TEST(tab_subclass_rejects_equal_generation_when_removed_hwnd_reappears,
     Recorder recorder;
     Reset(recorder);
     TabSetResult result{};
-    WXI_REQUIRE(winexinfo::hook::ApplyTabSetUpdate(
+    WXI_REQUIRE(recorder.tabs.Apply(
                     recorder.top,
                     recorder.Update(10, {{recorder.order[0], 20},
                                          {recorder.order[1], 21}}),
                     recorder.Operations(), &result).ok());
     recorder.order.resize(1);
-    WXI_REQUIRE(winexinfo::hook::ApplyTabSetUpdate(
+    WXI_REQUIRE(recorder.tabs.Apply(
                     recorder.top,
                     recorder.Update(11, {{recorder.order[0], 20}}),
                     recorder.Operations(), &result).ok());
@@ -269,7 +271,7 @@ WXI_TEST(tab_subclass_rejects_equal_generation_when_removed_hwnd_reappears,
     const auto equal = recorder.Update(
         12, {{recorder.order[0], 20}, {recorder.order[1], 21}});
     RequireFailureAck(
-        winexinfo::hook::ApplyTabSetUpdate(
+            recorder.tabs.Apply(
             recorder.top, equal, recorder.Operations(), &result), result, 12);
     WXI_REQUIRE(recorder.calls.empty());
 }
@@ -280,7 +282,7 @@ WXI_TEST(tab_subclass_install_failure_rolls_back_without_new_generation,
     Reset(recorder);
     recorder.order.resize(1);
     TabSetResult result{};
-    WXI_REQUIRE(winexinfo::hook::ApplyTabSetUpdate(
+    WXI_REQUIRE(recorder.tabs.Apply(
                     recorder.top,
                     recorder.Update(10, {{recorder.order[0], 20}}),
                     recorder.Operations(), &result).ok());
@@ -288,14 +290,14 @@ WXI_TEST(tab_subclass_install_failure_rolls_back_without_new_generation,
     recorder.order.push_back(Window(0x202));
     recorder.fail_install = recorder.order[1];
     RequireFailureAck(
-        winexinfo::hook::ApplyTabSetUpdate(
+            recorder.tabs.Apply(
             recorder.top,
             recorder.Update(11, {{recorder.order[0], 20}, {recorder.order[1], 21}}),
             recorder.Operations(), &result), result, 11);
     WXI_REQUIRE_EQ(recorder.calls, (std::vector<std::string>{"add:514:21"}));
     recorder.fail_install = nullptr;
     recorder.calls.clear();
-    WXI_REQUIRE(winexinfo::hook::ApplyTabSetUpdate(
+    WXI_REQUIRE(recorder.tabs.Apply(
                     recorder.top,
                     recorder.Update(11, {{recorder.order[0], 20}, {recorder.order[1], 21}}),
                     recorder.Operations(), &result).ok());
@@ -312,7 +314,7 @@ WXI_TEST(tab_subclass_remove_all_is_reverse_and_preserves_failed_lifetime,
     recorder.classes[third] = L"ShellTabWindowClass";
     recorder.parents[third] = recorder.top;
     TabSetResult result{};
-    WXI_REQUIRE(winexinfo::hook::ApplyTabSetUpdate(
+    WXI_REQUIRE(recorder.tabs.Apply(
                     recorder.top,
                     recorder.Update(10, {{recorder.order[0], 20},
                                          {recorder.order[1], 21}, {third, 22}}),
@@ -333,18 +335,18 @@ WXI_TEST(tab_subclass_remove_all_is_reverse_and_preserves_failed_lifetime,
         }
         return Success();
     };
-    const Status cleanup = winexinfo::hook::RemoveAllTabSubclasses(failing);
+    const Status cleanup = recorder.tabs.RemoveAll(failing);
     WXI_REQUIRE(!cleanup.ok());
     WXI_REQUIRE_EQ(cleanup.win32, DWORD{ERROR_ACCESS_DENIED});
     WXI_REQUIRE_EQ(
         recorder.calls,
         (std::vector<std::string>{"remove:515", "remove:514", "remove:513"}));
-    WXI_REQUIRE(!winexinfo::hook::TabSubclassCleanupSafe());
+    WXI_REQUIRE(!recorder.tabs.cleanup_safe());
     recorder.calls.clear();
-    WXI_REQUIRE(winexinfo::hook::RemoveAllTabSubclasses(recorder.Operations()).ok());
+    WXI_REQUIRE(recorder.tabs.RemoveAll(recorder.Operations()).ok());
     WXI_REQUIRE_EQ(
         recorder.calls, (std::vector<std::string>{"remove:515", "remove:514"}));
-    WXI_REQUIRE(winexinfo::hook::TabSubclassCleanupSafe());
+    WXI_REQUIRE(recorder.tabs.cleanup_safe());
 }
 
 WXI_TEST(tab_subclass_failed_rollback_remove_retains_every_possible_callback,
@@ -353,7 +355,7 @@ WXI_TEST(tab_subclass_failed_rollback_remove_retains_every_possible_callback,
     Reset(recorder);
     recorder.order.resize(1);
     TabSetResult result{};
-    WXI_REQUIRE(winexinfo::hook::ApplyTabSetUpdate(
+    WXI_REQUIRE(recorder.tabs.Apply(
                     recorder.top, recorder.Update(10, {{recorder.order[0], 20}}),
                     recorder.Operations(), &result).ok());
     const HWND second = Window(0x202);
@@ -365,15 +367,15 @@ WXI_TEST(tab_subclass_failed_rollback_remove_retains_every_possible_callback,
     recorder.fail_install = third;
     recorder.fail_remove = second;
     RequireFailureAck(
-        winexinfo::hook::ApplyTabSetUpdate(
+            recorder.tabs.Apply(
             recorder.top,
             recorder.Update(11, {{recorder.order[0], 20}, {second, 21}, {third, 22}}),
             recorder.Operations(), &result), result, 11);
-    WXI_REQUIRE(!winexinfo::hook::TabSubclassCleanupSafe());
+    WXI_REQUIRE(!recorder.tabs.cleanup_safe());
     recorder.fail_install = nullptr;
     recorder.fail_remove = nullptr;
     recorder.calls.clear();
-    WXI_REQUIRE(winexinfo::hook::RemoveAllTabSubclasses(recorder.Operations()).ok());
+    WXI_REQUIRE(recorder.tabs.RemoveAll(recorder.Operations()).ok());
     WXI_REQUIRE_EQ(
         recorder.calls,
         (std::vector<std::string>{"remove:514", "remove:513"}));
@@ -385,7 +387,7 @@ WXI_TEST(tab_subclass_failed_rollback_restore_retains_possible_callback,
     Reset(recorder);
     recorder.order.resize(1);
     TabSetResult result{};
-    WXI_REQUIRE(winexinfo::hook::ApplyTabSetUpdate(
+    WXI_REQUIRE(recorder.tabs.Apply(
                     recorder.top, recorder.Update(10, {{recorder.order[0], 20}}),
                     recorder.Operations(), &result).ok());
     recorder.calls.clear();
@@ -393,13 +395,13 @@ WXI_TEST(tab_subclass_failed_rollback_restore_retains_possible_callback,
         recorder.install_attempt + 1,
         recorder.install_attempt + 2};
     RequireFailureAck(
-        winexinfo::hook::ApplyTabSetUpdate(
+            recorder.tabs.Apply(
             recorder.top, recorder.Update(11, {{recorder.order[0], 21}}),
             recorder.Operations(), &result), result, 11);
-    WXI_REQUIRE(!winexinfo::hook::TabSubclassCleanupSafe());
+    WXI_REQUIRE(!recorder.tabs.cleanup_safe());
     recorder.fail_install_attempts.clear();
     recorder.calls.clear();
-    WXI_REQUIRE(winexinfo::hook::RemoveAllTabSubclasses(recorder.Operations()).ok());
+    WXI_REQUIRE(recorder.tabs.RemoveAll(recorder.Operations()).ok());
     WXI_REQUIRE_EQ(recorder.calls, (std::vector<std::string>{"remove:513"}));
 }
 
@@ -410,11 +412,11 @@ WXI_TEST(tab_subclass_destroy_notification_forgets_lifetime_and_coalesces_refres
     recorder.order.resize(1);
     TabSetResult result{};
     const auto update = recorder.Update(10, {{recorder.order[0], 20}});
-    WXI_REQUIRE(winexinfo::hook::ApplyTabSetUpdate(
+    WXI_REQUIRE(recorder.tabs.Apply(
                     recorder.top, update, recorder.Operations(), &result).ok());
     recorder.calls.clear();
-    winexinfo::hook::NotifyTabSubclassMessage(recorder.order[0], WM_NCDESTROY);
-    WXI_REQUIRE(winexinfo::hook::ApplyTabSetUpdate(
+    recorder.tabs.Notify(recorder.order[0], WM_NCDESTROY);
+    WXI_REQUIRE(recorder.tabs.Apply(
                     recorder.top, update, recorder.Operations(), &result).ok());
     WXI_REQUIRE_EQ(
         recorder.calls, (std::vector<std::string>{"add:513:20", "refresh"}));
@@ -427,7 +429,7 @@ WXI_TEST(tab_subclass_rejects_update_that_omits_a_live_tab,
     TabSetResult result{};
     const auto incomplete = recorder.Update(10, {{recorder.order[0], 20}});
     RequireFailureAck(
-        winexinfo::hook::ApplyTabSetUpdate(
+            recorder.tabs.Apply(
             recorder.top, incomplete, recorder.Operations(), &result),
         result, 10);
     WXI_REQUIRE(recorder.calls.empty());
@@ -448,7 +450,7 @@ WXI_TEST(tab_subclass_rejects_non_tab_direct_child_cycle_transactionally,
     };
     TabSetResult result{};
     RequireFailureAck(
-        winexinfo::hook::ApplyTabSetUpdate(
+            recorder.tabs.Apply(
             recorder.top,
             recorder.Update(10, {{recorder.order[0], 20}, {recorder.order[1], 21}}),
             operations, &result), result, 10);
@@ -477,7 +479,89 @@ WXI_TEST(tab_subclass_accepts_bounded_long_non_tab_direct_child_chain,
             ? *std::next(found) : HWND{nullptr};
     };
     TabSetResult result{};
-    WXI_REQUIRE(winexinfo::hook::ApplyTabSetUpdate(
+    WXI_REQUIRE(recorder.tabs.Apply(
                     recorder.top, recorder.Update(10, {{recorder.order[0], 20}}),
                     operations, &result).ok());
+}
+
+WXI_TEST(tab_subclass_instances_isolate_identical_hwnd_generation_history,
+         "tab_subclass.instance_history_isolation") {
+    Recorder first;
+    Recorder second;
+    first.order.resize(1);
+    second.order.resize(1);
+    TabSetResult firstResult{};
+    TabSetResult secondResult{};
+
+    WXI_REQUIRE(first.tabs.Apply(
+        first.top, first.Update(10, {{first.order[0], 40}}),
+        first.Operations(), &firstResult).ok());
+    WXI_REQUIRE(second.tabs.Apply(
+        second.top, second.Update(3, {{second.order[0], 7}}),
+        second.Operations(), &secondResult).ok());
+    WXI_REQUIRE_EQ(firstResult, (TabSetResult{10, 0, {}}));
+    WXI_REQUIRE_EQ(secondResult, (TabSetResult{3, 0, {}}));
+
+    second.calls.clear();
+    WXI_REQUIRE(second.tabs.Apply(
+        second.top, second.Update(4, {{second.order[0], 8}}),
+        second.Operations(), &secondResult).ok());
+    WXI_REQUIRE_EQ(
+        second.calls,
+        (std::vector<std::string>{"remove:513", "add:513:8", "refresh"}));
+    WXI_REQUIRE(first.tabs.cleanup_safe());
+    WXI_REQUIRE(second.tabs.cleanup_safe());
+}
+
+WXI_TEST(tab_subclass_instances_isolate_failure_destroy_and_cleanup,
+         "tab_subclass.instance_failure_isolation") {
+    Recorder first;
+    Recorder second;
+    first.order.resize(1);
+    second.order.resize(1);
+    TabSetResult result{};
+    WXI_REQUIRE(first.tabs.Apply(
+        first.top, first.Update(10, {{first.order[0], 20}}),
+        first.Operations(), &result).ok());
+    WXI_REQUIRE(second.tabs.Apply(
+        second.top, second.Update(10, {{second.order[0], 20}}),
+        second.Operations(), &result).ok());
+
+    const HWND secondTab = Window(0x202);
+    const HWND thirdTab = Window(0x203);
+    first.order = {first.order[0], secondTab, thirdTab};
+    first.classes[thirdTab] = L"ShellTabWindowClass";
+    first.parents[thirdTab] = first.top;
+    first.calls.clear();
+    first.fail_install = thirdTab;
+    first.fail_remove = secondTab;
+    RequireFailureAck(
+        first.tabs.Apply(
+            first.top,
+            first.Update(11, {{first.order[0], 20}, {secondTab, 21},
+                              {thirdTab, 22}}),
+            first.Operations(), &result),
+        result, 11);
+    WXI_REQUIRE(!first.tabs.cleanup_safe());
+    WXI_REQUIRE(second.tabs.cleanup_safe());
+
+    second.calls.clear();
+    WXI_REQUIRE(second.tabs.Apply(
+        second.top, second.Update(10, {{second.order[0], 20}}),
+        second.Operations(), &result).ok());
+    WXI_REQUIRE_EQ(result, (TabSetResult{10, 0, {}}));
+    WXI_REQUIRE(second.calls.empty());
+
+    first.fail_install = nullptr;
+    first.fail_remove = first.order[0];
+    WXI_REQUIRE(!first.tabs.RemoveAll(first.Operations()).ok());
+    WXI_REQUIRE(!first.tabs.cleanup_safe());
+    WXI_REQUIRE(second.tabs.cleanup_safe());
+
+    first.tabs.Notify(first.order[0], WM_NCDESTROY);
+    WXI_REQUIRE(first.tabs.cleanup_safe());
+    second.calls.clear();
+    WXI_REQUIRE(second.tabs.RemoveAll(second.Operations()).ok());
+    WXI_REQUIRE_EQ(second.calls, (std::vector<std::string>{"remove:513"}));
+    WXI_REQUIRE(second.tabs.cleanup_safe());
 }

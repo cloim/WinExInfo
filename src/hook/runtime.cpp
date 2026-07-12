@@ -54,6 +54,7 @@ struct RuntimeContext final {
     RuntimeSignalSourceState signal_source;
     HookRuntimeRefreshIngress ingress;
     HookRuntimeStateMachine state;
+    TabSubclassSet tab_subclasses;
     std::mutex tab_update_mutex;
     std::optional<ipc::TabSetUpdate> pending_tab_update;
     ipc::TabSetResult tab_update_result;
@@ -369,8 +370,10 @@ bool HandleStatusPaneRuntimeMessage(
         return false;
     }
     if (message == kStatusPaneRuntimeCleanupMessage) {
-        if (!RemoveAllTabSubclasses(CreateProductionTabSubclassOperations()).ok() ||
-            !TabSubclassCleanupSafe()) {
+        if (!context->tab_subclasses.RemoveAll(
+                 CreateProductionTabSubclassOperations(
+                     context->tab_subclasses)).ok() ||
+            !context->tab_subclasses.cleanup_safe()) {
             return true;
         }
         if (!RuntimeSignalCleanupSafe(context->signal_source)) {
@@ -398,10 +401,11 @@ bool HandleStatusPaneRuntimeMessage(
             update = *context->pending_tab_update;
         }
         ipc::TabSetResult result{};
-        static_cast<void>(ApplyTabSetUpdate(
+        static_cast<void>(context->tab_subclasses.Apply(
             context->target,
             update,
-            CreateProductionTabSubclassOperations(),
+            CreateProductionTabSubclassOperations(
+                context->tab_subclasses),
             &result));
         {
             const std::scoped_lock lock{context->tab_update_mutex};

@@ -11,7 +11,6 @@
 #include <vector>
 
 namespace winexinfo::hook {
-namespace {
 
 struct InstalledTab final {
     HWND window = nullptr;
@@ -20,7 +19,8 @@ struct InstalledTab final {
     bool operator==(const InstalledTab&) const = default;
 };
 
-struct TabSubclassState final {
+class TabSubclassSet::Impl final {
+public:
     HWND top_level = nullptr;
     std::uint64_t top_level_generation = 0;
     std::vector<InstalledTab> authoritative;
@@ -30,7 +30,7 @@ struct TabSubclassState final {
     bool cleanup_blocked = false;
 };
 
-TabSubclassState g_tabs;
+namespace {
 
 Status Success() noexcept {
     return {ErrorCode::OK, S_OK, ERROR_SUCCESS};
@@ -95,23 +95,23 @@ const InstalledTab* Find(
     return found == tabs.end() ? nullptr : &*found;
 }
 
-void TrackPossibleCallback(const InstalledTab& tab) {
+void TrackPossibleCallback(auto& state, const InstalledTab& tab) {
     const auto found = std::find_if(
-        g_tabs.installed.begin(), g_tabs.installed.end(),
+        state.installed.begin(), state.installed.end(),
         [&](const InstalledTab& candidate) { return candidate.window == tab.window; });
-    if (found == g_tabs.installed.end()) {
-        g_tabs.installed.push_back(tab);
+    if (found == state.installed.end()) {
+        state.installed.push_back(tab);
     } else {
         *found = tab;
     }
 }
 
-void ForgetCallback(const HWND window) {
+void ForgetCallback(auto& state, const HWND window) {
     const auto found = std::find_if(
-        g_tabs.installed.begin(), g_tabs.installed.end(),
+        state.installed.begin(), state.installed.end(),
         [&](const InstalledTab& candidate) { return candidate.window == window; });
-    if (found != g_tabs.installed.end()) {
-        g_tabs.installed.erase(found);
+    if (found != state.installed.end()) {
+        state.installed.erase(found);
     }
 }
 
@@ -182,27 +182,28 @@ Status ValidateUpdate(
 }
 
 Status ValidateGenerations(
+    const auto& state,
     const HWND topLevel,
     const ipc::TabSetUpdate& update,
     const std::vector<InstalledTab>& desired) {
-    if (g_tabs.top_level == nullptr) {
+    if (state.top_level == nullptr) {
         return Success();
     }
-    if (g_tabs.lifetime_failed || g_tabs.cleanup_blocked) {
+    if (state.lifetime_failed || state.cleanup_blocked) {
         return Failure(ERROR_INVALID_STATE);
     }
-    if (g_tabs.top_level != topLevel ||
-        update.top_level_generation < g_tabs.top_level_generation) {
+    if (state.top_level != topLevel ||
+        update.top_level_generation < state.top_level_generation) {
         return Failure(ERROR_INVALID_STATE);
     }
-    if (update.top_level_generation == g_tabs.top_level_generation) {
-        return desired == g_tabs.authoritative
+    if (update.top_level_generation == state.top_level_generation) {
+        return desired == state.authoritative
             ? Success()
             : Failure(ERROR_INVALID_STATE);
     }
     for (const InstalledTab& tab : desired) {
-        const InstalledTab* const prior = Find(g_tabs.known_generations, tab.window);
-        const InstalledTab* const active = Find(g_tabs.authoritative, tab.window);
+        const InstalledTab* const prior = Find(state.known_generations, tab.window);
+        const InstalledTab* const active = Find(state.authoritative, tab.window);
         if (prior != nullptr &&
             (tab.generation < prior->generation ||
              (active == nullptr && tab.generation == prior->generation))) {
@@ -219,6 +220,7 @@ struct Mutation final {
 };
 
 Status Rollback(
+    auto& state,
     const std::vector<Mutation>& mutations,
     const TabSubclassOperations& operations) {
     Status firstFailure = Success();
@@ -228,35 +230,36 @@ Status Rollback(
             status = operations.remove_subclass(
                 mutation->tab.window, kTabSubclassId);
             if (status.ok()) {
-                ForgetCallback(mutation->tab.window);
+                ForgetCallback(state, mutation->tab.window);
             } else {
-                TrackPossibleCallback(mutation->tab);
+                TrackPossibleCallback(state, mutation->tab);
             }
         } else {
             status = operations.install_subclass(
                 mutation->tab.window, kTabSubclassId, mutation->tab.generation);
-            TrackPossibleCallback(mutation->tab);
+            TrackPossibleCallback(state, mutation->tab);
         }
         if (!status.ok() && firstFailure.ok()) {
             firstFailure = status;
         }
     }
     if (!firstFailure.ok()) {
-        g_tabs.lifetime_failed = true;
-        g_tabs.cleanup_blocked = true;
+        state.lifetime_failed = true;
+        state.cleanup_blocked = true;
     }
     return firstFailure;
 }
 
 Status Reconcile(
+    auto& state,
     const std::vector<InstalledTab>& desired,
     const TabSubclassOperations& operations) {
-    const std::vector<InstalledTab> previousInstalled = g_tabs.installed;
+    const std::vector<InstalledTab> previousInstalled = state.installed;
     std::vector<Mutation> mutations;
     const auto fail = [&](const Status original) {
-        const Status rollback = Rollback(mutations, operations);
+        const Status rollback = Rollback(state, mutations, operations);
         if (rollback.ok()) {
-            g_tabs.installed = previousInstalled;
+            state.installed = previousInstalled;
             return original;
         }
         return rollback;
@@ -273,20 +276,20 @@ Status Reconcile(
         if (!status.ok()) {
             return fail(status);
         }
-        ForgetCallback(old.window);
+        ForgetCallback(state, old.window);
         mutations.push_back({MutationKind::Removed, old});
         status = operations.install_subclass(
             tab.window, kTabSubclassId, tab.generation);
         if (!status.ok()) {
             return fail(status);
         }
-        TrackPossibleCallback(tab);
+        TrackPossibleCallback(state, tab);
         mutations.push_back({MutationKind::Added, tab});
     }
 
     // Install new HWNDs in authoritative z-order before retiring old HWNDs.
     for (const InstalledTab& tab : desired) {
-        if (Find(g_tabs.installed, tab.window) != nullptr) {
+        if (Find(state.installed, tab.window) != nullptr) {
             continue;
         }
         const Status status = operations.install_subclass(
@@ -294,7 +297,7 @@ Status Reconcile(
         if (!status.ok()) {
             return fail(status);
         }
-        TrackPossibleCallback(tab);
+        TrackPossibleCallback(state, tab);
         mutations.push_back({MutationKind::Added, tab});
     }
     for (auto tab = previousInstalled.rbegin();
@@ -306,7 +309,7 @@ Status Reconcile(
         if (!status.ok()) {
             return fail(status);
         }
-        ForgetCallback(tab->window);
+        ForgetCallback(state, tab->window);
         mutations.push_back({MutationKind::Removed, *tab});
     }
 
@@ -339,9 +342,10 @@ LRESULT CALLBACK TabSubclassProc(
     const WPARAM wparam,
     const LPARAM lparam,
     const UINT_PTR id,
-    const DWORD_PTR) {
-    if (id == kTabSubclassId) {
-        NotifyTabSubclassMessage(window, message);
+    const DWORD_PTR reference) {
+    auto* const owner = reinterpret_cast<TabSubclassSet*>(reference);
+    if (id == kTabSubclassId && owner != nullptr) {
+        owner->Notify(window, message);
         if (message == WM_NCDESTROY || message == WM_SIZE ||
             message == WM_DPICHANGED || message == WM_THEMECHANGED ||
             message == WM_SHOWWINDOW || message == WM_WINDOWPOSCHANGED) {
@@ -353,7 +357,11 @@ LRESULT CALLBACK TabSubclassProc(
 
 }  // namespace
 
-Status ApplyTabSetUpdate(
+TabSubclassSet::TabSubclassSet() : impl_(std::make_unique<Impl>()) {}
+
+TabSubclassSet::~TabSubclassSet() = default;
+
+Status TabSubclassSet::Apply(
     const HWND topLevel,
     const ipc::TabSetUpdate& update,
     const TabSubclassOperations& operations,
@@ -365,25 +373,25 @@ Status ApplyTabSetUpdate(
     std::vector<InstalledTab> desired;
     Status status = ValidateUpdate(topLevel, update, operations, &desired);
     if (status.ok()) {
-        status = ValidateGenerations(topLevel, update, desired);
+        status = ValidateGenerations(*impl_, topLevel, update, desired);
     }
     if (status.ok()) {
-        status = Reconcile(desired, operations);
+        status = Reconcile(*impl_, desired, operations);
     }
     if (status.ok()) {
-        g_tabs.top_level = topLevel;
-        g_tabs.top_level_generation = update.top_level_generation;
-        g_tabs.authoritative = desired;
-        g_tabs.installed = desired;
+        impl_->top_level = topLevel;
+        impl_->top_level_generation = update.top_level_generation;
+        impl_->authoritative = desired;
+        impl_->installed = desired;
         for (const InstalledTab& tab : desired) {
             const auto known = std::find_if(
-                g_tabs.known_generations.begin(),
-                g_tabs.known_generations.end(),
+                impl_->known_generations.begin(),
+                impl_->known_generations.end(),
                 [&](const InstalledTab& candidate) {
                     return candidate.window == tab.window;
                 });
-            if (known == g_tabs.known_generations.end()) {
-                g_tabs.known_generations.push_back(tab);
+            if (known == impl_->known_generations.end()) {
+                impl_->known_generations.push_back(tab);
             } else if (tab.generation > known->generation) {
                 known->generation = tab.generation;
             }
@@ -393,35 +401,36 @@ Status ApplyTabSetUpdate(
     return status;
 }
 
-Status RemoveAllTabSubclasses(const TabSubclassOperations& operations) {
+Status TabSubclassSet::RemoveAll(const TabSubclassOperations& operations) {
     if (!operations.remove_subclass) {
         return Failure(ERROR_INVALID_PARAMETER);
     }
     Status firstFailure = Success();
-    const std::vector<InstalledTab> tracked = g_tabs.installed;
+    const std::vector<InstalledTab> tracked = impl_->installed;
     for (auto tab = tracked.rbegin(); tab != tracked.rend(); ++tab) {
         const Status status = operations.remove_subclass(
             tab->window, kTabSubclassId);
         if (status.ok()) {
-            ForgetCallback(tab->window);
+            ForgetCallback(*impl_, tab->window);
         } else if (firstFailure.ok()) {
             firstFailure = status;
         }
     }
-    if (!g_tabs.installed.empty()) {
-        g_tabs.lifetime_failed = true;
-        g_tabs.cleanup_blocked = true;
+    if (!impl_->installed.empty()) {
+        impl_->lifetime_failed = true;
+        impl_->cleanup_blocked = true;
         return firstFailure.ok() ? Failure() : firstFailure;
     }
-    g_tabs = {};
+    *impl_ = {};
     return firstFailure;
 }
 
-bool TabSubclassCleanupSafe() noexcept {
-    return !g_tabs.lifetime_failed && !g_tabs.cleanup_blocked;
+bool TabSubclassSet::cleanup_safe() const noexcept {
+    return !impl_->lifetime_failed && !impl_->cleanup_blocked;
 }
 
-TabSubclassOperations CreateProductionTabSubclassOperations() {
+TabSubclassOperations CreateProductionTabSubclassOperations(
+    TabSubclassSet& owner) {
     return {
         &GetCurrentThreadId,
         &GetWindowThreadProcessId,
@@ -429,12 +438,12 @@ TabSubclassOperations CreateProductionTabSubclassOperations() {
         &GetParent,
         [](const HWND window) { return GetWindow(window, GW_CHILD); },
         [](const HWND window) { return GetWindow(window, GW_HWNDNEXT); },
-        [](const HWND window, const UINT_PTR id, const std::uint64_t generation) {
+        [&owner](const HWND window, const UINT_PTR id, const std::uint64_t) {
             return SetWindowSubclass(
                        window,
                        TabSubclassProc,
                        id,
-                       static_cast<DWORD_PTR>(generation)) != FALSE
+                       reinterpret_cast<DWORD_PTR>(&owner)) != FALSE
                 ? Success()
                 : Failure(GetLastError());
         },
@@ -447,14 +456,14 @@ TabSubclassOperations CreateProductionTabSubclassOperations() {
     };
 }
 
-void NotifyTabSubclassMessage(const HWND window, const UINT message) noexcept {
+void TabSubclassSet::Notify(const HWND window, const UINT message) noexcept {
     if (window == nullptr || message != WM_NCDESTROY) {
         return;
     }
-    ForgetCallback(window);
-    if (g_tabs.installed.empty()) {
-        g_tabs.lifetime_failed = false;
-        g_tabs.cleanup_blocked = false;
+    ForgetCallback(*impl_, window);
+    if (impl_->installed.empty()) {
+        impl_->lifetime_failed = false;
+        impl_->cleanup_blocked = false;
     }
 }
 

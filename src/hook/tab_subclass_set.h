@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 
 namespace winexinfo::hook {
@@ -26,15 +27,28 @@ struct TabSubclassOperations final {
     std::function<Status()> post_refresh;
 };
 
-[[nodiscard]] Status ApplyTabSetUpdate(
-    HWND topLevel,
-    const ipc::TabSetUpdate& update,
-    const TabSubclassOperations& operations,
-    ipc::TabSetResult* result);
-[[nodiscard]] Status RemoveAllTabSubclasses(
-    const TabSubclassOperations& operations);
-[[nodiscard]] bool TabSubclassCleanupSafe() noexcept;
-[[nodiscard]] TabSubclassOperations CreateProductionTabSubclassOperations();
-void NotifyTabSubclassMessage(HWND window, UINT message) noexcept;
+class TabSubclassSet final {
+public:
+    TabSubclassSet();
+    ~TabSubclassSet();
+    TabSubclassSet(const TabSubclassSet&) = delete;
+    TabSubclassSet& operator=(const TabSubclassSet&) = delete;
+
+    [[nodiscard]] Status Apply(
+        HWND topLevel,
+        const ipc::TabSetUpdate& update,
+        const TabSubclassOperations& operations,
+        ipc::TabSetResult* result);
+    [[nodiscard]] Status RemoveAll(const TabSubclassOperations& operations);
+    [[nodiscard]] bool cleanup_safe() const noexcept;
+    void Notify(HWND window, UINT message) noexcept;
+
+private:
+    class Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+[[nodiscard]] TabSubclassOperations CreateProductionTabSubclassOperations(
+    TabSubclassSet& owner);
 
 }  // namespace winexinfo::hook
